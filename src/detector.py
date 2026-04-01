@@ -201,30 +201,26 @@ class Detector:
         self.predictor_a = CongestionPredictor(cfg, fps=fps)        # A방향 정체 예측
         self.predictor_b = CongestionPredictor(cfg, fps=fps)        # B방향 정체 예측
 
-        # ── 파일에서 불러온 baseline이 있으면 즉시 설정 ──────────────
-        if self._saved_baseline is not None:                        # 저장된 baseline 존재 시
-            self.traffic_analyzer_a.set_baseline(copy(self._saved_baseline))  # A방향 기준선
-            self.traffic_analyzer_b.set_baseline(copy(self._saved_baseline))  # B방향 기준선
-            self._compute_ref_direction()                           # flow_map 로드됨 → 기준 방향 계산
-            print("✅ 저장된 baseline 로드 완료 (A/B 양방향)")
-        elif not st.is_learning:                                    # 탐지 전용인데 baseline 미저장 (ver.1 파일)
-            # 구버전 flow_map은 baseline이 없음 → fallback 모드로 동작
-            _fb = BaselineStats(                                    # 기본값 fallback baseline
-                free_flow_dwell=45.0,                              # 자유흐름 체류 기본값 (프레임) — 30→45 완화
-                typical_dwell=90.0,                                # 일반 체류 기본값 — 60→90 완화
-                norm_speed_ref=0.15,                               # 정규화 속도 기준 — 원활 차량 nm≈0.14 기반 (15.4px/4f ÷ 40px_bbox)
-                count_ref=15.0,                                    # 기준 차량 수 — 10→15 상향
-                bbox_slope=0.0,                                    # 원근 기울기 (미보정)
-                bbox_intercept=50.0,                               # 원근 절편 기본값
-                lcs=0.0,                                           # fallback → LCS 보정 차단 (0.5이면 smooth_thr이 0.30→0.24로 낮아져 SLOW 오판)
-                quality_warning=False,
-                passage_count=0,
-                is_fallback=False                                  # False → 속도비율 50% 반영, 정지차량 jam≈0.5+ 가능
-            )
-            self.traffic_analyzer_a.set_baseline(_fb)              # A방향 fallback baseline
-            self.traffic_analyzer_b.set_baseline(copy(_fb))        # B방향 fallback baseline
-            self._compute_ref_direction()                           # 기준 방향 계산
-            print("⚠️  baseline 없는 flow_map → fallback 모드로 탐지 (밀도·정지율 기반)")
+        # ── 정체 탐지 baseline 설정 — 항상 fallback 모드 (stop_ratio + density 기반) ──
+        # norm_speed_ref 등 카메라 종속 값 불필요. LCS=default_lcs로 임계값만 보정.
+        # flow_map은 역주행 탐지 전용으로만 사용하며 정체 판정 기준으로 쓰지 않는다.
+        _fb = BaselineStats(                                        # fallback baseline 생성
+            free_flow_dwell=45.0,                                  # 미사용 (fallback 모드에서 참조 안 됨)
+            typical_dwell=90.0,                                    # 미사용
+            norm_speed_ref=0.15,                                   # 미사용
+            count_ref=15.0,                                        # 미사용
+            bbox_slope=0.0,                                        # 미사용
+            bbox_intercept=50.0,                                   # 미사용
+            lcs=cfg.default_lcs,                                   # 한강 측정값 0.36 — 임계값 보정에만 사용
+            quality_warning=False,
+            passage_count=0,
+            is_fallback=True,                                      # fallback → stop_ratio + density 기반 jam 계산
+        )
+        self.traffic_analyzer_a.set_baseline(_fb)                  # A방향 baseline 설정
+        self.traffic_analyzer_b.set_baseline(copy(_fb))            # B방향 baseline 설정
+        if not st.is_learning:                                     # 탐지 전용이면 flow_map 로드됨 → 기준 방향 계산
+            self._compute_ref_direction()
+        print(f"✅ 정체 탐지 baseline 설정 완료 (fallback 모드, LCS={cfg.default_lcs})")
 
         save_path = self._get_next_filename()                       # 결과 저장 파일명
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")                    # mp4 인코더 설정
@@ -247,11 +243,17 @@ class Detector:
             cfg.learning_frames * cfg.max_learning_extension        # 기본 × 1.5 = 750프레임
         )
 
+        # ── 개선 2: 중간 평활화 플래그 (80%/95% 시점 정확히 1회씩) ─────
+        _learn_smoothed_80 = False                                  # 초기 학습 80% 시점 smoothing 완료 플래그
+        _learn_smoothed_95 = False                                  # 초기 학습 95% 시점 smoothing 완료 플래그
+        _relearn_smoothed_80 = False                                # 재학습 80% 시점 smoothing 완료 플래그
+        _relearn_smoothed_95 = False                                # 재학습 95% 시점 smoothing 완료 플래그
+
         # 키보드 단축키 안내
         print("\n" + "=" * 50)
         print("  [T] 궤적  [D] 방향  [F] 흐름장")
         print("  [S] 속도  [I] 패널  [V] 투표 디버그")
-        print("  [P] 내적값  [Q] 종료")
+        print("  [P] 내적값  [C] 정체 패널  [Q] 종료")
         print("=" * 50 + "\n")
 
         while cap.isOpened():                                       # 비디오 스트림이 열려 있는 동안
@@ -335,6 +337,8 @@ class Detector:
                     self._gru_pretrain_pending_b = False             # B방향 pretrain 예약 초기화
                     self._ref_direction = None                      # 기준 방향 초기화 (재학습 후 재계산)
                     self._track_direction.clear()                   # 차량 방향 매핑 초기화
+                    _relearn_smoothed_80 = False                    # 재학습 80% smoothing 플래그 리셋
+                    _relearn_smoothed_95 = False                    # 재학습 95% smoothing 플래그 리셋
 
             # ── 초기 학습 완료 처리 ──
             if st.is_learning:                                      # 학습 모드일 때만 체크
@@ -350,12 +354,11 @@ class Detector:
                 if learning_done:                                   # 학습 완료이면
                     self.flow.apply_spatial_smoothing(verbose=True) # 공간 보정 (상세 진단)
                     self.flow.apply_boundary_erosion()              # 경계 셀 제거 (오탐 차단)
-                    baseline = self.passage_tracker.finalize_baseline()  # baseline 산출
-                    self.traffic_analyzer_a.set_baseline(copy(baseline))  # A방향 기준선 (독립 복사)
-                    self.traffic_analyzer_b.set_baseline(copy(baseline))  # B방향 기준선 (독립 복사)
+                    baseline = self.passage_tracker.finalize_baseline()  # passage 통계 산출 (LCS 확인용)
+                    # 정체 탐지 baseline은 default_lcs 기반 fallback 유지 — 교체하지 않음
                     self._compute_ref_direction()                   # 기준 방향 벡터 계산
                     if cfg.flow_map_path:                           # 저장 경로 있으면
-                        self.flow.save(cfg.flow_map_path, baseline) # baseline 포함 저장
+                        self.flow.save(cfg.flow_map_path)           # flow_map만 저장 (baseline 미포함)
                     st.is_learning = False                          # 학습 모드 종료
                     print(f"학습 완료! (passage={self.passage_tracker.get_completed_count()}, "
                           f"lcs={baseline.lcs:.2f})")
@@ -381,12 +384,11 @@ class Detector:
                 if relearn_done:                                    # 재학습 완료이면
                     self.flow.apply_spatial_smoothing(verbose=True) # 공간 보정 (상세 진단)
                     self.flow.apply_boundary_erosion()              # 경계 셀 제거 (오탐 차단)
-                    baseline = self.passage_tracker.finalize_baseline()  # baseline 산출
-                    self.traffic_analyzer_a.set_baseline(copy(baseline))  # A방향 기준선 (독립 복사)
-                    self.traffic_analyzer_b.set_baseline(copy(baseline))  # B방향 기준선 (독립 복사)
+                    baseline = self.passage_tracker.finalize_baseline()  # passage 통계 산출 (LCS 확인용)
+                    # 정체 탐지 baseline은 default_lcs 기반 fallback 유지 — 교체하지 않음
                     self._compute_ref_direction()                   # 기준 방향 벡터 재계산
                     if cfg.flow_map_path:                           # 저장 경로 있으면
-                        self.flow.save(cfg.flow_map_path, baseline) # baseline 포함 저장
+                        self.flow.save(cfg.flow_map_path)           # flow_map만 저장 (baseline 미포함)
                     st.relearning = False                           # 재학습 모드 종료
                     st.cooldown_until = st.frame_num + cfg.cooldown_frames  # 쿨다운 설정
                     self.switch.set_reference(frame)                # 새 기준 프레임 설정
@@ -760,13 +762,14 @@ class Detector:
                 level_b     = self.traffic_analyzer_b.get_congestion_level()  # B방향 정체 레벨
                 jam_score_b = self.traffic_analyzer_b.get_jam_score()         # B방향 jam_score
                 dur_sec_b   = self.traffic_analyzer_b.get_duration_sec()      # B방향 지속 시간
-                self.vis.draw_congestion_status(                    # 방향별 정체 패널 그리기
-                    frame,
-                    level_a, jam_score_a, dur_sec_a,                # A방향 데이터
-                    level_b, jam_score_b, dur_sec_b,                # B방향 데이터
-                    label_a=self._dir_label_a,                      # "상행" 또는 "하행"
-                    label_b=self._dir_label_b                       # "하행" 또는 "상행"
-                )
+                if self.vis.show_congestion_panel:                  # C키로 패널 ON/OFF 가능
+                    self.vis.draw_congestion_status(                # 방향별 정체 패널 그리기
+                        frame,
+                        level_a, jam_score_a, dur_sec_a,            # A방향 데이터
+                        level_b, jam_score_b, dur_sec_b,            # B방향 데이터
+                        label_a=self._dir_label_a,                  # "UP" 또는 "DOWN"
+                        label_b=self._dir_label_b                   # "DOWN" 또는 "UP"
+                    )
 
             # FPS 계산 및 표시
             curr_time = time.time()                                 # 현재 시간
@@ -784,9 +787,26 @@ class Detector:
                 break                                               # 종료
             self.vis.handle_keys(key)                               # 시각화 옵션 토글 처리
 
-            # 학습/재학습 중에는 주기적으로 공간 보정 적용
-            if (st.is_learning or st.relearning) and st.frame_num % 150 == 0:
-                self.flow.apply_spatial_smoothing()                 # 공간 보정
+            # ── 개선 2: 80%/95% 시점 중간 평활화 (플래그 방식 — 정확히 1회씩) ──
+            # 너무 이른 보간 채움 방지: 데이터가 충분히 쌓인 후반에만 실행
+            # 학습 완료 시 verbose=True smoothing이 최종 1회 추가 실행됨
+            if st.is_learning:                                      # 초기 학습 모드
+                progress = st.frame_num / max(cfg.learning_frames, 1)  # 학습 진행률 (0.0~1.0+)
+                if progress >= 0.80 and not _learn_smoothed_80:     # 80% 도달 & 미실행
+                    self.flow.apply_spatial_smoothing()             # 1차 중간 평활화
+                    _learn_smoothed_80 = True                       # 플래그 설정 (재실행 방지)
+                if progress >= 0.95 and not _learn_smoothed_95:     # 95% 도달 & 미실행
+                    self.flow.apply_spatial_smoothing()             # 2차 중간 평활화
+                    _learn_smoothed_95 = True                       # 플래그 설정 (재실행 방지)
+            elif st.relearning:                                     # 재학습 모드
+                elapsed = st.frame_num - st.relearn_start_frame    # 재학습 경과 프레임
+                progress = elapsed / max(cfg.relearn_frames, 1)    # 재학습 진행률
+                if progress >= 0.80 and not _relearn_smoothed_80:  # 80% 도달 & 미실행
+                    self.flow.apply_spatial_smoothing()             # 1차 중간 평활화
+                    _relearn_smoothed_80 = True                    # 플래그 설정
+                if progress >= 0.95 and not _relearn_smoothed_95:  # 95% 도달 & 미실행
+                    self.flow.apply_spatial_smoothing()             # 2차 중간 평활화
+                    _relearn_smoothed_95 = True                    # 플래그 설정
 
         # ── 루프 종료 후 정리 ──
         cap.release()                                               # 비디오 캡처 해제

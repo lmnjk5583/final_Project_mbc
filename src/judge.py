@@ -1,8 +1,9 @@
-# 파일 경로: N:\개인\대원&수빈\최종 프로젝트\src\judge.py
+# 파일 경로: C:\final_pj\src\judge.py
 # 역할: 흐름장과 코사인 유사도 기반 역주행 판별
 #        원근 기반 속도 게이트 + 다중 포인트 투표 + 시간적 히스테리시스(카운팅)
 #        ③ 다중 스케일 윈도우: 단기(velocity_window) + 장기(×2) 모두 역방향이어야 의심
 #        ① 전체 궤적 방향 검증: 확정 시 traj[0]→traj[-1] 전체 방향도 역방향이어야 확정
+#        개선 3: smoothed_mask 셀에서 cos_threshold 완화 (보간 셀 오탐 방지)
 
 import numpy as np
 
@@ -19,6 +20,29 @@ class WrongWayJudge:
         scale = 0.3 + 0.7 * ratio           # 위는 0.3배, 아래는 1.0배 근처
         return self.cfg.base_speed_threshold * scale  # 위치에 따른 속도 임계값
 
+    # ── 개선 3: smoothed_mask 기반 cos_threshold 결정 ────────────────
+    def _get_cos_threshold(self, px, py, level="short"):
+        """위치 기반 cos_threshold 반환. smoothed_mask 셀이면 완화된 값 사용.
+
+        Args:
+            px, py: 픽셀 좌표 (flow 셀 위치 결정용).
+            level: "short"=단기 투표(-0.50), "long"=장기 윈도우(-0.60),
+                   "global"=전체 궤적(완화 없음, 원본 threshold 유지).
+
+        Returns:
+            float: 해당 위치·레벨에 맞는 cos_threshold.
+        """
+        # 전체 궤적 확정은 완화하지 않음 — 실 데이터 셀만 통과해야 최종 확정
+        if level == "global":                               # 전체 궤적 검증
+            return self.cfg.cos_threshold                   # 원본 threshold (-0.75) 그대로
+
+        r, c = self.flow.get_cell_rc(px, py)                # 픽셀 → 셀 좌표 변환
+        if self.flow.is_smoothed(r, c):                     # 보간으로 채워진 셀이면
+            if level == "long":                             # 장기 윈도우: 중간 수준 완화
+                return -0.60                                # -0.75 → -0.60 (15° 완화)
+            return -0.50                                    # 단기 투표: -0.75 → -0.50 (25° 완화)
+        return self.cfg.cos_threshold                       # 실 데이터 셀: 원본 threshold
+
     # ── 내부 유틸: 단일 방향 벡터가 flow와 역방향인지 확인 ──────────────
     def _is_against_flow(self, ndx, ndy, px, py):
         """(ndx, ndy) 방향이 (px, py) 위치의 flow 벡터와 역방향인지 반환.
@@ -34,7 +58,11 @@ class WrongWayJudge:
         if flow_v is None:                            # flow 없으면 판단 불가
             return False
         cos = float(ndx * flow_v[0] + ndy * flow_v[1])  # 코사인 유사도
-        return cos < self.cfg.cos_threshold           # 임계값 미만이면 역방향
+
+        # ── 개선 3: smoothed_mask 셀이면 cos_threshold 완화 ──────────
+        # 보간으로 채워진 셀은 방향 신뢰도가 낮으므로 판정 기준을 느슨하게 적용
+        threshold = self._get_cos_threshold(px, py, level="short")  # 단기 레벨 threshold
+        return cos < threshold                            # 완화된/원본 임계값 기준 판정
 
     def check(self, track_id, traj, ndx, ndy, speed, cy):
         """한 차량에 대해 flow_map과 방향 비교, 투표 방식으로 역주행 여부 판정.
@@ -101,7 +129,9 @@ class WrongWayJudge:
             cos_sim = ndx * flow_v[0] + ndy * flow_v[1]  # 코사인 유사도
             cos_values.append(cos_sim)                 # 내적값 기록
 
-            if cos_sim < self.cfg.cos_threshold:      # 역방향 판정 (jitter 보정 적용)
+            # ── 개선 3: 각 궤적 포인트별로 smoothed_mask 기반 threshold 적용 ──
+            pt_threshold = self._get_cos_threshold(px, py, level="short")  # 포인트 위치 기반 threshold
+            if cos_sim < pt_threshold:                 # 역방향 판정 (smoothed 셀이면 완화)
                 disagree += 1
                 debug_points.append((px, py, cos_sim, "disagree"))
             else:                                      # 정방향 판정
@@ -164,7 +194,11 @@ class WrongWayJudge:
                         lndx * flow_v_long[0] + lndy * flow_v_long[1]
                     )
                     debug_info["long_cos"] = round(long_cos, 4)  # 디버그 기록
-                    long_suspect = (long_cos < self.cfg.cos_threshold)  # 역방향이어야 True (jitter 보정 적용)
+                    # ── 개선 3: 장기 윈도우는 중간 수준 완화 (-0.60) ──────
+                    long_threshold = self._get_cos_threshold(    # 장기 레벨 threshold
+                        cx_last, cy_last, level="long"
+                    )
+                    long_suspect = (long_cos < long_threshold)   # 완화된 기준으로 역방향 판정
                 # flow 없으면 long_suspect = True (장기 검사 면제)
             # 이동 부족(느린 차량)이면 long_suspect = True (장기 검사 면제)
 
@@ -243,7 +277,12 @@ class WrongWayJudge:
                             gndx * flow_v_global[0] + gndy * flow_v_global[1]
                         )
                         debug_info["global_cos"] = round(global_cos, 4)  # 디버그 기록
-                        global_ok = (global_cos < cfg.cos_threshold)  # 역방향이어야 확정 (전체 궤적은 원본 threshold)
+                        # ── 개선 3: 전체 궤적 확정은 완화 없음 (원본 threshold) ──
+                        # 최종 확정 단계는 가장 엄격해야 함 — smoothed 셀이어도 -0.75 적용
+                        global_threshold = self._get_cos_threshold(  # global 레벨 → 항상 원본
+                            try_x, try_y, level="global"
+                        )
+                        global_ok = (global_cos < global_threshold)  # 역방향이어야 확정
 
             if global_ok:                              # 전체 궤적도 역방향 → 최종 확정
                 st.wrong_way_ids.add(track_id)         # 역주행 차량으로 등록

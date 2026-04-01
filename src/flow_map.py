@@ -1,6 +1,7 @@
 # 파일 경로: C:\final_pj\src\flow_map.py
 # 15x15 그리드 기반 정상 흐름장
 # EMA 학습 + 이중 선형 보간(Bilinear Interpolation) + 방향 일관성 공간 평활화
+# smoothed_mask: 보간으로 채워진 셀(실 데이터 없음) 추적 — judge.py에서 cos_threshold 완화에 사용
 
 import numpy as np                                       # 수치 계산
 from pathlib import Path                                  # 경로 조작
@@ -28,6 +29,12 @@ class FlowMap:
         # apply_boundary_erosion()이 제거한 셀 기록 — learn_step에서 재학습 금지
         self.eroded_mask = np.zeros((grid_size, grid_size), dtype=bool)  # True=영구 빈 셀
 
+        # ── 개선 1: smoothed_mask — 보간으로 채워진 셀 추적 ──────────────
+        # apply_spatial_smoothing()에서 count=0 셀이 이웃 평균으로 채워지면 True
+        # learn_step()에서 실 데이터가 들어오면 False로 해제
+        # judge.py에서 이 마스크가 True인 셀은 cos_threshold를 완화하여 오탐 방지
+        self.smoothed_mask = np.zeros((grid_size, grid_size), dtype=bool)  # True=보간 채움, 실 데이터 없음
+
         self._learn_call_count = 0                        # learn_step 호출 횟수 (디버그용)
 
     # ==================== 초기화/리셋 ====================
@@ -44,6 +51,7 @@ class FlowMap:
         self.count[:] = 0                                 # 샘플 수 초기화
         self.speed_ref[:] = 0                             # 셀별 정상 속도 기준값 초기화
         self.eroded_mask[:] = False                       # 경계 마스크 초기화 (재학습 시 초기화)
+        self.smoothed_mask[:] = False                     # 보간 마스크 초기화 (재학습 시 초기화)
         self._learn_call_count = 0                        # 호출 카운터 초기화
 
     # ==================== 좌표 변환 ====================
@@ -94,6 +102,12 @@ class FlowMap:
         self.flow[r, c, 0] = (1 - self.alpha) * self.flow[r, c, 0] + self.alpha * ndx
         self.flow[r, c, 1] = (1 - self.alpha) * self.flow[r, c, 1] + self.alpha * ndy
         self.count[r, c] += 1                             # 샘플 수 증가
+
+        # ── 개선 1: 실 데이터 유입 시 smoothed_mask 해제 ────────────────
+        # 보간으로 채워진 셀에 실제 차량이 통과하면 더 이상 "보간 전용"이 아님
+        # → judge.py에서 이 셀은 정상 cos_threshold(-0.75) 적용으로 복귀
+        if self.smoothed_mask[r, c]:                      # 보간으로 채워진 셀이면
+            self.smoothed_mask[r, c] = False              # 실 데이터 유입 → 보간 표시 해제
 
         # 디버그: 100회마다 학습 현황 출력
         self._learn_call_count += 1                       # 호출 카운터 증가
@@ -150,13 +164,15 @@ class FlowMap:
 
         동작 원칙:
           ① count >= min_samples 셀 → 이미 충분한 데이터, 건드리지 않음
+             smoothed_mask = False 보장 (실 데이터 있는 셀)
           ② 0 < count < min_samples 셀 → 자신의 방향 기준 같은 방향 이웃만 평균
           ③ count=0 셀 → 이웃이 전부 같은 방향이면 채움 (이웃끼리 반대면 skip)
              이웃끼리 cos < -0.3이면 중앙 분리대 경계 → 채우지 않음
+             채움 시 smoothed_mask = True (보간 전용 셀 표시)
         """
         if verbose:                                       # 상세 진단 시에만 전체 셀 출력
             print("\n📊 [진단] smoothing 전 — 전체 셀 상태")
-            print(f"   {'[r,c]':>8} {'count':>6} {'angle°':>8} {'mag':>6}")
+            print(f"   {'[r,c]':>8} {'count':>6} {'angle°':>8} {'mag':>6} {'smooth':>7}")
             for r in range(self.grid_size):               # 모든 행 순회
                 for c in range(self.grid_size):           # 모든 열 순회
                     v = self.flow[r, c]                   # 해당 셀 벡터
@@ -164,8 +180,9 @@ class FlowMap:
                     if m > 0.01:                          # 유효한 벡터만 출력
                         angle = np.degrees(np.arctan2(v[1], v[0]))  # 각도
                         cnt = self.count[r, c]            # 샘플 수
+                        sm = "★" if self.smoothed_mask[r, c] else ""  # 보간 셀 표시
                         mk = " ⚠️" if cnt < self.min_samples else ""
-                        print(f"   [{r:2d},{c:2d}] {cnt:6d} {angle:8.1f} {m:6.3f}{mk}")
+                        print(f"   [{r:2d},{c:2d}] {cnt:6d} {angle:8.1f} {m:6.3f}{mk} {sm}")
 
         new_map = self.flow.copy()                        # 기존 맵 복사본 (수정 대상)
         filled_count = 0                                  # count=0에서 채워진 셀 수
@@ -178,6 +195,7 @@ class FlowMap:
 
                 # ── ① count >= min_samples: 충분한 셀은 건드리지 않음 ──────
                 if own_cnt >= self.min_samples:           # 충분한 셀 → 변경 불필요
+                    self.smoothed_mask[r, c] = False      # 실 데이터 충분 → 보간 표시 확실히 해제
                     continue
 
                 # ── 3×3 이웃 범위 계산 ──────────────────────────────────────
@@ -221,6 +239,10 @@ class FlowMap:
                     if np.linalg.norm(avg_v) > 0.1:       # 유효한 평균이면
                         new_map[r, c] = avg_v             # 셀 채움
                         filled_count += 1                 # 채움 카운터 증가
+                        # ── 개선 1: 보간으로 채워진 셀 표시 ──────────────────
+                        # count=0 셀이 이웃 평균으로 채워짐 → 실 데이터 없는 보간 셀
+                        # judge.py에서 이 셀은 cos_threshold를 완화해 오탐 방지
+                        self.smoothed_mask[r, c] = True   # 보간 채움 표시
 
                 else:
                     # ── ② 0 < count < min_samples: 자신의 방향 기준 강화 ───
@@ -258,14 +280,16 @@ class FlowMap:
         total_with_flow = int(np.sum(                     # 유효 벡터 있는 셀 수
             np.linalg.norm(self.flow, axis=2) > 0.1
         ))
+        smoothed_total = int(np.sum(self.smoothed_mask))  # 보간 채움 셀 총 수
         print(f"   🔄 smoothing: {filled_count}셀 채움, "
               f"{reinforced_count}셀 강화, "
               f"learned={active}/{self.grid_size**2}, "
-              f"total_flow={total_with_flow}")
+              f"total_flow={total_with_flow}, "
+              f"smoothed={smoothed_total}")
 
         if verbose:                                       # 상세 진단 시에만 후 상태 출력
             print(f"\n📊 [진단] smoothing 후 — 전체 셀 상태")
-            print(f"   {'[r,c]':>8} {'count':>6} {'angle°':>8} {'mag':>6}")
+            print(f"   {'[r,c]':>8} {'count':>6} {'angle°':>8} {'mag':>6} {'smooth':>7}")
             for r in range(self.grid_size):
                 for c in range(self.grid_size):
                     v = self.flow[r, c]
@@ -273,8 +297,9 @@ class FlowMap:
                     if m > 0.01:
                         angle = np.degrees(np.arctan2(v[1], v[0]))
                         cnt = self.count[r, c]
+                        sm = "★" if self.smoothed_mask[r, c] else ""  # 보간 셀 표시
                         mk = " ⚠️" if cnt < self.min_samples else ""
-                        print(f"   [{r:2d},{c:2d}] {cnt:6d} {angle:8.1f} {m:6.3f}{mk}")
+                        print(f"   [{r:2d},{c:2d}] {cnt:6d} {angle:8.1f} {m:6.3f}{mk} {sm}")
 
     # ==================== Phase 1 정체 탐지용 — 셀별 속도 학습 ====================
     def learn_baseline(self, fx: float, fy: float, norm_speed: float):
@@ -294,6 +319,37 @@ class FlowMap:
                 (1 - self.alpha) * self.speed_ref[r, c]
                 + self.alpha * norm_speed
             )
+
+    # ==================== 개선 1: smoothed_mask 조회 메서드 ====================
+    def is_smoothed(self, r: int, c: int) -> bool:
+        """해당 셀이 보간으로 채워진 셀인지 반환 (실 데이터 없음).
+
+        Args:
+            r: 그리드 행 인덱스.
+            c: 그리드 열 인덱스.
+
+        Returns:
+            True=보간 채움 셀 (cos_threshold 완화 대상), False=실 데이터 있는 셀.
+        """
+        r = int(np.clip(r, 0, self.grid_size - 1))       # 범위 보정 (음수·오버플로 방지)
+        c = int(np.clip(c, 0, self.grid_size - 1))       # 범위 보정
+        return bool(self.smoothed_mask[r, c])             # bool 변환 후 반환
+
+    def get_cell_rc(self, px: float, py: float):
+        """픽셀 좌표(px, py)를 정수 셀 좌표(r, c)로 변환.
+
+        judge.py에서 smoothed_mask 조회 시 셀 좌표가 필요하므로 편의 메서드 제공.
+
+        Args:
+            px: 픽셀 x 좌표.
+            py: 픽셀 y 좌표.
+
+        Returns:
+            (r, c) 정수 튜플.
+        """
+        r = int(np.clip(py / self.cell_h, 0, self.grid_size - 1))  # 행 계산 + 범위 보정
+        c = int(np.clip(px / self.cell_w, 0, self.grid_size - 1))  # 열 계산 + 범위 보정
+        return r, c
 
     # ==================== 경계 셀 제거 ====================
     def apply_boundary_erosion(self, majority_threshold: float = 0.4):
@@ -343,6 +399,7 @@ class FlowMap:
                         new_flow[r, c]  = 0                # 이 셀 벡터 초기화
                         new_count[r, c] = 0                # count도 초기화
                         self.eroded_mask[r, c] = True      # 영구 재학습 금지 마스크 설정
+                        self.smoothed_mask[r, c] = False   # erosion 된 셀은 smoothed 해제 (빈 셀)
                         erased_adj += 1                    # 카운터 증가
                         break                              # 한 이웃만 확인해도 충분
 
@@ -387,6 +444,7 @@ class FlowMap:
                         new_flow[r, c]  = 0                # 이 셀 벡터 초기화
                         new_count[r, c] = 0                # count도 초기화
                         self.eroded_mask[r, c] = True      # 영구 재학습 금지 마스크
+                        self.smoothed_mask[r, c] = False   # erosion 된 셀은 smoothed 해제
                         erased_maj += 1                    # 2단계 카운터 증가
 
         self.flow  = new_flow                              # 맵 갱신
@@ -397,7 +455,7 @@ class FlowMap:
 
     # ==================== 저장/로드 ====================
     def save(self, path: Path, baseline_stats=None):
-        """학습된 flow_map, count, speed_ref, baseline_stats를 .npy 파일로 저장.
+        """학습된 flow_map, count, speed_ref, smoothed_mask, baseline_stats를 .npy 파일로 저장.
 
         Args:
             path: 저장 파일 경로 (.npy).
@@ -405,10 +463,11 @@ class FlowMap:
         """
         path.parent.mkdir(parents=True, exist_ok=True)    # 저장 폴더 생성
         data = {                                           # 저장할 데이터 딕셔너리
-            "version":   2,                               # 포맷 버전 (1=기존, 2=baseline 포함)
-            "flow":      self.flow,                       # 흐름 벡터 배열
-            "count":     self.count,                      # 셀별 샘플 수 배열
-            "speed_ref": self.speed_ref,                  # 셀별 정상 속도 배열
+            "version":       2,                           # 포맷 버전 (1=기존, 2=baseline 포함)
+            "flow":          self.flow,                   # 흐름 벡터 배열
+            "count":         self.count,                  # 셀별 샘플 수 배열
+            "speed_ref":     self.speed_ref,              # 셀별 정상 속도 배열
+            "smoothed_mask": self.smoothed_mask,          # 보간 채움 셀 마스크 (개선 1)
         }
         if baseline_stats is not None:                    # baseline_stats가 있으면 함께 저장
             import dataclasses                            # dataclass → dict 변환용
@@ -438,9 +497,13 @@ class FlowMap:
         version = data.get("version", 1)                  # 포맷 버전 확인 (없으면 1)
         if version >= 2 and "speed_ref" in data:          # 버전 2+ & speed_ref 있으면
             self.speed_ref = data["speed_ref"]            # 셀별 속도 기준 로드
+        if "smoothed_mask" in data:                       # smoothed_mask가 저장되어 있으면
+            self.smoothed_mask = data["smoothed_mask"]    # 보간 마스크 로드 (개선 1)
+
         baseline = None                                   # baseline 초기값 None
         if version >= 2 and "baseline_stats" in data:     # 버전 2+ & baseline 있으면
             from baseline_stats import BaselineStats      # 임포트 (순환 방지용 지연)
             baseline = BaselineStats(**data["baseline_stats"])  # dict → 객체 복원
-        print(f"✅ flow_map 로드 ({self.count.sum()} 샘플, ver={version})")
+        print(f"✅ flow_map 로드 ({self.count.sum()} 샘플, ver={version}, "
+              f"smoothed={int(np.sum(self.smoothed_mask))}셀)")
         return True, baseline                             # (성공, baseline) 반환

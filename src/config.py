@@ -8,14 +8,14 @@ from pathlib import Path
 class DetectorConfig:
     # ==================== 모델/기본 설정 ====================
     model_path: str | Path = ""       # YOLO 모델 경로
-    conf: float = 0.66                # 객체 검출 신뢰도(confidence) 임계값
+    conf: float = 0.3                 # 객체 검출 신뢰도(confidence) 임계값
     target_classes: list | None = None  # 추적할 클래스 인덱스 리스트 (None이면 모든 클래스)
 
     # ==================== 흐름 그리드(Flow Map) 설정 ====================
     grid_size: int = 20               # 흐름 맵을 나눌 격자 크기 (N x N) — 20은 셀 수 과다→셀당 샘플 부족→노이즈
 
     # ==================== 학습(learning) 관련 설정 ====================
-    learning_frames: int = 18000        # 초기 학습에 사용할 프레임 수 — 원래 500, 충분한 셀 커버리지 확보
+    learning_frames: int = 1800        # 초기 학습에 사용할 프레임 수 — 원래 500, 충분한 셀 커버리지 확보
     alpha: float = 0.1                # EMA 학습 속도 (새 데이터 반영 비율 10%)
     min_samples: int = 5              # 셀당 최소 학습 샘플 수 (이하이면 공간 보정에 사용)
     enable_online_flow_update: bool = False # 정상 흐름 학습에 사용(True)
@@ -24,11 +24,11 @@ class DetectorConfig:
     velocity_window: int = 15         # 속도/방향 계산 시 사용하는 프레임 간격 (이전 위치~현재 위치 거리)
     base_speed_threshold: float = 7.0 # 기본 속도 임계값 (원근에 따라 가중을 곱해 사용)
     cos_threshold: float = -0.75      # 코사인 유사도 임계값 (원본값 복원 — smoothing 오염 방지로 오탐 차단)
-    wrong_count_threshold: int = 5    # 역주행 확정까지 필요한 연속 의심 횟수
-    vote_threshold: float = 0.6       # 투표 시 역방향 비율 임계값 (원본값 복원 — 60% 이상이면 역주행 의심)
+    wrong_count_threshold: int = 8    # 역주행 확정까지 필요한 연속 의심 횟수
+    vote_threshold: float = 0.7       # 투표 시 역방향 비율 임계값 (원본값 복원 — 60% 이상이면 역주행 의심)
     min_move_distance: float = 10.0    # 최소 누적 이동 거리 (이하면 정지로 판단) — 원래 20.0, 원거리 CCTV 대응 완화
     min_move_per_frame: float = 0.4   # 프레임당 평균 이동거리 (이하면 정지) — 원래 1.5, 원거리 CCTV 대응 완화
-    direction_change_guard_frames: int = 45  # 정상→역방향 급전환 가드: 정상 판정 후 이 프레임 이내 의심 카운트 차단
+    direction_change_guard_frames: int = 90  # 정상→역방향 급전환 가드: 정상 판정 후 이 프레임 이내 의심 카운트 차단 — 45→90 (점진적 방향 전환 오탐 대응)
 
     # ==================== ID 매핑 관련 ====================
     id_match_distance: int = 120      # ID 재매칭 허용 거리 (픽셀 단위, 이전 ID와 새 ID 위치 비교)
@@ -55,7 +55,7 @@ class DetectorConfig:
     # ==================== 정체 탐지 파라미터 (OLD — CongestionPredictor 호환용) ====================
     free_flow_speed: float = 100.0        # 자유 흐름 속도 기준 (km/h) — 고속도로 기본값
     pixels_per_meter: float = 8.0         # 1미터 = 몇 픽셀 (카메라·해상도 따라 보정 필요)
-    congestion_hysteresis_sec: float = 5.0   # 정체 레벨 전환 유지 시간 (초) — 15→5로 완화 (전환 반응속도 향상)
+    congestion_hysteresis_sec: float = 3.0   # 정체 레벨 전환 유지 시간 (초) — 5→3으로 단축 (서행 반응속도 향상)
     prediction_history_window: int = 30   # CongestionPredictor 속도 히스토리 창 (프레임 수)
     prediction_horizon: int = 5           # 정체 예측 시간 범위 (분)
 
@@ -64,8 +64,9 @@ class DetectorConfig:
     min_passage_dist:        float = 100.0  # 유효 passage 최소 진입-퇴장 픽셀 거리
     min_passages_required:   int   = 5      # 학습 종료에 필요한 최소 완성 passage 수
     stop_mag_threshold:      float = 3.0    # (구버전 호환용, 미사용) 절대 픽셀 정지 임계값
-    norm_stop_threshold:     float = 0.05   # bbox_h 대비 정지 임계값 (mag/bbox_h < 이 값 → 정지)
-                                            # 0.08→0.05로 완화: 원활한 원거리 차량(nm≈0.14)이 정지로 오판되는 것 방지
+    norm_stop_threshold:     float = 0.06   # bbox_h 대비 정지 임계값 (mag/bbox_h < 이 값 → 정지)
+                                            # 0.10→0.06: 원거리 차량 bbox_h 클램프(30px) 시 nm≈0.07~0.10 오판 방지
+                                            # 완전 정지는 nm≈0~0.03, 서행은 nm≈0.07+로 충분히 구분 가능
     min_bbox_h:              float = 30.0   # bbox_h 최솟값 보정 (이 값 미만이면 30px로 클램프)
                                             # 원거리 차량 bbox_h≈15px → nm이 과대 계산되어 원활 오판 방지
     exit_rate_window:        int   = 30     # exit_rate 계산 슬라이딩 윈도우 (프레임)
@@ -73,7 +74,9 @@ class DetectorConfig:
 
     # ==================== jam_score 임계값 ====================
     smooth_jam_threshold:    float = 0.30   # jam_score 이 값 미만 → SMOOTH — 0.25→0.30 (원활 차량 dwell/density 기여 흡수)
-    slow_jam_threshold:      float = 0.55   # jam_score 이 값 미만 → SLOW, 이상 → CONGESTED
+    slow_jam_threshold:      float = 0.60   # jam_score 이 값 미만 → SLOW, 이상 → CONGESTED — 0.42→0.55 복원 (density 정규화로 범위 0~1.0 확보)
+    density_max_vehicles:   float = 40.0   # density 정규화 기준 차량 수 — 이 값 이상이면 density=1.0 (포화) — 20→40 (10대 원활 시 density 50%→25% 보정)
+    default_lcs:             float = 0.36   # 한강대교 베이스라인 학습 결과 — 모든 카메라 임계값 보정에 사용
 
     # ==================== jam_score EMA 스무딩 ====================
     # 비대칭 EMA: 악화(올라갈 때)는 빠르게, 호전(내려갈 때)은 느리게

@@ -20,6 +20,7 @@ class Visualizer:
         self.show_vote_debug = False     # 역주행 투표 디버그(점/텍스트) 표시 ON/OFF
         self.show_dot_product = False     # 내적(코사인 유사도) 값 표시 ON/OFF
         self.show_detection_stats = True # 탐지 소요시간 패널 ON/OFF
+        self.show_congestion_panel = True  # 하단 Down/Up 정체 패널 ON/OFF (단축키 C)
 
     # ==================== 키보드 입력 처리 ====================
     def handle_keys(self, key):
@@ -45,6 +46,9 @@ class Visualizer:
         elif key == ord("p"):
             self.show_dot_product = not self.show_dot_product
             print(f"내적값: {'ON' if self.show_dot_product else 'OFF'}")
+        elif key == ord("c"):                                      # C키: 정체 패널 토글
+            self.show_congestion_panel = not self.show_congestion_panel
+            print(f"정체 패널: {'ON' if self.show_congestion_panel else 'OFF'}")
 
     # ==================== 궤적 그리기 ====================
     def draw_trajectory(self, frame, track_id, is_wrong=False):
@@ -464,15 +468,15 @@ class Visualizer:
             return "VMS detour  |  Ramp metering"                 # ALINEA 1991, MDPI 2024
         return ""                                                  # 알 수 없는 레벨
 
-    # ==================== 정체 상태 패널(좌하단, 방향별 2행) ====================
+    # ==================== 정체 상태 패널(하단 좌우 분리, Down/Up 각각) ====================
     def draw_congestion_status(self, frame,
                                level_a: str, jam_score_a: float, duration_sec_a: float,
                                level_b: str, jam_score_b: float, duration_sec_b: float,
                                label_a: str = "UP", label_b: str = "DOWN"):
-        """화면 좌하단에 방향별(상행/하행) 정체 상태 패널을 그린다.
+        """화면 하단 좌측(Down)·우측(Up)에 방향별 정체 상태 미니 패널을 그린다.
 
-        A방향·B방향 각각의 레벨·jam_score 바·지속 시간을 표시하고,
-        가장 나쁜 방향 기준으로 조치 권고를 표시한다.
+        label_a/label_b 값에 따라 자동으로 DOWN↔UP 데이터를 좌우에 배치한다.
+        두 패널 사이 위쪽에 조치 권고 텍스트를 표시한다.
 
         Args:
             frame: BGR 이미지 프레임.
@@ -482,8 +486,8 @@ class Visualizer:
             level_b: B방향 정체 레벨.
             jam_score_b: B방향 jam_score.
             duration_sec_b: B방향 지속 시간(초).
-            label_a: A방향 표시 레이블 (기본값: "상행").
-            label_b: B방향 표시 레이블 (기본값: "하행").
+            label_a: A방향 표시 레이블 ("UP" 또는 "DOWN").
+            label_b: B방향 표시 레이블 ("DOWN" 또는 "UP").
         """
         fh, fw = frame.shape[:2]                                   # 프레임 높이·너비
 
@@ -493,87 +497,98 @@ class Visualizer:
             "SLOW":      (0, 200, 255),                            # 노랑 — 서행
             "CONGESTED": (0, 0, 255),                              # 빨강 — 정체
         }
-        color_a = _lv_colors.get(level_a, (200, 200, 200))        # A방향 색상
-        color_b = _lv_colors.get(level_b, (200, 200, 200))        # B방향 색상
+
+        # ── label 기준으로 Down/Up 데이터 매핑 ────────────────────
+        # label_a가 "DOWN"이면 A=Down(좌), B=Up(우), 아니면 반대
+        if label_a == "DOWN":                                      # A방향이 하행이면
+            down_lv, down_jam, down_dur = level_a, jam_score_a, duration_sec_a
+            up_lv,   up_jam,   up_dur   = level_b, jam_score_b, duration_sec_b
+        else:                                                      # A방향이 상행이면
+            up_lv,   up_jam,   up_dur   = level_a, jam_score_a, duration_sec_a
+            down_lv, down_jam, down_dur = level_b, jam_score_b, duration_sec_b
+        color_down = _lv_colors.get(down_lv, (200, 200, 200))     # Down 색상
+        color_up   = _lv_colors.get(up_lv,   (200, 200, 200))     # Up 색상
 
         # ── 최악 방향 기준 조치 권고 ──────────────────────────────
         _lv_order = {"SMOOTH": 0, "SLOW": 1, "CONGESTED": 2}      # 레벨 심각도 순서
-        if _lv_order.get(level_a, 0) >= _lv_order.get(level_b, 0):  # A가 더 나쁘면
-            worst_level = level_a                                  # 최악 = A
-            worst_dur = duration_sec_a                             # 최악 지속시간 = A
-            border_color = color_a                                 # 테두리 색 = A
-        else:                                                      # B가 더 나쁘면
-            worst_level = level_b                                  # 최악 = B
-            worst_dur = duration_sec_b                             # 최악 지속시간 = B
-            border_color = color_b                                 # 테두리 색 = B
+        if _lv_order.get(down_lv, 0) >= _lv_order.get(up_lv, 0): # Down이 더 나쁘면
+            worst_level, worst_dur = down_lv, down_dur             # 최악 = Down
+        else:                                                      # Up이 더 나쁘면
+            worst_level, worst_dur = up_lv, up_dur                 # 최악 = Up
         action = self._get_action_text(worst_level, worst_dur)     # 권고 문자열
 
-        # ── 패널 크기 결정 ────────────────────────────────────────
-        panel_w = 380                                              # 패널 너비 (px)
-        row_h = 50                                                 # 방향 1행 높이 (레벨 + 바)
-        dur_h_a = 18 if duration_sec_a > 0 else 0                  # A지속시간 행 높이
-        dur_h_b = 18 if duration_sec_b > 0 else 0                  # B지속시간 행 높이
-        action_h = 24 if action else 0                             # 조치 행 높이
-        panel_h = 10 + row_h + dur_h_a + 6 + row_h + dur_h_b + action_h + 10  # 전체 높이
-        px = 8                                                     # 패널 좌상단 x
-        py = fh - panel_h - 8                                      # 패널 좌상단 y (하단 기준)
+        # ── 미니 패널 크기 ────────────────────────────────────────
+        panel_w = 190                                              # 각 패널 너비 (기존 380 → 반으로)
+        panel_h = 58                                               # 기본 패널 높이 (지속시간 없을 때)
+        dur_extra = 14                                             # 지속시간 표시 시 추가 높이
+        margin = 8                                                 # 화면 가장자리 여백
+        bar_w = panel_w - 52                                       # jam bar 너비 (수치 공간 확보)
 
-        # ── 반투명 배경 ───────────────────────────────────────────
-        overlay = frame.copy()                                     # 원본 복사
-        cv2.rectangle(overlay, (px, py),                           # 어두운 배경 사각형
-                      (px + panel_w, py + panel_h), (20, 20, 20), -1)
-        cv2.addWeighted(overlay, 0.75, frame, 0.25, 0, frame)     # 75% 불투명 합성
-        cv2.rectangle(frame, (px, py),                             # 최악 방향 색상 테두리
-                      (px + panel_w, py + panel_h), border_color, 2)
-
-        # ── 공통 jam bar 그리기 헬퍼 ──────────────────────────────
-        bar_w = panel_w - 100                                      # 바 너비 (수치 공간 확보)
-
-        def _draw_direction_row(y_base, label, level, jam, dur_sec, color):
-            """한 방향의 레벨 텍스트 + jam bar + 지속시간을 그린다."""
-            # 레벨 텍스트: "[A] CONGESTED"
-            cv2.putText(frame, f"[{label}] {level}",              # 방향 레벨 텍스트
-                        (px + 10, y_base + 18),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2, cv2.LINE_AA)
+        def _draw_mini_panel(px, py, title, level, jam, dur_sec, color):
+            """미니 패널 1개 (제목+레벨, jam bar, 지속시간) 그리기."""
+            p_h = panel_h + (dur_extra if dur_sec > 0 else 0)     # 지속시간 유무에 따라 높이 조정
+            # 반투명 배경
+            overlay = frame.copy()                                 # 원본 복사 (합성용)
+            cv2.rectangle(overlay, (px, py),
+                          (px + panel_w, py + p_h), (20, 20, 20), -1)  # 어두운 배경
+            cv2.addWeighted(overlay, 0.75, frame, 0.25, 0, frame)  # 75% 불투명 합성
+            cv2.rectangle(frame, (px, py),
+                          (px + panel_w, py + p_h), color, 2)     # 레벨 색상 테두리
+            # 제목 + 레벨 텍스트 ("Down  CONGESTED")
+            cv2.putText(frame, f"{title}  {level}",
+                        (px + 8, py + 19),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.50, color, 2, cv2.LINE_AA)
             # jam_score 바
-            bar_x = px + 10                                        # 바 시작 x
-            bar_y = y_base + 26                                    # 바 시작 y
-            bar_h = 11                                             # 바 높이
+            bar_x = px + 8                                         # 바 시작 x
+            bar_y = py + 27                                        # 바 시작 y
+            bar_h = 10                                             # 바 높이
             filled = int(bar_w * min(1.0, max(0.0, jam)))         # 채워진 너비
-            cv2.rectangle(frame, (bar_x, bar_y),                   # 바 배경
-                          (bar_x + bar_w, bar_y + bar_h), (55, 55, 55), -1)
-            cv2.rectangle(frame, (bar_x, bar_y),                   # 채워진 부분
-                          (bar_x + filled, bar_y + bar_h), color, -1)
-            cv2.rectangle(frame, (bar_x, bar_y),                   # 바 테두리
-                          (bar_x + bar_w, bar_y + bar_h), (120, 120, 120), 1)
-            cv2.putText(frame, f"{jam:.2f}",                       # 수치 텍스트
-                        (bar_x + bar_w + 6, bar_y + bar_h),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.38, (200, 200, 200), 1, cv2.LINE_AA)
-            # 지속 시간 (해당 방향이 SLOW/CONGESTED일 때만)
-            row_total = 38                                         # 기본 행 높이 (텍스트+바)
-            if dur_sec > 0:                                        # 지속시간 표시 필요 시
-                mins = int(dur_sec // 60)                          # 분
-                secs = int(dur_sec % 60)                           # 초
-                dur_text = f"{mins}m {secs}s" if mins > 0 else f"{secs}s"    # 포맷
-                cv2.putText(frame, dur_text,                       # 지속 시간 텍스트
-                            (px + 14, y_base + 50),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.35, (160, 160, 160), 1, cv2.LINE_AA)
-                row_total += 18                                    # 지속시간 행 추가
-            return row_total                                       # 이 방향이 차지한 높이 반환
+            cv2.rectangle(frame, (bar_x, bar_y),
+                          (bar_x + bar_w, bar_y + bar_h), (55, 55, 55), -1)  # 바 배경
+            cv2.rectangle(frame, (bar_x, bar_y),
+                          (bar_x + filled, bar_y + bar_h), color, -1)  # 채워진 부분
+            cv2.rectangle(frame, (bar_x, bar_y),
+                          (bar_x + bar_w, bar_y + bar_h), (120, 120, 120), 1)  # 바 테두리
+            cv2.putText(frame, f"{jam:.2f}",                       # jam 수치 텍스트
+                        (bar_x + bar_w + 4, bar_y + bar_h),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.36, (200, 200, 200), 1, cv2.LINE_AA)
+            # 지속 시간 (SLOW/CONGESTED 유지 시간)
+            if dur_sec > 0:                                        # 지속시간 있을 때만
+                mins = int(dur_sec // 60)                          # 분 계산
+                secs = int(dur_sec % 60)                           # 초 계산
+                dur_text = f"{mins}m {secs}s" if mins > 0 else f"{secs}s"
+                cv2.putText(frame, dur_text,                       # 지속시간 텍스트
+                            (px + 8, py + p_h - 5),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.33, (160, 160, 160), 1, cv2.LINE_AA)
 
-        # ── A방향 (상단) ──────────────────────────────────────────
-        y_cursor = py + 6                                          # 시작 y (상단 여백)
-        h_a = _draw_direction_row(y_cursor, label_a, level_a,      # A방향 행 그리기 (상행/하행 레이블)
-                                  jam_score_a, duration_sec_a, color_a)
-        y_cursor += h_a + 4                                        # A행 높이 + 간격
+        # ── Down 패널 (하단 좌측) ──────────────────────────────────
+        down_h = panel_h + (dur_extra if down_dur > 0 else 0)     # Down 패널 실제 높이
+        up_h   = panel_h + (dur_extra if up_dur   > 0 else 0)     # Up 패널 실제 높이
+        max_h  = max(down_h, up_h)                                 # 두 패널 중 더 큰 높이 (y 기준 통일)
+        py_panel = fh - max_h - margin                             # 공통 상단 y (하단 기준)
+        _draw_mini_panel(margin, py_panel,                         # 좌측 여백에 배치
+                         "Down", down_lv, down_jam, down_dur, color_down)
 
-        # ── B방향 (하단) ──────────────────────────────────────────
-        h_b = _draw_direction_row(y_cursor, label_b, level_b,      # B방향 행 그리기 (상행/하행 레이블)
-                                  jam_score_b, duration_sec_b, color_b)
-        y_cursor += h_b + 2                                        # B행 높이 + 간격
+        # ── Up 패널 (하단 우측) ────────────────────────────────────
+        _draw_mini_panel(fw - panel_w - margin, py_panel,          # 우측 여백에 배치
+                         "Up", up_lv, up_jam, up_dur, color_up)
 
-        # ── 조치 권고 (최하단, 노란 계열) ─────────────────────────
+        # ── 조치 권고 (두 패널 사이 위쪽, 중앙 정렬) ─────────────
         if action:                                                 # 조치 있을 때만
-            cv2.putText(frame, action,                             # 조치 텍스트
-                        (px + 10, y_cursor + 14),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.40, (50, 200, 255), 1, cv2.LINE_AA)
+            font_scale = 0.52                                      # 텍스트 크기 (기존 0.38 → 가시성 향상)
+            font_thick = 2                                         # 텍스트 두께 (기존 1 → 가시성 향상)
+            (tw, th), baseline = cv2.getTextSize(                  # 텍스트 크기 측정 (중앙 정렬용)
+                action, cv2.FONT_HERSHEY_SIMPLEX, font_scale, font_thick)
+            text_x = (fw - tw) // 2                               # 화면 가로 중앙
+            text_y = py_panel - 10                                 # 패널 바로 위에 표시
+            # 반투명 배경 박스 (텍스트 가독성 확보)
+            pad = 6                                                # 배경 박스 패딩
+            overlay = frame.copy()                                 # 합성용 복사
+            cv2.rectangle(overlay,
+                          (text_x - pad, text_y - th - pad),      # 박스 좌상단
+                          (text_x + tw + pad, text_y + baseline + pad),  # 박스 우하단
+                          (20, 20, 20), -1)                        # 어두운 배경
+            cv2.addWeighted(overlay, 0.40, frame, 0.60, 0, frame)  # 40% 불투명 합성
+            cv2.putText(frame, action,                             # 조치 권고 텍스트
+                        (text_x, text_y),
+                        cv2.FONT_HERSHEY_SIMPLEX, font_scale, (50, 200, 255), font_thick, cv2.LINE_AA)

@@ -133,8 +133,17 @@ class FeatureExtractor:
             r = int(np.clip(fy / cell_h, 0, grid_size - 1))  # 셀 행 (범위 클램프)
             c = int(np.clip(fx / cell_w, 0, grid_size - 1))  # 셀 열 (범위 클램프)
             occupied_cells.add((r, c))                 # 셀 좌표 추가
-        total_cells = grid_size * grid_size            # 전체 셀 수 (225)
-        density_score = len(occupied_cells) / total_cells  # 점유율 (0~1)
+        total_cells = grid_size * grid_size            # 전체 셀 수 (400 = 20×20)
+        raw_density = len(occupied_cells) / total_cells    # 원시 점유율 (고속도로 20대 = 0.05 수준)
+
+        # ── density 정규화: 현실적 최대 차량 수 기준으로 0~1 확장 ───────
+        # 20×20 그리드에서 차량 20대 → raw_density = 0.05 → 기여 거의 0
+        # density_max_vehicles 대 이상이면 포화(1.0)로 처리
+        density_max = getattr(self.cfg, "density_max_vehicles", 20.0)  # 포화 기준 차량 수
+        density_scale = density_max / total_cells          # 포화 기준 점유율 (예: 20/400 = 0.05)
+        density_score = float(np.clip(                     # 정규화: raw / 포화기준, 최대 1.0
+            raw_density / density_scale, 0.0, 1.0
+        ))
 
         # ── 7차원 feature 벡터 계산 ──────────────────────────────────
         # [0] norm_speed_ratio: 현재 속도 / 기준 속도 (1.0이면 정상)
