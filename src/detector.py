@@ -421,8 +421,8 @@ class Detector:
                 if not st.is_learning and not st.relearning:        # 탐지 모드일 때만
                     self.idm.check_reappear(tid, cx, cy)            # 재매칭 시도
 
-                # 궤적에 현재 위치 추가
-                st.trajectories[tid].append((cx, cy))               # 궤적 포인트 추가
+                # 궤적에 현재 위치 추가 (footpoint 기준 — bbox 크기 변화에 무관하게 안정적)
+                st.trajectories[tid].append((fx, fy))               # cx,cy 대신 fx,fy 사용
                 if len(st.trajectories[tid]) > cfg.trail_length:    # 최대 길이 초과 시
                     st.trajectories[tid].pop(0)                     # 오래된 궤적 제거
 
@@ -452,10 +452,10 @@ class Detector:
                         speeds[tid] = speed                         # 속도 딕셔너리에 기록
 
                         if st.is_learning or st.relearning:         # 학습/재학습 모드
-                            self.flow.learn_step(                   # 흐름장 업데이트
+                            self.flow.learn_step(                   # 흐름장 업데이트 (footpoint 기준)
                                 traj[-cfg.velocity_window][0],
                                 traj[-cfg.velocity_window][1],
-                                cx, cy, cfg.min_move_distance
+                                fx, fy, cfg.min_move_distance       # cx,cy → fx,fy (footpoint 일관성)
                             )
                         else:                                       # 감지 모드
                             # 역주행 여부 판단
@@ -467,10 +467,10 @@ class Detector:
                             if (cfg.enable_online_flow_update and
                                     (not is_wrong) and
                                     (st.wrong_way_count[tid] == 0)):
-                                self.flow.learn_step(               # 흐름장 업데이트
+                                self.flow.learn_step(               # 흐름장 업데이트 (footpoint 기준)
                                     traj[-cfg.velocity_window][0],
                                     traj[-cfg.velocity_window][1],
-                                    cx, cy, cfg.min_move_distance
+                                    fx, fy, cfg.min_move_distance  # cx,cy → fx,fy (footpoint 일관성)
                                 )
                                 # 방향별 SMOOTH + 최소 활성 차량 조건 충족 시 baseline 온라인 갱신
                                 _dir = self._track_direction.get(tid, 'a')  # 해당 차량 방향

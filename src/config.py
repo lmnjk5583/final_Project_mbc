@@ -15,7 +15,7 @@ class DetectorConfig:
     grid_size: int = 20               # 흐름 맵을 나눌 격자 크기 (N x N) — 20은 셀 수 과다→셀당 샘플 부족→노이즈
 
     # ==================== 학습(learning) 관련 설정 ====================
-    learning_frames: int = 700        # 초기 학습에 사용할 프레임 수 — 원래 500, 충분한 셀 커버리지 확보
+    learning_frames: int = 18000        # 초기 학습에 사용할 프레임 수 — 원래 500, 충분한 셀 커버리지 확보
     alpha: float = 0.1                # EMA 학습 속도 (새 데이터 반영 비율 10%)
     min_samples: int = 5              # 셀당 최소 학습 샘플 수 (이하이면 공간 보정에 사용)
     enable_online_flow_update: bool = False # 정상 흐름 학습에 사용(True)

@@ -188,9 +188,12 @@ class PassageTracker:
 
         LCS = 0.40×signal_A + 0.35×signal_B + 0.25×signal_C
 
-        signal_A: dwell 분포 편중도 (median/min 비율)
-        signal_B: 속도 저하 정도 (1 - mean/max)
-        signal_C: 차량 누적 정도 (1 - exit/entry)
+        signal_A: dwell 편중도 (median/p10 비율, 분모 8)
+                  → p10으로 자연 편차 흡수, 분모 8로 범위 보정
+        signal_B: 속도 저하 정도 (1 - mean/p95)
+                  → p95로 bbox 튐 이상치 방지
+        signal_C: dwell 변동계수 (std/median/2)
+                  → smooth=균일 분포, 정체=편차 큰 분포 판별
 
         Returns:
             0.0~1.0 사이 점수. 데이터 부족 시 0.5.
@@ -203,41 +206,59 @@ class PassageTracker:
         if len(valid_dwells) < 2:                      # 유효 passage 2개 미만이면
             return 0.5                                 # 판단 불가 → 중간값 반환
 
-        # ── signal_A: dwell 분포 편중 ────────────────────────────────
-        min_dwell = max(min(valid_dwells), 1)          # 최소 dwell (0 방지 → 1)
+        # ── signal_A: dwell 편중도 ──────────────────────────────────
+        # p10 사용 이유: p5보다 안정적인 '빠른 차량' 기준선.
+        #   고속도로 카메라는 진입 위치에 따라 dwell이 자연스럽게 분산됨
+        #   (상단 진입=긴 dwell, 하단 진입=짧은 dwell) → p5는 이 자연 편차에
+        #   너무 민감해 smooth 도로에서도 signal_A가 과대 산출됨.
+        # 분모 8 이유: median/p10 비율이 smooth 도로에서 2~3 수준이므로
+        #   (2-1)/8=0.12, 정체 도로(비율 4~6)에서 (5-1)/8=0.50 → 범위 유효.
+        p10_dwell = max(                               # 하위 10% dwell (0 방지)
+            float(np.percentile(valid_dwells, 10)), 1.0
+        )
         median_dwell = float(np.median(valid_dwells))  # 중앙값 dwell
         signal_A = min(                                # 편중도 계산 (0~1 클램프)
-            (median_dwell / min_dwell - 1) / 5.0,      # (중앙/최소 - 1) / 5
+            (median_dwell / p10_dwell - 1) / 8.0,      # (중앙/p10 - 1) / 8
             1.0                                        # 상한 1.0
         )
 
         # ── signal_B: 속도 저하 정도 ────────────────────────────────
+        # max() 대신 95th percentile 사용 — bbox 순간 튐 이상치로 인해
+        # max_speed가 폭등하고 signal_B가 1.0 고착되는 문제 수정
         if self._all_norm_mags:                        # norm_mag 데이터가 있으면
-            max_speed = max(                           # 최대 속도 (0 방지)
-                max(self._all_norm_mags), 1e-6
+            p95_speed = max(                           # 상위 5% 속도 (0 방지)
+                float(np.percentile(self._all_norm_mags, 95)), 1e-6
             )
             mean_speed = float(np.mean(                # 평균 속도
                 self._all_norm_mags
             ))
-            signal_B = 1.0 - mean_speed / max_speed    # 속도 저하 비율
+            signal_B = max(                            # 속도 저하 비율 (하한 0)
+                0.0,
+                1.0 - mean_speed / p95_speed           # mean이 p95에 가까울수록 0
+            )
         else:                                          # 데이터 없으면
             signal_B = 0.5                             # 중간값
 
-        # ── signal_C: 차량 누적 (유출 부족) ──────────────────────────
-        if self._frame_counts:                         # 프레임 데이터가 있으면
-            total_entry = sum(self._frame_counts) + 1e-6  # 전체 활성 합계 (0 방지)
-            total_exit = sum(self._exit_counts)        # 전체 퇴장 합계
-            signal_C = max(                            # 누적 비율 (하한 0)
-                0.0,
-                1.0 - total_exit / total_entry         # 1 - (퇴장/활성)
+        # ── signal_C: dwell 변동계수(CV) ────────────────────────────
+        # 기존 방식(mean_exit/mean_active) 문제: 차 한 대가 수백 프레임 걸리므로
+        #   프레임당 퇴장 수는 항상 활성 수보다 훨씬 작음 → signal_C ≈ 0.97 고정.
+        #   smooth/정체 도로 모두 동일하게 높아 판별력 없음.
+        # 수정: dwell의 변동계수(std/median)를 사용 — 실질적 판별 근거:
+        #   smooth 도로: 모든 차가 비슷한 속도 → dwell 분포 균일 → CV 낮음(0.2~0.4)
+        #   정체 도로: 정지 차량+이동 차량 혼재 → dwell 분포 편차 큼 → CV 높음(0.6~1.5+)
+        # /2 정규화: smooth CV(0.3~0.4)/2 = 0.15~0.20 목표 범위로 조정.
+        if median_dwell > 1e-6:                        # median 유효하면 (0 방지)
+            dwell_cv = (                               # 변동계수 = std / median
+                float(np.std(valid_dwells)) / median_dwell
             )
-        else:                                          # 데이터 없으면
+            signal_C = min(dwell_cv / 2.0, 1.0)       # /2 정규화 후 상한 1.0 클램프
+        else:                                          # median 0이면 (방어)
             signal_C = 0.5                             # 중간값
 
         # ── 가중 합산 ────────────────────────────────────────────────
         lcs = (0.40 * signal_A                         # dwell 편중 기여 (40%)
                + 0.35 * signal_B                       # 속도 저하 기여 (35%)
-               + 0.25 * signal_C)                      # 차량 누적 기여 (25%)
+               + 0.25 * signal_C)                      # 차량 유출 기여 (25%)
         return lcs                                     # LCS 반환 (0.0~1.0)
 
     # ==================================================================
