@@ -14,11 +14,7 @@ sys.path.insert(0, str(PROJECT_ROOT))                   # from src import ... �
 from src import Detector, DetectorConfig                # src/__init__.py 경유
 
 # ── 경로 설정 ──────────────────────────────────────────────────────
-MODEL_PATH = Path(                                      # YOLO 모델 경로
-    r"N:\개인\박대원\0211~0313_miniproject"
-    r"\highway-anomaly-detection\runs"
-    r"\yolo11n_vehicle_v5\weights\best.pt"
-)
+MODEL_PATH = PROJECT_ROOT / "runs" / "yolo11n_v1" / "weights" / "best.pt"  # YOLO 모델 가중치
 
 VIDEO_DIR  = Path(                                      # 한강대교 10분 영상 폴더
     r"N:\개인\대원&수빈\최종 프로젝트\임시\2026-03-31_10-44-07\videos"
@@ -26,7 +22,7 @@ VIDEO_DIR  = Path(                                      # 한강대교 10분 영
 VIDEO_FILE = "record_2026-03-31_10-44-07.mp4"          # 베이스라인 학습용 영상 파일명
 
 FLOW_MAP_PATH = PROJECT_ROOT / "baselines" / "hangang_baseline.npy"  # 베이스라인 저장 경로
-RESULT_DIR    = PROJECT_ROOT / "임시" / "results"                     # 결과 영상 저장 폴더
+RESULT_DIR    = PROJECT_ROOT / "results"                     # 결과 영상 저장 폴더
 
 # ── DetectorConfig 구성 ───────────────────────────────────────────
 cfg = DetectorConfig(

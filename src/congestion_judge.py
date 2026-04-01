@@ -76,9 +76,18 @@ def compute_jam_score(x_t: dict, lcs: float, cfg) -> float:
 
 
 def compute_jam_score_fallback(x_t: dict) -> float:
-    """baseline 없이 밀도·정지비율·유출만으로 jam_score를 계산한다 (fallback 모드).
+    """baseline 없이 밀도·정지비율만으로 jam_score를 계산한다 (fallback 모드).
 
     정확도 낮음 — passage/dwell 기반 판정 불가 시 사용.
+
+    설계 목표:
+      - 정상 (density≈0.20, stop≈0.03): jam ≈ 0.10 → SMOOTH
+      - 중간 정체 (density≈0.40, stop≈0.35): jam ≈ 0.37 → SLOW
+      - 극심 정체 (density≈0.60, stop≈0.70): jam ≈ 0.66 → CONGESTED
+
+    유출(exit_rate_ratio) 제거 이유:
+      fallback 모드에서 count_ref=15 고정값 기반 exit_rate_ratio는
+      실제 교통량과 무관하게 outflow_contribution을 과대 산출함 → 신뢰 불가.
 
     Args:
         x_t: 7차원 feature 벡터 dict.
@@ -86,27 +95,21 @@ def compute_jam_score_fallback(x_t: dict) -> float:
     Returns:
         jam_score (0.0~1.0).
     """
-    # ── 밀도 기여 (density_score × 2, 상한 1.0) ─────────────────────
+    # ── 밀도 기여 (배율 1.0 — 고속도로 정상 교통도 20~25% 점유) ────────
+    # 기존 × 2.0은 정상 교통에서도 density_contribution이 과도하게 높아져
+    # stop이 낮아도 jam이 0.3 이상으로 올라가 SLOW 오판 유발.
     density_contribution = _clip(                      # 밀도가 높을수록 정체
-        x_t["density_score"] * 2.0, 0.0, 1.0
+        x_t["density_score"] * 1.0, 0.0, 1.0          # 배율 2.0 → 1.0 (과대평가 방지)
     )
 
-    # ── 정지 비율 기여 (그대로 사용) ─────────────────────────────────
+    # ── 정지 비율 기여 (정체의 핵심 지표 — 카메라 무관) ─────────────────
     stop_contribution = x_t["stop_ratio"]              # 0~1 범위
 
-    # ── 유출 부족 기여 (유출 낮을수록 정체) ───────────────────────────
-    if x_t["exit_rate_ratio"] < 2.0:                   # 유출이 2배 미만이면
-        outflow_contribution = _clip(                  # 유출 부족 기여
-            1.0 - x_t["exit_rate_ratio"] / 2.0,       # 유출 적을수록 높음
-            0.0, 1.0                                   # 범위 클램프
-        )
-    else:                                              # 유출 2배 이상이면
-        outflow_contribution = 0.0                     # 유출 충분 → 기여 0
-
-    # ── 가중 합산 ────────────────────────────────────────────────────
-    return (0.30 * density_contribution                # 밀도 가중 30%
-            + 0.50 * stop_contribution                 # 정지 가중 50% (가장 직접적)
-            + 0.20 * outflow_contribution)             # 유출 부족 가중 20%
+    # ── 가중 합산 (density 40% + stop 60%) ───────────────────────────
+    # stop_ratio를 주 지표로 높이고, density는 보조 지표로 낮춤.
+    # 정상 주행 차량이 많아도 정지가 없으면 낮은 score 유지.
+    return (0.40 * density_contribution                # 밀도 가중 40%
+            + 0.60 * stop_contribution)                # 정지 가중 60% (핵심 지표)
 
 
 # ======================================================================
@@ -214,21 +217,33 @@ class CongestionJudge:
 
     # ── LCS 보정 임계값 접근자 ────────────────────────────────────────
     def get_smooth_threshold(self) -> float:
-        """LCS 보정된 SMOOTH 판정 임계값을 반환한다.
+        """SMOOTH 판정 임계값을 반환한다.
+
+        fallback 모드에서는 LCS 보정 미적용 — fallback 공식은 score 범위가
+        정상 모드보다 보수적이므로 임계값을 낮추면 SLOW 오판 발생.
+        정상 모드에서만 LCS로 임계값을 낮춰 정체 감지 민감도를 높인다.
 
         Returns:
-            smooth_jam_threshold × (1 - lcs × 0.40). 기본 0.25, 최저 0.15.
+            fallback: smooth_jam_threshold 그대로 (기본 0.30).
+            정상:     smooth_jam_threshold × (1 - lcs × 0.40).
         """
-        lcs = self.baseline.lcs if self.baseline else 0.0  # LCS (없으면 0)
+        if self.baseline is not None and self.baseline.is_fallback:  # fallback 모드
+            return self.cfg.smooth_jam_threshold               # LCS 보정 없음
+        lcs = self.baseline.lcs if self.baseline else 0.0      # 정상 모드: LCS 적용
         return self.cfg.smooth_jam_threshold * (1.0 - lcs * 0.40)  # LCS 보정
 
     def _get_slow_threshold(self) -> float:
-        """LCS 보정된 SLOW 판정 임계값을 반환한다.
+        """SLOW 판정 임계값을 반환한다.
+
+        fallback 모드에서는 LCS 보정 미적용 (get_smooth_threshold 참고).
 
         Returns:
-            slow_jam_threshold × (1 - lcs × 0.30). 기본 0.55, 최저 0.38.
+            fallback: slow_jam_threshold 그대로 (기본 0.55).
+            정상:     slow_jam_threshold × (1 - lcs × 0.30).
         """
-        lcs = self.baseline.lcs if self.baseline else 0.0  # LCS (없으면 0)
+        if self.baseline is not None and self.baseline.is_fallback:  # fallback 모드
+            return self.cfg.slow_jam_threshold                 # LCS 보정 없음
+        lcs = self.baseline.lcs if self.baseline else 0.0      # 정상 모드: LCS 적용
         return self.cfg.slow_jam_threshold * (1.0 - lcs * 0.30)  # LCS 보정
 
     # ── 히스테리시스 적용 ────────────────────────────────────────────
