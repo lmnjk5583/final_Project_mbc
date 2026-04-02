@@ -4,6 +4,38 @@
 
 ---
 
+## 2026-04-02 (64차 — 문서 체계 정비 + 화면설계서 v1.1 재생성)
+
+### 오늘 한 작업
+
+**문서 체계 정비**
+- `CLAUDE.md`: guide.md 운영 규칙 확립 (산출물↔guide 동기화 원칙 명시), 수빈_노트/대원_노트 참조 제외, N드라이브 산출물 경로·읽기 방법·충돌 보고 형식 고정
+- `FILE_INDEX.md`: N드라이브 산출물 경로 명시, 인터페이스명세서 v1.2 경로 업데이트
+- `Docs/dev_guide.md`: §0 체크리스트 전체 ✅ 업데이트 (Phase 1·2 완료 반영), guide 역할 명시, 파라미터 기준값 실제값과 동기화
+- `Docs/dev_guide_phase2.md`: Phase 1·2 완료 상태 명시, **Phase 3 설계 명세 신규 추가** (§13)
+- `Docs/plan.md`: Phase 1·2 완료 / Phase 3 미구현 상태 반영, 역할 분담 업데이트
+
+**화면설계서 v1.1 재생성**
+- `generate_screen_design_docx.py` 수정: km/h → 정상 대비 속도(%) 전환 (7곳), LSTM → GRU, 정체 판정 기준 jam_score 기반으로 변경, 개정이력 v1.1 추가
+- 재생성 후 `N:\개인\대원&수빈\최종 프로젝트\산출물\교통흐름모니터링_화면설계서.docx` 덮어쓰기 완료
+
+**산출물 충돌 잔존 확인** (수빈이 직접 수정 필요)
+- 인터페이스 명세서 v1.2: 표지 버전 표기·§1.1 Phase 상태·§4.4.2 임계값·§2.2 C키 누락 (4곳)
+- 프로그램설계서: §4.1·§8.1·§8.2 파라미터값 (3곳)
+
+### 수정 파일
+`CLAUDE.md`, `FILE_INDEX.md`, `Docs/dev_guide.md`, `Docs/dev_guide_phase2.md`, `Docs/plan.md`, `work_log.md`, `work_log_archive.md`
+`N드라이브: generate_screen_design_docx.py`, `교통흐름모니터링_화면설계서.docx`
+
+### 발생 오류
+- python-docx 미설치 → cv 환경에 설치 완료
+
+### 작업 재개 위치
+- 웹 화면 구성(React 뼈대) 작업 시작 예정
+- 산출물 인터페이스명세서·프로그램설계서 수동 수정 대기 중 (수빈)
+
+---
+
 ## 2026-04-01 (63차 — flow_map 개선 + 시각화 개편 + 파라미터 튜닝)
 
 ### 오늘 한 작업
@@ -67,20 +99,3 @@
 
 ---
 
-## 2026-03-31 (60차 — LCS compute_lcs() 3단계 수정)
-
-- `passage_tracker.py`: `compute_lcs()` 총 3차례 수정 (0.96 → 0.58 → 0.36)
-  - signal_A: `percentile(5)/5` → `percentile(10)/8` — 자연 편차 흡수 + 범위 보정
-  - signal_B: `max` → `percentile(95)` — bbox 튐 이상치 방지
-  - signal_C: `exit/active(≈0.977 고정)` → `std(dwells)/median/2` — 변동계수 기반 교체
-- **수정 파일**: `src/passage_tracker.py`
-
----
-
-## 2026-03-31 (59차 — 프로젝트 경로 C드라이브 이전 및 CLAUDE.md 정리)
-
-- 프로젝트 전체 `N:\개인\대원&수빈\최종 프로젝트` → `C:\final_pj` 이동
-- `src/` 8개, `tests/` 4개, 실행 스크립트 2개 경로 주석 수정
-- CLAUDE.md 완료 섹션 정리
-
----

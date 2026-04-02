@@ -7,26 +7,22 @@
 | 폴더/파일 | 내용 |
 |-----------|------|
 | `Docs/` | 개발 기준서(dev_guide.md), 계획서(plan.md), 논문 근거(research.md) |
-| `src/` | 탐지 시스템 Python 코드 전체. 미니프로젝트 py 복사본(역주행) + Phase 1 신규 파일(정체). 완성 후 팀원 웹 reverse_modules/에 이식 |
+| `src/` | 탐지 시스템 Python 코드 전체. Phase 1·2 완료. 완성 후 팀원 웹 reverse_modules/에 이식 |
 | `tests/` | pytest 테스트 파일 (TDD — 코드 작성 전 먼저 작성) |
 | `mini_project/` | 미니프로젝트 Jupyter Notebook — 데이터 전처리·라벨링·YOLO 학습 (참조용) |
 | `run_wrongway.py` | 역주행 탐지 실행 진입점 (루트에서 `python run_wrongway.py`) |
 | `run_test.py` | 정체 탐지 연동 테스트 실행 (루트에서 `python run_test.py`) |
-| `산출물/` | 기획서(PPT), WBS, 요구사항 정의서(Excel) |
-| `대원_노트/` | 코드 분석 노트 |
-| `수빈_노트/` | 산출물 체크리스트 |
+| `산출물/` (N드라이브) | `N:\개인\대원&수빈\최종 프로젝트\산출물` — 기획서·WBS·요구사항정의서·화면설계서·인터페이스명세서·프로그램설계서 등 (`.docx`/`.xlsx`/`.pdf`) |
 
 ## 요청 유형 → 읽을 파일
 
 | 요청 유형 | 읽을 파일 (순서대로) |
 |-----------|----------------------|
-| 개발 관련 작업 (코드, 테스트, 설계) | **`Docs/dev_guide.md`** (Phase 1 기준 전체 포함) |
-| Phase 2 이후 작업 (GRU·기술스택·알림등급) | **`Docs/dev_guide_phase2.md`** |
+| 개발 관련 작업 (코드, 테스트, 설계) | **`Docs/dev_guide.md`** + **`Docs/dev_guide_phase2.md`** (Phase 1·2 모두 완료) |
 | 현재 상태 파악 / 어디까지 했는지 | `work_log.md` |
 | 전체 계획 / 마일스톤 | `Docs/plan.md` |
 | 논문 근거 / 조치 권고 상세 | `Docs/research.md` |
-| 산출물 확인 (기획서, WBS 등) | `산출물/` 폴더 내 해당 파일 |
-| 산출물 체크리스트 | `수빈_노트/` 폴더 내 해당 파일 |
+| 산출물 확인 (기획서, WBS, 화면설계서 등) | `N:\개인\대원&수빈\최종 프로젝트\산출물\` 폴더. `.docx` 파일은 Bash + `/c/Users/User/.conda/envs/cv/python.exe`로 zipfile 방식 읽기 |
 | 전체 프로젝트 구조 파악 | CLAUDE.md (이미 로드됨) → `work_log.md` |
 
 ## 개발 파일 역할
@@ -84,6 +80,6 @@
 | `dev_guide_phase2.md` | `Docs/` | **개발 기준서 Phase 2** — GRU·기술스택·알림등급·WebSocket |
 | `plan.md` | `Docs/` | 전체 개발 계획, 마일스톤 |
 | `research.md` | `Docs/` | 논문 근거, 조치 권고 매핑 |
-| `교통흐름모니터링_유스케이스_v1.0.md` | `수빈_노트/` | 유스케이스 명세서 — **§7에 UC↔SCR 대응표 포함** (팀원 연동 시 참조) |
+| 인터페이스 명세서 | N드라이브 산출물 | `교통흐름모니터링_인터페이스_명세서_v1.2.docx` — SCR↔모듈 연동, UC↔인터페이스 대응표 |
 
 ## 파일 추가 시 이 파일만 수정하면 됩니다.
