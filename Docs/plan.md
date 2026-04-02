@@ -28,7 +28,7 @@
 
 ## 3. 새로 추가할 기능
 
-### 3.0 정체 탐지 모듈 (Phase 1 개발 중)
+### 3.0 정체 탐지 모듈 (Phase 1·2 완료 — 2026-04-02)
 
 **설계 원칙**: 절대 km/h 없이 학습 기준 대비 상대 비율로 정체 판단.
 상세 설계는 `Docs/dev_guide.md` §3~10 참조.
@@ -39,7 +39,7 @@
 | 통과 기록 | `passage_tracker.py` (신규) | 차량 진입/퇴장 dwell 집계 → BaselineStats 산출 |
 | 정체 판정 | `congestion_judge.py` (신규) | jam_score 계산·레벨 판정·히스테리시스 |
 | 정체 탐지 (래퍼) | `traffic_analyzer.py` (개조) | 기존 인터페이스 유지, 내부 교체 |
-| GRU 모듈 | `gru_module.py` (신규, Phase 2) | 시계열 패턴 학습·추론 |
+| GRU 모듈 | `gru_module.py` (완료, Phase 2) | 시계열 패턴 학습·추론 |
 | baseline 자료구조 | `baseline_stats.py` (신규) | PassageRecord·BaselineStats 데이터 클래스 |
 | 기존 파일 확장 | `state.py`, `id_manager.py`, `flow_map.py` | 최소 수정 (§15 원칙 적용) |
 | 정체 시각화 | `visualizer.py` 확장 | draw_congestion_status, draw_congestion_heatmap |
@@ -48,9 +48,9 @@
 
 **개발 순서 (Phase 1 → 2 → 3)**:
 ```
-Phase 1: 규칙 기반 jam_score (normalized_mag + dwell + count)
-Phase 2: GRU 병렬 추가 (40% 혼합)
-Phase 3: GRU primary (65%)
+Phase 1: 규칙 기반 jam_score (normalized_mag + dwell + count)   ✅ 완료
+Phase 2: GRU 병렬 추가 (40% 혼합)                              ✅ 완료
+Phase 3: GRU primary (65%) — dev_guide_phase2.md §13 참조       ⬜ 미구현
 ```
 
 ### 3.1 정체 해결 조치 권고 (research.md §11 기반)
@@ -81,8 +81,9 @@ frontend_js/src/modules/carbon/
 ```
 
 **역할 분담**:
-- 우리: `src/` 개발 완료 → 깃허브 공유
-- 팀원: carbon.py API 라우트 + index.jsx UI 개발
+- 대원: `src/` 개발 완료 → 깃허브 공유
+- 수빈: 화면설계서 기반 React 웹 화면 구성 (뼈대) 담당
+- 팀원: carbon.py API 라우트 + WebSocket + MySQL 연동
 
 **DB**: 역주행 + 정체 이벤트 모두 저장 (MySQL, 기존 DetectionResult 모델 활용 또는 신규 모델 추가)
 

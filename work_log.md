@@ -6,9 +6,7 @@
 
 ## 2026-04-02 (65차 — fallback jam_score 근본 수정: slow_ratio 도입)
 
-### 오늘 한 작업
-
-**[이전 64차 작업 포함 — 아래는 이번 세션 추가 작업]**
+### 오늘 한 작업 [대원]
 
 **jam_score 로직 전체 분석 및 근본 문제 발견**
 - `norm_speed_ratio` fallback 적용 불가 이유 확인:
@@ -28,25 +26,50 @@
 **fallback 공식 최종 교체 (`src/congestion_judge.py`)**
 - 기존: `0.40×density + 0.60×stop` (서행 감지 불가)
 - 최종: `0.50×slow + 0.30×stop + 0.20×density`
-- 설계 목표 수치:
-  - 원활 (slow=0.02, stop=0.01, density=0.25): jam = **0.06** → SMOOTH
-  - 서행 (slow=0.60, stop=0.05, density=0.40): jam = **0.40** → SLOW
-  - 정체 (slow=0.20, stop=0.70, density=0.70): jam = **0.45** → SLOW
-  - 극심 (slow=0.10, stop=0.90, density=0.80): jam = **0.48** → CONGESTED
+- 설계 목표: 원활 jam=0.06, 서행 jam=0.40, 극심 jam=0.48
 
-### 수정 파일
+### 수정 파일 [대원]
 `src/config.py`, `src/flow_map.py`, `src/judge.py`, `src/detector.py`,
 `src/feature_extractor.py`, `src/traffic_analyzer.py`, `src/congestion_judge.py`
 
 ### 발생 오류 / 확인 사항
-- `judge.py` NameError: `adaptive_threshold` → `nm_speed`로 수정 (64차)
 - norm_speed_ratio 기반 접근 4차례 시도 → 근본 원인(norm_speed_ref 고정값) 확인 후 포기
 - slow_ratio 방식으로 전환: nm 기준값 의존 없이 직접 구간 카운트
 
-### 작업 재개 위치
+### 작업 재개 위치 [대원]
 - 서행/정체 영상에서 slow_ratio 도입 후 jam_score 확인 (목표: 서행 ≥ 0.30)
-- nm < 0.15 구간 차량이 실제로 얼마나 잡히는지 확인 (velocity_window=20프레임 조건 충족 차량 기준)
-- 역주행 오탐 추가 검증 (nm-based gate + velocity_window=20 적용 후)
+
+---
+
+## 2026-04-02 (64차 — 문서 체계 정비 + 화면설계서 v1.1 재생성)
+
+### 오늘 한 작업 [수빈]
+
+**문서 체계 정비**
+- `CLAUDE.md`: guide.md 운영 규칙 확립 (산출물↔guide 동기화 원칙 명시), 수빈_노트/대원_노트 참조 제외, N드라이브 산출물 경로·읽기 방법·충돌 보고 형식 고정
+- `FILE_INDEX.md`: N드라이브 산출물 경로 명시, 인터페이스명세서 v1.2 경로 업데이트
+- `Docs/dev_guide.md`: §0 체크리스트 전체 ✅ 업데이트 (Phase 1·2 완료 반영), guide 역할 명시, 파라미터 기준값 실제값과 동기화
+- `Docs/dev_guide_phase2.md`: Phase 1·2 완료 상태 명시, **Phase 3 설계 명세 신규 추가** (§13)
+- `Docs/plan.md`: Phase 1·2 완료 / Phase 3 미구현 상태 반영, 역할 분담 업데이트
+
+**화면설계서 v1.1 재생성**
+- `generate_screen_design_docx.py` 수정: km/h → 정상 대비 속도(%) 전환 (7곳), LSTM → GRU, 정체 판정 기준 jam_score 기반으로 변경, 개정이력 v1.1 추가
+- 재생성 후 `N:\개인\대원&수빈\최종 프로젝트\산출물\교통흐름모니터링_화면설계서.docx` 덮어쓰기 완료
+
+**산출물 충돌 잔존 확인** (수빈이 직접 수정 필요)
+- 인터페이스 명세서 v1.2: 표지 버전 표기·§1.1 Phase 상태·§4.4.2 임계값·§2.2 C키 누락 (4곳)
+- 프로그램설계서: §4.1·§8.1·§8.2 파라미터값 (3곳)
+
+### 수정 파일 [수빈]
+`CLAUDE.md`, `FILE_INDEX.md`, `Docs/dev_guide.md`, `Docs/dev_guide_phase2.md`, `Docs/plan.md`
+`N드라이브: generate_screen_design_docx.py`, `교통흐름모니터링_화면설계서.docx`
+
+### 발생 오류
+- python-docx 미설치 → cv 환경에 설치 완료
+
+### 작업 재개 위치 [수빈]
+- 웹 화면 구성(React 뼈대) 작업 시작 예정
+- 산출물 인터페이스명세서·프로그램설계서 수동 수정 대기 중
 
 ---
 
@@ -113,20 +136,3 @@
 
 ---
 
-## 2026-03-31 (60차 — LCS compute_lcs() 3단계 수정)
-
-- `passage_tracker.py`: `compute_lcs()` 총 3차례 수정 (0.96 → 0.58 → 0.36)
-  - signal_A: `percentile(5)/5` → `percentile(10)/8` — 자연 편차 흡수 + 범위 보정
-  - signal_B: `max` → `percentile(95)` — bbox 튐 이상치 방지
-  - signal_C: `exit/active(≈0.977 고정)` → `std(dwells)/median/2` — 변동계수 기반 교체
-- **수정 파일**: `src/passage_tracker.py`
-
----
-
-## 2026-03-31 (59차 — 프로젝트 경로 C드라이브 이전 및 CLAUDE.md 정리)
-
-- 프로젝트 전체 `N:\개인\대원&수빈\최종 프로젝트` → `C:\final_pj` 이동
-- `src/` 8개, `tests/` 4개, 실행 스크립트 2개 경로 주석 수정
-- CLAUDE.md 완료 섹션 정리
-
----

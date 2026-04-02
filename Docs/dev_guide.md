@@ -1,9 +1,18 @@
 # 개발 기준서 (dev_guide.md)
 
-> 최종 수정: 2026-03-27
-> **개발 관련 작업 시 이 문서를 가장 먼저 읽는다. Phase 1 핵심 내용만 포함.**
-> 새 세션 시작 시: 이 문서 → work_log.md 순서로 읽고 현재 상태 파악 후 진행.
-> Phase 2 이후 내용(GRU·기술스택·PTZ Phase 2·알림등급): `dev_guide_phase2.md` 참조.
+> 최종 수정: 2026-04-02
+>
+> ## 개발 기준서 구성 안내
+>
+> | 파일 | 포함 내용 | 상태 |
+> |------|-----------|------|
+> | **dev_guide.md** (이 파일) | 설계 원칙·모듈 명세·인터페이스·공통 알고리즘 (Phase 무관 기준) | 유지보수 중 |
+> | **dev_guide_phase2.md** | Phase 2 GRU 명세(완료) + **Phase 3 설계(§13, 미구현)** | Phase 3 착수 시 §13 실행 |
+>
+> - **개발 시 반드시 두 파일 모두 읽는다.** 산출물(.docx/.xlsx)은 개발 시 직접 읽지 않는다.
+> - **산출물 생성·수정 시 개발에 필요한 핵심 내용을 이 guide에 반드시 반영한다.**
+> - Phase 3 착수 시: `dev_guide_phase2.md §13` 체크리스트 실행 → 완료 후 상태를 ✅로 업데이트.
+> - 새 세션 시작 시: **이 파일 → dev_guide_phase2.md → work_log.md** 순서로 읽기.
 
 ---
 
@@ -11,23 +20,25 @@
 
 새 세션에서 이 프로젝트를 이어받을 때 반드시 확인할 항목.
 
-### 현재 파일 상태 (2026-03-26 기준)
+### 현재 파일 상태 (2026-04-02 기준 — Phase 1·2 완료)
 
-| 파일 | 현재 상태 | 다음 할 일 |
-|------|-----------|-----------|
-| `src/traffic_analyzer.py` | ❌ OLD 코드 — pixels_per_meter 기반, km/h 변환, TC-01~13 기준 | Phase 1 설계로 내부 전면 교체 |
-| `src/config.py` | ⚠️ OLD 파라미터만 있음 (§A 신규 파라미터 미추가) | §A 파라미터 추가 |
-| `src/state.py` | ⚠️ `entry_positions` 필드 없음 | 필드 1개 추가 |
-| `src/id_manager.py` | ⚠️ `cleanup()`에 passage 기록 없음 | 약 15줄 추가 |
-| `src/flow_map.py` | ⚠️ `speed_ref` 배열·`learn_baseline()` 없음 | 필드·메서드 추가 |
-| `src/detector.py` | ⚠️ footpoint·baseline freeze·feature 추출 없음 | 최소 수정 |
-| `src/feature_extractor.py` | ❌ 없음 | 신규 작성 |
-| `src/baseline_stats.py` | ❌ 없음 | 신규 작성 |
-| `src/passage_tracker.py` | ❌ 없음 | 신규 작성 |
-| `src/congestion_judge.py` | ❌ 없음 | 신규 작성 |
-| `tests/test_traffic_analyzer.py` | ⚠️ OLD 기준 TC-01~13 (pixels_per_meter) — 현재 PASS 상태 | 신규 설계로 재작성 |
-| `tests/test_passage_tracker.py` | ❌ 없음 | TDD로 먼저 작성 |
-| `tests/test_congestion_judge.py` | ❌ 없음 | TDD로 먼저 작성 |
+| 파일 | 현재 상태 |
+|------|-----------|
+| `src/traffic_analyzer.py` | ✅ Phase 1 설계로 내부 전면 교체 완료 |
+| `src/config.py` | ✅ Phase 1·2 파라미터 모두 추가 완료 |
+| `src/state.py` | ✅ `entry_positions` 필드 추가 완료 |
+| `src/id_manager.py` | ✅ `cleanup()`에 passage 기록 추가 완료 |
+| `src/flow_map.py` | ✅ `speed_ref` 배열·`learn_baseline()`·`smoothed_mask` 완료 |
+| `src/detector.py` | ✅ footpoint·baseline freeze·feature 추출 추가 완료 |
+| `src/feature_extractor.py` | ✅ 구현 완료 |
+| `src/baseline_stats.py` | ✅ 구현 완료 |
+| `src/passage_tracker.py` | ✅ 구현 완료 |
+| `src/congestion_judge.py` | ✅ 구현 완료 |
+| `src/gru_module.py` | ✅ Phase 2 구현 완료 |
+| `tests/test_traffic_analyzer.py` | ✅ 신규 기준으로 재작성 완료 (`test_traffic_analyzer_legacy.py`에 OLD 보존) |
+| `tests/test_passage_tracker.py` | ✅ 구현 완료 |
+| `tests/test_congestion_judge.py` | ✅ 구현 완료 |
+| `tests/test_gru_module.py` | ✅ Phase 2 테스트 완료 |
 
 ### 개발 진행 순서
 
@@ -57,7 +68,8 @@ Step 13. 실영상 테스트 (run_test.py)
 | ✅ 할 것 | 정체 이벤트 DB 저장 |
 | ✅ 할 것 | 정체 해결 조치 권고 (research.md §11 기반) |
 | ✅ 할 것 | YOLO11n 추가학습 (고속도로 CCTV 데이터) |
-| ❌ 안 할 것 | 웹 UI / Flask 라우트 (팀원 담당) |
+| ✅ 할 것 | 웹 화면 구성 (수빈 담당 — 화면설계서 기반 React 뼈대) |
+| ⚠️ 팀원 담당 | Flask REST API / WebSocket 라우트 / MySQL 연동 |
 | ❌ 안 할 것 | 탄소배출 기능 |
 | ❌ 안 할 것 | 역주행 탐지 로직 수정 (§15 원칙 적용) |
 | ❌ 안 할 것 | 절대 km/h 측정 (카메라 캘리브레이션 없이 불가 — ITS API 확인 완료) |
@@ -78,8 +90,8 @@ exit_rate_window:        int   = 30     # exit_rate 계산 슬라이딩 윈도�
 grace_period_sec:        float = 60.0   # 카메라 전환 후 판정 유예 시간 (초)
 
 # ==================== jam_score 임계값 ====================
-smooth_jam_threshold:    float = 0.25   # jam_score < 이 값 → SMOOTH
-slow_jam_threshold:      float = 0.55   # jam_score < 이 값 → SLOW, 이상 → CONGESTED
+smooth_jam_threshold:    float = 0.30   # jam_score < 이 값 → SMOOTH
+slow_jam_threshold:      float = 0.60   # jam_score < 이 값 → SLOW, 이상 → CONGESTED
 
 # ==================== 학습 연장 ====================
 max_learning_extension:  float = 1.5   # learning_frames × 이 값 = 최대 학습 프레임 수
