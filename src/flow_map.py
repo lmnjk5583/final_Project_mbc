@@ -4,6 +4,7 @@
 # smoothed_mask: 보간으로 채워진 셀(실 데이터 없음) 추적 — judge.py에서 cos_threshold 완화에 사용
 
 import numpy as np                                       # 수치 계산
+from collections import deque                             # BFS 큐 (flood-fill용)
 from pathlib import Path                                  # 경로 조작
 
 
@@ -188,6 +189,45 @@ class FlowMap:
         filled_count = 0                                  # count=0에서 채워진 셀 수
         reinforced_count = 0                              # 0<count<min_samples 강화된 셀 수
 
+        # ── BFS flood-fill: 격자 모서리부터 연결된 빈 셀 = "외부" 판별 ────
+        # 외부 = 차량이 실제로 지나간 영역 밖 (도로 이외 구역, 하늘, 갓길 등)
+        # 모서리에서 BFS로 연결된 count=0 셀은 외부로 표시 → 채우지 않음
+        # eroded_mask 셀은 중앙 분리대 경계 → BFS 통행 차단(벽 역할)
+        gs = self.grid_size                               # 그리드 크기 단축 참조
+        exterior = np.zeros((gs, gs), dtype=bool)         # 외부 셀 마스크 (True=외부)
+        bfs_queue = deque()                               # BFS 탐색 큐
+
+        for r in range(gs):                               # 좌우 경계 행 순회
+            for c in [0, gs - 1]:                         # 첫 열·마지막 열
+                if (self.count[r, c] == 0                 # 빈 셀이고
+                        and not self.eroded_mask[r, c]    # erosion 셀(벽)이 아니고
+                        and not exterior[r, c]):           # 아직 미방문이면
+                    exterior[r, c] = True                 # 외부 표시
+                    bfs_queue.append((r, c))              # 큐에 추가
+
+        for c in range(gs):                               # 상하 경계 열 순회
+            for r in [0, gs - 1]:                         # 첫 행·마지막 행
+                if (self.count[r, c] == 0
+                        and not self.eroded_mask[r, c]
+                        and not exterior[r, c]):
+                    exterior[r, c] = True
+                    bfs_queue.append((r, c))
+
+        while bfs_queue:                                  # BFS 확산 (4방향)
+            r, c = bfs_queue.popleft()                    # 현재 셀 꺼냄
+            for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:  # 4방향
+                nr, nc = r + dr, c + dc                   # 이웃 좌표
+                if (0 <= nr < gs and 0 <= nc < gs         # 범위 내
+                        and not exterior[nr, nc]          # 미방문
+                        and self.count[nr, nc] == 0       # 빈 셀
+                        and not self.eroded_mask[nr, nc]):  # erosion 벽 아님
+                    exterior[nr, nc] = True               # 외부로 표시
+                    bfs_queue.append((nr, nc))            # 큐에 추가
+
+        interior_holes = int(np.sum(                      # 내부 홀 수 (디버그용)
+            (~exterior) & (self.count == 0) & (~self.eroded_mask)
+        ))
+
         for r in range(self.grid_size):                   # 모든 칸 순회
             for c in range(self.grid_size):
 
@@ -205,7 +245,14 @@ class FlowMap:
                 c_e = min(self.grid_size, c + 2)          # 이웃 열 범위 끝
 
                 if own_cnt == 0:
-                    # ── ③ count=0: 이웃끼리 방향 일관성 확인 후 채움 ───────
+                    # ── ③ count=0: 외부 셀이면 채우지 않음 ──────────────────
+                    # 외부에서 1칸 확장 허용 시 반대 차선 방향이 경계를 넘어 오염됨.
+                    # (확장된 셀끼리 방향 일치 → boundary_erosion이 제거 불가)
+                    # 순수 내부 홀(exterior=False)만 채움 — 외부 확장 없음.
+                    if exterior[r, c]:                    # 외부 셀이면
+                        continue                          # 채우지 않음
+
+                    # ── 이웃끼리 방향 일관성 확인 후 채움 (내부 홀만) ────────
                     # 이웃 중 유효 벡터 수집
                     neighbor_vecs = []                    # 이웃 유효 벡터 목록
                     for nr in range(r_s, r_e):            # 이웃 행 순회
@@ -281,11 +328,13 @@ class FlowMap:
             np.linalg.norm(self.flow, axis=2) > 0.1
         ))
         smoothed_total = int(np.sum(self.smoothed_mask))  # 보간 채움 셀 총 수
-        print(f"   🔄 smoothing: {filled_count}셀 채움, "
+        exterior_total = int(np.sum(exterior))            # 외부 셀 수 (flood-fill 결과)
+        print(f"   🔄 smoothing: {filled_count}셀 채움 (내부홀/{interior_holes}개), "
               f"{reinforced_count}셀 강화, "
               f"learned={active}/{self.grid_size**2}, "
               f"total_flow={total_with_flow}, "
-              f"smoothed={smoothed_total}")
+              f"smoothed={smoothed_total}, "
+              f"exterior={exterior_total}(채움 제외)")
 
         if verbose:                                       # 상세 진단 시에만 후 상태 출력
             print(f"\n📊 [진단] smoothing 후 — 전체 셀 상태")

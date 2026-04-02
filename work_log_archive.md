@@ -4,6 +4,24 @@
 
 ---
 
+## 2026-03-31 (59차 — 프로젝트 경로 C드라이브 이전 및 CLAUDE.md 정리)
+
+- 프로젝트 전체 `N:\개인\대원&수빈\최종 프로젝트` → `C:\final_pj` 이동
+- `src/` 8개, `tests/` 4개, 실행 스크립트 2개 경로 주석 수정
+- CLAUDE.md 완료 섹션 정리
+
+---
+
+## 2026-03-31 (60차 — LCS compute_lcs() 3단계 수정)
+
+- `passage_tracker.py`: `compute_lcs()` 총 3차례 수정 (0.96 → 0.58 → 0.36)
+  - signal_A: `percentile(5)/5` → `percentile(10)/8` — 자연 편차 흡수 + 범위 보정
+  - signal_B: `max` → `percentile(95)` — bbox 튐 이상치 방지
+  - signal_C: `exit/active(≈0.977 고정)` → `std(dwells)/median/2` — 변동계수 기반 교체
+- **수정 파일**: `src/passage_tracker.py`
+
+---
+
 ## 2026-03-30 (58차 — 신규/정지 차량 stops_ratio 분리 재설계)
 
 - `detector.py`: 신규 차량(궤적 < velocity_window) speeds 미등록, `mag_val is not None`만 등록

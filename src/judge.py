@@ -15,10 +15,14 @@ class WrongWayJudge:
         self.st = state                 # DetectorState 참조
 
     def get_speed_threshold(self, cy):
-        """화면 상의 y 위치에 따라 속도 임계값을 달리 적용 (원근 보정)"""
+        """(레거시) 화면 y 위치 기반 raw 속도 임계값 — 로그 표시 전용.
+
+        역주행 판정 진입 조건은 nm 기반(norm_speed_gate_threshold)으로 변경됨.
+        이 메서드는 detector.py 트랙 로그에서 참고값 출력용으로만 유지.
+        """
         ratio = cy / self.st.frame_h        # 화면 상단(0)~하단(1) 비율
         scale = 0.3 + 0.7 * ratio           # 위는 0.3배, 아래는 1.0배 근처
-        return self.cfg.base_speed_threshold * scale  # 위치에 따른 속도 임계값
+        return self.cfg.base_speed_threshold * scale  # 위치에 따른 raw 속도 임계값
 
     # ── 개선 3: smoothed_mask 기반 cos_threshold 결정 ────────────────
     def _get_cos_threshold(self, px, py, level="short"):
@@ -64,7 +68,7 @@ class WrongWayJudge:
         threshold = self._get_cos_threshold(px, py, level="short")  # 단기 레벨 threshold
         return cos < threshold                            # 완화된/원본 임계값 기준 판정
 
-    def check(self, track_id, traj, ndx, ndy, speed, cy):
+    def check(self, track_id, traj, ndx, ndy, speed, cy, bbox_h: float = 30.0):
         """한 차량에 대해 flow_map과 방향 비교, 투표 방식으로 역주행 여부 판정.
 
         Args:
@@ -72,7 +76,8 @@ class WrongWayJudge:
             traj: 해당 차량의 (cx, cy) 궤적 리스트.
             ndx, ndy: velocity_window 기반 단기 단위 방향 벡터.
             speed: 단기 이동량(픽셀).
-            cy: 현재 y 좌표 (원근 보정용).
+            cy: 현재 y 좌표 (방향 급변 필터 등에 사용).
+            bbox_h: 바운딩박스 높이 (원근 정규화 속도 게이트에 사용).
 
         Returns:
             (is_wrong: bool, disagree_ratio: float, debug_info: dict)
@@ -84,11 +89,14 @@ class WrongWayJudge:
         if track_id in st.wrong_way_ids:
             return True, 1.0, {"status": "CONFIRMED", "cos_values": []}
 
-        # ── 원근 기반 속도 게이트 ────────────────────────────────────────
-        adaptive_threshold = self.get_speed_threshold(cy)   # 위치별 속도 임계값
-        if speed < adaptive_threshold:                       # 너무 느리면 판정 X
-            # 속도 부족 = 방향 불명확 → last_correct_frame 갱신 안 함
-            # (실제 역주행 차량도 초기에 느릴 수 있으므로 설정 시 역주행 탐지 차단 위험)
+        # ── nm 기반 속도 게이트 (원근 정규화) ───────────────────────────
+        # 기존 cy 기반 임계값(1~2 단위 변화)은 실제 속도 차이(10:1)를 보정 불가.
+        # nm = speed / max(bbox_h, min_bbox_h) → feature_extractor의 정지 판정과 동일 기준.
+        #   근거리(bbox_h=150): nm=0.15 → mag≥22px 필요  (실제 크기 대비 충분한 이동)
+        #   원거리(bbox_h=30):  nm=0.15 → mag≥4.5px 필요 (비례 보정 — 동일 nm 기준)
+        _bh_clamped = max(bbox_h, cfg.min_bbox_h)     # bbox_h 클램프 (min_bbox_h=30 기준)
+        nm_speed = speed / _bh_clamped                # bbox_h 기반 정규화 속도
+        if nm_speed < cfg.norm_speed_gate_threshold:  # nm 기준 속도 부족 → 방향 불명확
             return False, 0, {"status": "slow", "cos_values": []}
 
         # ── 방향 급변 필터 (CCTV 글자/오클루전 오탐 차단) ──────────────
@@ -147,7 +155,7 @@ class WrongWayJudge:
             "skip": skip,
             "total": total_checked,
             "points": debug_points,
-            "threshold": adaptive_threshold,
+            "threshold": nm_speed,             # nm 기반 속도 (게이트 기준: norm_speed_gate_threshold)
             "status": "voting",
             "cos_values": cos_values,
             "long_cos": None,     # ③ 장기 윈도우 cos 값 (디버그용)

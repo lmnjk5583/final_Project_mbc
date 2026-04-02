@@ -21,7 +21,7 @@ class DetectorConfig:
     enable_online_flow_update: bool = False # 정상 흐름 학습에 사용(True)
 
     # ==================== 역주행 탐지 관련 설정 ====================
-    velocity_window: int = 15         # 속도/방향 계산 시 사용하는 프레임 간격 (이전 위치~현재 위치 거리)
+    velocity_window: int = 20         # 속도/방향 계산 시 사용하는 프레임 간격 (이전 위치~현재 위치 거리) — 15→20 (bbox jitter의 방향 벡터 영향 완화)
     base_speed_threshold: float = 7.0 # 기본 속도 임계값 (원근에 따라 가중을 곱해 사용)
     cos_threshold: float = -0.75      # 코사인 유사도 임계값 (원본값 복원 — smoothing 오염 방지로 오탐 차단)
     wrong_count_threshold: int = 8    # 역주행 확정까지 필요한 연속 의심 횟수
@@ -67,6 +67,15 @@ class DetectorConfig:
     norm_stop_threshold:     float = 0.06   # bbox_h 대비 정지 임계값 (mag/bbox_h < 이 값 → 정지)
                                             # 0.10→0.06: 원거리 차량 bbox_h 클램프(30px) 시 nm≈0.07~0.10 오판 방지
                                             # 완전 정지는 nm≈0~0.03, 서행은 nm≈0.07+로 충분히 구분 가능
+    norm_learn_threshold:      float = 0.10 # 플로우맵 학습 진입 nm 임계값 (nm_move < 이 값 → 기록 스킵)
+                                            # norm_speed_gate_threshold(0.15)보다 낮게 — 서행 차량 방향도 학습 허용
+                                            # nm=0.10: bbox_h=30 기준 mag≥3px (방향 신뢰 최솟값)
+                                            # 0.05는 1.5px 변위 허용 → 방향 벡터가 랜덤 노이즈 수준 → 오염 유발
+    norm_speed_gate_threshold: float = 0.15 # 역주행 판정 진입 nm 임계값 (nm_speed < 이 값 → 방향 불명확, 판정 스킵)
+                                            # nm = mag / max(bbox_h, min_bbox_h) — 원근 정규화 속도
+                                            # cy 기반 raw 속도 임계값(1~2 단위 변화)을 대체:
+                                            # 근거리(bbox_h=150) nm=0.15 → mag=22px 필요
+                                            # 원거리(bbox_h=30)  nm=0.15 → mag=4.5px 필요 (비례 보정)
     min_bbox_h:              float = 30.0   # bbox_h 최솟값 보정 (이 값 미만이면 30px로 클램프)
                                             # 원거리 차량 bbox_h≈15px → nm이 과대 계산되어 원활 오판 방지
     exit_rate_window:        int   = 30     # exit_rate 계산 슬라이딩 윈도우 (프레임)

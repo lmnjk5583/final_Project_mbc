@@ -4,6 +4,52 @@
 
 ---
 
+## 2026-04-02 (65차 — fallback jam_score 근본 수정: slow_ratio 도입)
+
+### 오늘 한 작업
+
+**[이전 64차 작업 포함 — 아래는 이번 세션 추가 작업]**
+
+**jam_score 로직 전체 분석 및 근본 문제 발견**
+- `norm_speed_ratio` fallback 적용 불가 이유 확인:
+  - fallback baseline의 `norm_speed_ref=0.15` (고정값)
+  - 실제 고속도로 nm = 0.5~2.0 → ratio가 항상 1.0으로 clip → speed_contribution = 0
+  - `upper_half` 중앙값 방식: 혼합 방향 차량 존재 시 빠른 차량이 서행 신호 덮어버림
+- `stop_ratio`만으로는 nm 0.06~0.15 구간 서행 차량 감지 불가
+
+**slow_ratio 신규 feature 도입 (`src/feature_extractor.py`)**
+- nm 구간별 분류 추가:
+  - nm < 0.06 → `stopped_count` (정지, 기존)
+  - 0.06 ≤ nm < 0.15 → `slow_count` (서행, 신규)
+  - nm ≥ 0.15 → 정상 주행 (카운트 없음)
+- `slow_ratio = slow_count / speed_known_count` (소표본 보정 동일 적용)
+- feature 딕셔너리에 `"slow_ratio"` 추가 (8차원으로 확장)
+
+**fallback 공식 최종 교체 (`src/congestion_judge.py`)**
+- 기존: `0.40×density + 0.60×stop` (서행 감지 불가)
+- 최종: `0.50×slow + 0.30×stop + 0.20×density`
+- 설계 목표 수치:
+  - 원활 (slow=0.02, stop=0.01, density=0.25): jam = **0.06** → SMOOTH
+  - 서행 (slow=0.60, stop=0.05, density=0.40): jam = **0.40** → SLOW
+  - 정체 (slow=0.20, stop=0.70, density=0.70): jam = **0.45** → SLOW
+  - 극심 (slow=0.10, stop=0.90, density=0.80): jam = **0.48** → CONGESTED
+
+### 수정 파일
+`src/config.py`, `src/flow_map.py`, `src/judge.py`, `src/detector.py`,
+`src/feature_extractor.py`, `src/traffic_analyzer.py`, `src/congestion_judge.py`
+
+### 발생 오류 / 확인 사항
+- `judge.py` NameError: `adaptive_threshold` → `nm_speed`로 수정 (64차)
+- norm_speed_ratio 기반 접근 4차례 시도 → 근본 원인(norm_speed_ref 고정값) 확인 후 포기
+- slow_ratio 방식으로 전환: nm 기준값 의존 없이 직접 구간 카운트
+
+### 작업 재개 위치
+- 서행/정체 영상에서 slow_ratio 도입 후 jam_score 확인 (목표: 서행 ≥ 0.30)
+- nm < 0.15 구간 차량이 실제로 얼마나 잡히는지 확인 (velocity_window=20프레임 조건 충족 차량 기준)
+- 역주행 오탐 추가 검증 (nm-based gate + velocity_window=20 적용 후)
+
+---
+
 ## 2026-04-01 (63차 — flow_map 개선 + 시각화 개편 + 파라미터 튜닝)
 
 ### 오늘 한 작업

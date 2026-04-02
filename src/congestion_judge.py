@@ -76,40 +76,71 @@ def compute_jam_score(x_t: dict, lcs: float, cfg) -> float:
 
 
 def compute_jam_score_fallback(x_t: dict) -> float:
-    """baseline 없이 밀도·정지비율만으로 jam_score를 계산한다 (fallback 모드).
+    """baseline 없이 서행비율·정지비율·밀도로 jam_score를 계산한다 (fallback 모드).
 
-    정확도 낮음 — passage/dwell 기반 판정 불가 시 사용.
+    핵심 지표: slow_ratio (0.06 ≤ nm < 0.15 차량 비율).
+      기존 문제: norm_speed_ref=0.15 하드코딩 → 실제 고속도로 nm은 0.5~2.0이므로
+      norm_speed_ratio가 항상 1.0으로 clip → speed_contribution이 항상 0.
+      또한 stop_ratio(nm<0.06)만으로는 서행(nm=0.08~0.14) 감지 불가.
+      slow_ratio는 정지와 정상 주행 사이의 "서행 구간"을 직접 카운트하여
+      nm 기준값(norm_speed_ref) 의존 없이 서행을 감지한다.
 
     설계 목표:
-      - 정상 (density≈0.20, stop≈0.03): jam ≈ 0.10 → SMOOTH
-      - 중간 정체 (density≈0.40, stop≈0.35): jam ≈ 0.37 → SLOW
-      - 극심 정체 (density≈0.60, stop≈0.70): jam ≈ 0.66 → CONGESTED
+      - 원활  (slow≈0.02, stop≈0.01, density≈0.25):  jam ≈ 0.06 → SMOOTH
+      - 서행  (slow≈0.60, stop≈0.05, density≈0.40):  jam ≈ 0.40 → SLOW
+      - 정체  (slow≈0.20, stop≈0.70, density≈0.70):  jam ≈ 0.45 → SLOW~CONGESTED
+      - 극심  (slow≈0.10, stop≈0.90, density≈0.80):  jam ≈ 0.48 → CONGESTED
 
-    유출(exit_rate_ratio) 제거 이유:
+    가중치:
+      0.50 × slow_contribution    — 서행 비율: 서행 핵심 감지 (nm 0.06~0.15)
+      0.30 × stop_contribution    — 정지 비율: 완전 정체 핵심 감지 (nm < 0.06)
+      0.20 × density_contribution — 밀도: 보조 지표 (차량 많을수록 가산)
+
+    유출(exit_rate_ratio) 미사용 이유:
       fallback 모드에서 count_ref=15 고정값 기반 exit_rate_ratio는
       실제 교통량과 무관하게 outflow_contribution을 과대 산출함 → 신뢰 불가.
 
+    norm_speed_ratio 미사용 이유:
+      fallback baseline의 norm_speed_ref=0.15는 임의 고정값.
+      실제 고속도로 nm은 0.5~2.0 → ratio가 항상 1.0으로 clip되어
+      speed_contribution이 0으로 무효화됨. slow_ratio가 직접 대체.
+
     Args:
-        x_t: 7차원 feature 벡터 dict.
+        x_t: 8차원 feature 벡터 dict.
 
     Returns:
         jam_score (0.0~1.0).
     """
-    # ── 밀도 기여 (배율 1.0 — 고속도로 정상 교통도 20~25% 점유) ────────
-    # 기존 × 2.0은 정상 교통에서도 density_contribution이 과도하게 높아져
-    # stop이 낮아도 jam이 0.3 이상으로 올라가 SLOW 오판 유발.
-    density_contribution = _clip(                      # 밀도가 높을수록 정체
-        x_t["density_score"] * 1.0, 0.0, 1.0          # 배율 2.0 → 1.0 (과대평가 방지)
+    # ── 서행 비율 기여 (0.06 ≤ nm < 0.15 차량 비율) ──────────────────
+    # 서행 = 정지도 정상도 아닌 중간 영역 — fallback 모드 핵심 지표
+    # 원활: 대부분 nm > 0.15 → slow≈0.02 → 기여 ≈ 0.01
+    # 서행: 대부분 nm 0.08~0.14 → slow≈0.60 → 기여 = 0.30
+    slow_contribution = _clip(                         # 서행 비율 (0~1)
+        x_t.get("slow_ratio", 0.0), 0.0, 1.0          # .get() — 구버전 호환
     )
 
-    # ── 정지 비율 기여 (정체의 핵심 지표 — 카메라 무관) ─────────────────
-    stop_contribution = x_t["stop_ratio"]              # 0~1 범위
+    # ── 정지 비율 기여 (nm < 0.06 차량 비율) ──────────────────────────
+    # 완전 정지 차량 비율 — 정체의 결정적 증거
+    stop_contribution = _clip(                         # 정지 비율 (0~1)
+        x_t["stop_ratio"], 0.0, 1.0                   # 범위 방어
+    )
 
-    # ── 가중 합산 (density 40% + stop 60%) ───────────────────────────
-    # stop_ratio를 주 지표로 높이고, density는 보조 지표로 낮춤.
-    # 정상 주행 차량이 많아도 정지가 없으면 낮은 score 유지.
-    return (0.40 * density_contribution                # 밀도 가중 40%
-            + 0.60 * stop_contribution)                # 정지 가중 60% (핵심 지표)
+    # ── 밀도 기여 (차량수 / density_max_vehicles=40) ──────────────────
+    # 보조 지표 — 차량이 많을수록 정체 가능성 약간 가산
+    density_contribution = _clip(                      # 밀도 점수 (0~1)
+        x_t["density_score"], 0.0, 1.0                 # 이미 정규화됨
+    )
+
+    # ── 가중 합산 (slow 50% + stop 30% + density 20%) ────────────────
+    # 원활:  0.50×0.02 + 0.30×0.01 + 0.20×0.25 = 0.01+0.003+0.05 = 0.06
+    # 서행:  0.50×0.60 + 0.30×0.05 + 0.20×0.40 = 0.30+0.015+0.08 = 0.40
+    # 정체:  0.50×0.20 + 0.30×0.70 + 0.20×0.70 = 0.10+0.21+0.14  = 0.45
+    # 극심:  0.50×0.10 + 0.30×0.90 + 0.20×0.80 = 0.05+0.27+0.16  = 0.48
+    jam = (0.50 * slow_contribution                    # 서행 가중 50% (서행 감지 핵심)
+           + 0.30 * stop_contribution                  # 정지 가중 30% (정체 확증)
+           + 0.20 * density_contribution)              # 밀도 가중 20% (보조)
+
+    return _clip(jam, 0.0, 1.0)                        # [0, 1] 범위 클램프
 
 
 # ======================================================================

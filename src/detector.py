@@ -201,12 +201,13 @@ class Detector:
         self.predictor_a = CongestionPredictor(cfg, fps=fps)        # A방향 정체 예측
         self.predictor_b = CongestionPredictor(cfg, fps=fps)        # B방향 정체 예측
 
-        # ── 정체 탐지 baseline 설정 — 항상 fallback 모드 (stop_ratio + density 기반) ──
+        # ── 정체 탐지 baseline 설정 — 항상 fallback 모드 (density + stop + dwell 기반) ──
         # norm_speed_ref 등 카메라 종속 값 불필요. LCS=default_lcs로 임계값만 보정.
         # flow_map은 역주행 탐지 전용으로만 사용하며 정체 판정 기준으로 쓰지 않는다.
         _fb = BaselineStats(                                        # fallback baseline 생성
-            free_flow_dwell=45.0,                                  # 미사용 (fallback 모드에서 참조 안 됨)
-            typical_dwell=90.0,                                    # 미사용
+            free_flow_dwell=90.0,                                  # dwell_ratio 계산 기준 (원활 차량 기준 체류: 3초×30fps=90f)
+                                                                   # avg_dwell < 90이면 dwell_jam≈0 (원활), 200이면 0.55 (서행), 350이면 0.74 (정체)
+            typical_dwell=180.0,                                   # 미사용 (참조용)
             norm_speed_ref=0.15,                                   # 미사용
             count_ref=15.0,                                        # 미사용
             bbox_slope=0.0,                                        # 미사용
@@ -446,23 +447,34 @@ class Detector:
                     # 프레임당 평균 이동거리 계산 (떨림 필터)
                     avg_move = mag / cfg.velocity_window             # 프레임당 평균 이동
 
-                    speeds[tid] = 0                                 # 궤적 확인 완료 — 기본 정지
-                    # 누적 이동거리 AND 프레임당 이동거리 모두 충족해야 "움직이는 중"
-                    if mag > cfg.min_move_distance and avg_move > cfg.min_move_per_frame:
+                    speeds[tid] = mag                               # 실제 이동량 기록 — feature_extractor에서 nm으로 정지 판정
+                    # ── nm 기반 이동 조건 (학습·판정 임계값 분리) ────────────────
+                    # 학습:  nm_move > norm_learn_threshold(0.05)  — 서행·정체 차량 방향도 학습
+                    # 판정:  judge.check() 내부에서 nm > norm_speed_gate_threshold(0.15) 재검사
+                    #        → 학습엔 진입했지만 판정은 내부 게이트에서 필터링
+                    #   원거리(bbox_h=30): mag≥1.5px → 학습 가능 (서행 포함)
+                    #   근거리(bbox_h=150): mag≥7.5px → 학습 가능
+                    _bh = max(y2 - y1, cfg.min_bbox_h)              # bbox_h 클램프
+                    _nm_move = mag / _bh                            # 원근 정규화 이동량
+                    if _nm_move > cfg.norm_learn_threshold and mag > 1.0:  # 학습 임계값 기준
                         ndx, ndy = vdx / mag, vdy / mag             # 단위 방향 벡터
                         speed = mag                                 # 속도 = 픽셀 이동량
-                        speeds[tid] = speed                         # 속도 딕셔너리에 기록
+                        speeds[tid] = speed                         # 속도 딕셔너리 갱신 (이미 mag이나 명시적 유지)
 
                         if st.is_learning or st.relearning:         # 학습/재학습 모드
+                            # nm 기반 min_move: 외부 조건(_nm_move>norm_learn_threshold)과 일관성 유지
+                            # learn_step 내부 자체 mag<min_move 체크가 외부 조건을 무효화하지 않도록
+                            _learn_min_mag = max(1.0, _bh * cfg.norm_learn_threshold)  # nm 역산 최소 mag
                             self.flow.learn_step(                   # 흐름장 업데이트 (footpoint 기준)
                                 traj[-cfg.velocity_window][0],
                                 traj[-cfg.velocity_window][1],
-                                fx, fy, cfg.min_move_distance       # cx,cy → fx,fy (footpoint 일관성)
+                                fx, fy, _learn_min_mag              # nm 기반 min_move 전달
                             )
                         else:                                       # 감지 모드
-                            # 역주행 여부 판단
+                            # 역주행 여부 판단 (bbox_h 전달 — nm 기반 속도 게이트용)
+                            _bbox_h = max(y2 - y1, 1)               # bbox 높이 (원근 정규화용)
                             is_wrong, _, debug_info = self.judge.check(
-                                tid, traj, ndx, ndy, mag, cy
+                                tid, traj, ndx, ndy, mag, cy, _bbox_h
                             )
 
                             # 역주행 의심이 전혀 없으면 정상 흐름으로 온라인 학습
@@ -472,7 +484,7 @@ class Detector:
                                 self.flow.learn_step(               # 흐름장 업데이트 (footpoint 기준)
                                     traj[-cfg.velocity_window][0],
                                     traj[-cfg.velocity_window][1],
-                                    fx, fy, cfg.min_move_distance  # cx,cy → fx,fy (footpoint 일관성)
+                                    fx, fy, _learn_min_mag          # nm 기반 min_move (학습과 동일 기준)
                                 )
                                 # 방향별 SMOOTH + 최소 활성 차량 조건 충족 시 baseline 온라인 갱신
                                 _dir = self._track_direction.get(tid, 'a')  # 해당 차량 방향
@@ -497,7 +509,9 @@ class Detector:
                         debug_info = {"status": "CONFIRMED", "cos_values": []}
 
                 # ── 트랙 단위 로그 생성 ────────────────────────────────────
-                speed_thr = self.judge.get_speed_threshold(cy)      # 원근 기반 속도 임계값
+                _log_bh = max(y2 - y1, cfg.min_bbox_h)              # 로그용 bbox_h 클램프
+                nm_spd = speed / _log_bh if _log_bh > 0 else 0     # 로그용 nm 속도
+                speed_thr = cfg.norm_speed_gate_threshold           # nm 게이트 임계값 (로그용)
 
                 flow_v = None                                       # 정상 흐름 벡터
                 cos_current = None                                  # 현재 코사인 유사도

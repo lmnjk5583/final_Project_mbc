@@ -15,18 +15,19 @@ from baseline_stats import BaselineStats               # 학습 기준선 통계
 class FeatureExtractor:
     """매 프레임 tracks·speeds를 받아 정체 판정용 feature 벡터를 산출한다.
 
-    feature 벡터 7차원:
-    ┌─────┬───────────────────┬────────────────────────────────────────────┐
-    │ idx │ 이름              │ 계산식                                     │
-    ├─────┼───────────────────┼────────────────────────────────────────────┤
-    │  0  │ norm_speed_ratio  │ mean(norm_mags) / norm_speed_ref, clip 0~1│
-    │  1  │ count_ratio       │ active_count / count_ref, clip 0~3        │
-    │  2  │ stop_ratio        │ stopped / active_count                    │
-    │  3  │ exit_rate_ratio   │ exit_last_30f / (count_ref×0.5), clip 0~3 │
-    │  4  │ dwell_ratio       │ free_flow_dwell / mean(dwells), clip 0~1  │
-    │  5  │ density_score     │ occupied_cells / total_cells              │
-    │  6  │ rule_jam_score    │ 0.0 (congestion_judge가 채워넣음)          │
-    └─────┴───────────────────┴────────────────────────────────────────────┘
+    feature 벡터 8차원:
+    ┌─────┬───────────────────┬──────────────────────────────────────────────┐
+    │ idx │ 이름              │ 계산식                                       │
+    ├─────┼───────────────────┼──────────────────────────────────────────────┤
+    │  0  │ norm_speed_ratio  │ median(upper_50%_nm) / norm_speed_ref       │
+    │  1  │ count_ratio       │ active_count / count_ref, clip 0~3          │
+    │  2  │ stop_ratio        │ (nm<0.06 차량) / speed_known_count          │
+    │ 2.5 │ slow_ratio        │ (0.06≤nm<0.15 차량) / speed_known_count     │
+    │  3  │ exit_rate_ratio   │ exit_last_30f / (count_ref×0.5), clip 0~3   │
+    │  4  │ dwell_ratio       │ free_flow_dwell / mean(dwells), clip 0~1    │
+    │  5  │ density_score     │ occupied_cells / density_max_vehicles        │
+    │  6  │ rule_jam_score    │ 0.0 (congestion_judge가 채워넣음)            │
+    └─────┴───────────────────┴──────────────────────────────────────────────┘
 
     Parameters
     ----------
@@ -87,9 +88,13 @@ class FeatureExtractor:
 
         # ── 차량별 normalized_mag 계산 ───────────────────────────────
         norm_mags = []                                 # 차량별 원근 보정 속도 리스트
-        stopped_count = 0                              # 정지 차량 카운터
+        stopped_count = 0                              # 정지 차량 카운터 (nm < 0.06)
+        slow_count = 0                                 # 서행 차량 카운터 (0.06 ≤ nm < 0.15)
         norm_stop_thr = getattr(                       # norm_stop_threshold 없으면 구버전 호환
             self.cfg, "norm_stop_threshold", 0.05
+        )
+        norm_speed_gate = getattr(                     # 서행 상한 = 역주행 판정 진입 임계값
+            self.cfg, "norm_speed_gate_threshold", 0.15
         )
         min_bbox_h = getattr(                          # min_bbox_h 없으면 구버전 호환 (30px)
             self.cfg, "min_bbox_h", 30.0
@@ -108,8 +113,10 @@ class FeatureExtractor:
                 continue
             nm = mag / bbox_h                          # normalized_mag = mag / bbox_h (원근 보정)
             norm_mags.append(nm)                       # 속도 목록에 추가
-            if nm < norm_stop_thr:                     # nm < threshold이면 저속 정지로 판단
+            if nm < norm_stop_thr:                     # nm < 0.06 → 저속 정지
                 stopped_count += 1                     # 정지 카운트
+            elif nm < norm_speed_gate:                 # 0.06 ≤ nm < 0.15 → 서행 구간
+                slow_count += 1                        # 서행 카운트
 
         # ── 활성 차량의 현재 dwell 조회 ──────────────────────────────
         active_ids = {t["id"] for t in tracks}         # 활성 차량 ID 집합
@@ -164,7 +171,26 @@ class FeatureExtractor:
 
         # [2] stop_ratio: 궤적 확인된 차량 중 정지 비율
         # 분모: speed_known_count (신규 제외, 실제 정지·이동 모두 포함)
-        stop_ratio = stopped_count / max(speed_known_count, 1)
+        # ── 소표본 신뢰도 보정: 차량 수가 3대 미만이면 stop_ratio 최대 기여 제한 ──
+        # 차량 2대 중 1대 정지 → stop_ratio=0.50(원본) vs 0.33(보정)
+        # 차량 1대 정지     → stop_ratio=1.00(원본) vs 0.33(보정)
+        # 차량 3대+        → 보정 없음 (신뢰도 충분)
+        _MIN_RELIABLE = 3                                  # 신뢰 가능 최소 차량 수
+        _raw_stop = stopped_count / max(speed_known_count, 1)  # 원시 stop_ratio
+        if speed_known_count < _MIN_RELIABLE:              # 차량 수 부족 → 신뢰도 가중치 적용
+            _reliability = speed_known_count / _MIN_RELIABLE  # 0 ~ 1 신뢰도 (차량수/3)
+            stop_ratio = _raw_stop * _reliability          # 최대 기여 (1/3, 2/3, 1) 제한
+        else:                                              # 차량 수 충분 → 그대로 사용
+            stop_ratio = _raw_stop                         # 신뢰도 보정 불필요
+
+        # [2.5] slow_ratio: 궤적 확인된 차량 중 서행 비율 (0.06 ≤ nm < 0.15)
+        # 서행 차량은 정지도 아니고 정상도 아닌 중간 영역 — jam_score fallback 핵심 지표
+        # stop_ratio와 동일한 소표본 신뢰도 보정 적용
+        _raw_slow = slow_count / max(speed_known_count, 1) # 원시 slow_ratio
+        if speed_known_count < _MIN_RELIABLE:              # 차량 수 부족 → 신뢰도 가중치 적용
+            slow_ratio = _raw_slow * _reliability          # _reliability는 stop_ratio에서 이미 계산됨
+        else:                                              # 차량 수 충분 → 그대로 사용
+            slow_ratio = _raw_slow                         # 신뢰도 보정 불필요
 
         # [3] exit_rate_ratio: 퇴장률 / 기준 퇴장률 (높을수록 원활)
         baseline_exit_rate = max(bl.count_ref * 0.5, 0.01)  # 기준 퇴장률 = count_ref × 0.5
@@ -184,10 +210,11 @@ class FeatureExtractor:
         # [6] rule_jam_score: CongestionJudge가 채워넣을 예정 (초기 0.0)
 
         # ── feature 딕셔너리 조립 ────────────────────────────────────
-        return {                                       # 7차원 feature 벡터
+        return {                                       # 8차원 feature 벡터
             "norm_speed_ratio": norm_speed_ratio,      # [0] 속도 비율
             "count_ratio":      count_ratio,           # [1] 차량 수 비율
-            "stop_ratio":       stop_ratio,            # [2] 정지 비율
+            "stop_ratio":       stop_ratio,            # [2] 정지 비율 (nm < 0.06)
+            "slow_ratio":       slow_ratio,            # [2.5] 서행 비율 (0.06 ≤ nm < 0.15)
             "exit_rate_ratio":  exit_rate_ratio,       # [3] 퇴장률 비율
             "dwell_ratio":      dwell_ratio,           # [4] 체류 비율
             "density_score":    density_score,         # [5] 밀도 점수
