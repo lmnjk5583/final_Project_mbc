@@ -257,6 +257,14 @@ class Detector:
         print("  [P] 내적값  [C] 정체 패널  [Q] 종료")
         print("=" * 50 + "\n")
 
+        # ── 출력 창 초기화 (크기 고정) ──────────────────────────────────
+        _win_name = "Highway Wrong-Way Detection"               # 창 이름 (imshow와 동일)
+        _disp_w = getattr(cfg, "display_width", 1280)           # 표시 너비 (기본 1280)
+        _disp_h = getattr(cfg, "display_height", 720)           # 표시 높이 (기본 720)
+        cv2.namedWindow(_win_name, cv2.WINDOW_NORMAL)           # 리사이즈 가능한 창 생성
+        if _disp_w > 0 and _disp_h > 0:                        # 0이 아닌 경우에만 크기 고정
+            cv2.resizeWindow(_win_name, _disp_w, _disp_h)      # 창 크기 고정
+
         while cap.isOpened():                                       # 비디오 스트림이 열려 있는 동안
             ret, frame = cap.read()                                 # 프레임 읽기
             if not ret:                                             # 더 이상 프레임 없으면
@@ -794,7 +802,7 @@ class Detector:
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2, cv2.LINE_AA)
 
             writer.write(frame)                                     # 결과 영상 파일에 프레임 기록
-            cv2.imshow("Highway Wrong-Way Detection", frame)        # 화면에 출력
+            cv2.imshow(_win_name, frame)                            # 화면에 출력 (고정 창)
 
             key = cv2.waitKey(1) & 0xFF                             # 키 입력 대기
             if key == ord("q"):                                     # q 누르면

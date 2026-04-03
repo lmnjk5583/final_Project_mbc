@@ -18,10 +18,10 @@ from src import Detector, DetectorConfig                # src/__init__.py 경유
 MODEL_PATH = PROJECT_ROOT / "runs" / "yolo11n_v1" / "weights" / "best.pt"  # YOLO 모델 가중치
 
 VIDEO_DIR = Path(                                       # 영상이 들어있는 폴더
-    r"N:\개인\대원&수빈\최종 프로젝트\임시"
-    r"\2026-03-25_10-17-40\videos"
+    r"N:\개인\대원&수빈\최종 프로젝트"
+    r"\임시"
 )
-VIDEO_FILE = "record_2026-03-25_10-17-40.mp4"          # 실행할 영상 파일명
+VIDEO_FILE = "정체_완화_테스트.mp4"          # 실행할 영상 파일명
 
 FLOW_MAP_PATH = PROJECT_ROOT / "flow_maps" / "flow_map.npy"  # 한강 학습 완료 flow_map
 RESULT_DIR    = PROJECT_ROOT / "results"            # 결과 영상 저장 폴더
@@ -29,11 +29,11 @@ RESULT_DIR    = PROJECT_ROOT / "results"            # 결과 영상 저장 폴�
 # ── DetectorConfig 구성 ───────────────────────────────────────────
 cfg = DetectorConfig(
     model_path=MODEL_PATH,                              # YOLO 모델 경로
-    conf=0.5,                                           # 검출 신뢰도 임계값
+    conf=0.3,                                           # 검출 신뢰도 임계값
     grid_size=20,                                       # 20×20 Flow Map 그리드
     target_classes=None,                                # 모든 클래스 탐지
     enable_online_flow_update=True,                     # 정상 흐름 온라인 학습 활성
-    detect_only=True,                                   # 탐지 모드 → 기존 flow_map 사용
+    detect_only=False,                                   # 탐지 모드 → 기존 flow_map 사용
     flow_map_path=FLOW_MAP_PATH,                        # 학습 완료 후 저장될 경로
     result_dir=RESULT_DIR,                              # 결과 영상 저장 폴더
     data_dir=VIDEO_DIR,                                 # 입력 영상 폴더

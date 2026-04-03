@@ -22,7 +22,7 @@ class FeatureExtractor:
     │  0  │ norm_speed_ratio  │ median(upper_50%_nm) / norm_speed_ref       │
     │  1  │ count_ratio       │ active_count / count_ref, clip 0~3          │
     │  2  │ stop_ratio        │ (nm<0.06 차량) / speed_known_count          │
-    │ 2.5 │ slow_ratio        │ (0.06≤nm<0.15 차량) / speed_known_count     │
+    │ 2.5 │ slow_ratio        │ (0.06≤nm<0.50 차량) / speed_known_count     │
     │  3  │ exit_rate_ratio   │ exit_last_30f / (count_ref×0.5), clip 0~3   │
     │  4  │ dwell_ratio       │ free_flow_dwell / mean(dwells), clip 0~1    │
     │  5  │ density_score     │ occupied_cells / density_max_vehicles        │
@@ -89,12 +89,12 @@ class FeatureExtractor:
         # ── 차량별 normalized_mag 계산 ───────────────────────────────
         norm_mags = []                                 # 차량별 원근 보정 속도 리스트
         stopped_count = 0                              # 정지 차량 카운터 (nm < 0.06)
-        slow_count = 0                                 # 서행 차량 카운터 (0.06 ≤ nm < 0.15)
+        slow_count = 0                                 # 서행 차량 카운터 (0.06 ≤ nm < slow_upper_nm)
         norm_stop_thr = getattr(                       # norm_stop_threshold 없으면 구버전 호환
             self.cfg, "norm_stop_threshold", 0.05
         )
-        norm_speed_gate = getattr(                     # 서행 상한 = 역주행 판정 진입 임계값
-            self.cfg, "norm_speed_gate_threshold", 0.15
+        slow_upper_nm = getattr(                       # 서행 상한 nm — 역주행 게이트(0.15)와 별개
+            self.cfg, "slow_upper_nm", 0.50            # 기본 0.50: nm≥0.50 → 정상 주행
         )
         min_bbox_h = getattr(                          # min_bbox_h 없으면 구버전 호환 (30px)
             self.cfg, "min_bbox_h", 30.0
@@ -110,12 +110,14 @@ class FeatureExtractor:
             speed_known_count += 1                     # 궤적 확인 차량 수 증가
             if mag <= 0:                               # speeds=0: 실제 정지 확정
                 stopped_count += 1                     # 정지 카운트 (nm 계산 없이)
+                slow_count += 1                        # 정지는 서행의 부분집합 — 서행에도 포함
                 continue
             nm = mag / bbox_h                          # normalized_mag = mag / bbox_h (원근 보정)
             norm_mags.append(nm)                       # 속도 목록에 추가
             if nm < norm_stop_thr:                     # nm < 0.06 → 저속 정지
                 stopped_count += 1                     # 정지 카운트
-            elif nm < norm_speed_gate:                 # 0.06 ≤ nm < 0.15 → 서행 구간
+                slow_count += 1                        # 정지는 서행의 부분집합 — 서행에도 포함
+            elif nm < slow_upper_nm:                   # 0.06 ≤ nm < 0.50 → 서행 구간
                 slow_count += 1                        # 서행 카운트
 
         # ── 활성 차량의 현재 dwell 조회 ──────────────────────────────
