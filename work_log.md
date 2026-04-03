@@ -4,6 +4,38 @@
 
 ---
 
+## 2026-04-03 (68차 — 웹 정체 모니터링 탭 구현)
+
+### 오늘 한 작업 [수빈]
+
+**웹 정체 탭 (탄소배출/정체 탭) 구현**
+- 탄소 제외 결정 (팀원 중복 + 별도 개발 필요) → 정체 전용(안 A)으로 확정
+- Phase 3 미래 예측 구현 + 의존성 파일 동기화 (plan.md, 프로그램설계서, 인터페이스명세서)
+- CLAUDE.md 동기화 체크리스트 추가 (누락 방지)
+
+**구현 파일 (C:\finalPj_웹)**
+- `backend_flask/shared/state.py`: congestion_state, congestion_events, jam_score_history 추가
+- `backend_flask/modules/carbon/carbon.py`: `/status` `/jam_history` `/history` `/stats` API 4개 구현
+- `frontend_js/src/modules/carbon/api.js`: 신규 — API 호출 함수 4개
+- `frontend_js/src/modules/carbon/index.jsx`: 전체 재작성
+  - 현재 상태 카드 (레벨 배지 + jam_score 게이지)
+  - KPI 3개 (오늘 이벤트, 최대 지속시간, GRU 예측)
+  - jam_score 실시간 SVG Sparkline 차트
+  - GRU 확률 바 (p_smooth/p_slow/p_congested)
+  - 정체 이벤트 로그 테이블
+
+### 수정 파일 [수빈]
+`C:\finalPj_웹` 4개 파일, `c:\final_pj` src/gru_module.py, src/config.py, dev_guide_phase2.md, plan.md, 산출물 2개, CLAUDE.md
+
+### 발생 오류 / 확인 사항
+- 차트 라이브러리 미설치 (recharts/chart.js 없음) → SVG polyline으로 직접 구현
+
+### 작업 재개 위치 [수빈]
+- 백엔드 실제 탐지기 연동: CongestionDetector가 shared.congestion_state를 갱신하는 연결 작업 필요
+- 현재는 API 구조만 완성, 탐지기 미연결 상태 (초기값 SMOOTH 반환)
+
+---
+
 ## 2026-04-03 (67차 — 웹 탄소/정체 탭 설계 논의 + 벤치마킹)
 
 ### 오늘 한 작업 [수빈]
