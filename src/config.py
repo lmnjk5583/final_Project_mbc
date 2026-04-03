@@ -24,11 +24,11 @@ class DetectorConfig:
     velocity_window: int = 20         # 속도/방향 계산 시 사용하는 프레임 간격 (이전 위치~현재 위치 거리) — 15→20 (bbox jitter의 방향 벡터 영향 완화)
     base_speed_threshold: float = 7.0 # 기본 속도 임계값 (원근에 따라 가중을 곱해 사용)
     cos_threshold: float = -0.75      # 코사인 유사도 임계값 (원본값 복원 — smoothing 오염 방지로 오탐 차단)
-    wrong_count_threshold: int = 8    # 역주행 확정까지 필요한 연속 의심 횟수
+    wrong_count_threshold: int = 12   # 역주행 확정까지 필요한 연속 의심 횟수 — 8→12 (오탐 감소)
     vote_threshold: float = 0.7       # 투표 시 역방향 비율 임계값 (원본값 복원 — 60% 이상이면 역주행 의심)
     min_move_distance: float = 10.0    # 최소 누적 이동 거리 (이하면 정지로 판단) — 원래 20.0, 원거리 CCTV 대응 완화
     min_move_per_frame: float = 0.4   # 프레임당 평균 이동거리 (이하면 정지) — 원래 1.5, 원거리 CCTV 대응 완화
-    direction_change_guard_frames: int = 90  # 정상→역방향 급전환 가드: 정상 판정 후 이 프레임 이내 의심 카운트 차단 — 45→90 (점진적 방향 전환 오탐 대응)
+    direction_change_guard_frames: int = 120 # 정상→역방향 급전환 가드: 정상 판정 후 이 프레임 이내 의심 카운트 차단 — 45→90→120 (오탐 감소)
 
     # ==================== ID 매핑 관련 ====================
     id_match_distance: int = 120      # ID 재매칭 허용 거리 (픽셀 단위, 이전 ID와 새 ID 위치 비교)
@@ -105,6 +105,16 @@ class DetectorConfig:
     gru_replay_size: int = 200              # replay_buffer 최대 크기
     gru_online_interval: int = 10           # 온라인 학습 gradient step 주기 (프레임)
     gru_lr: float = 1e-3                    # Adam optimizer 학습률
+
+    # ==================== 화면 표시 설정 ====================
+    display_width: int = 1280              # 화면 출력 창 너비 (픽셀). 0이면 원본 해상도 그대로
+    display_height: int = 720              # 화면 출력 창 높이 (픽셀). 0이면 원본 해상도 그대로
+
+    # ==================== 정체 탐지 slow_ratio 파라미터 ====================
+    slow_upper_nm: float = 0.50            # 서행 판정 상한 nm (이 값 미만 = 서행, 이상 = 정상 주행)
+                                           # norm_speed_gate_threshold(0.15)와 분리 — 역주행 게이트와 무관
+                                           # nm≈0.50: 속도 40~50km/h 수준 (카메라 화각에 따라 다름)
+                                           # 원활(80km/h nm≈0.90): slow 미해당, 서행(40km/h nm≈0.44): slow 해당
 
     # ==================== 방향별 차선 분리 파라미터 ====================
     lane_cos_threshold: float = 0.0        # 방향 분류 코사인 임계값 (≥ 이면 A방향, < 이면 B방향)
