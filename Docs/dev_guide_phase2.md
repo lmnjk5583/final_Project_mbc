@@ -2,8 +2,8 @@
 
 > Phase 1: 규칙 기반 jam_score — **완료**
 > Phase 2: GRU 40% 혼합 — **완료** (`gru_module.py` 포함 src/ 전체 작동 중)
-> Phase 3: GRU 65% primary — **미구현** (§13 참조)
-> 최종 수정: 2026-04-02
+> Phase 3: GRU 65% primary + 미래 예측 — **구현 중** (§13 참조)
+> 최종 수정: 2026-04-03
 
 ---
 
@@ -82,9 +82,11 @@ GRU 가중치는 화각 무관 (feature가 비율이므로). 재학습 불필요
 
 ---
 
-## 13. Phase 3 설계 명세 (미구현)
+## 13. Phase 3 설계 명세 (구현 중)
 
-> Phase 2 안정화 후 착수. GRU를 primary 모델로 전환, rule은 보조 역할.
+> Phase 2 안정화 후 착수. GRU를 primary 모델로 전환 + **미래 정체 예측** 추가.
+
+### 13-A. GRU primary 전환 (블렌드 비율 변경)
 
 ```
 최종 blend: final_jam = 0.35 × rule_jam + 0.65 × gru_score
@@ -103,12 +105,51 @@ config.py 변경:
   gru_blend_ratio: 0.40 → 0.65
 ```
 
+### 13-B. 미래 정체 예측 (자기회귀 롤아웃) — ✅ 구현 완료
+
+```
+구조 변경 (_GRUNet):
+  기존: GRU(7→64) → FC(64→32→3) Softmax (분류 전용)
+  추가: pred_head = Linear(64→7)  ← 다음 프레임 feature 예측 헤드
+
+자기회귀 롤아웃 (predict_future):
+  1. 현재 버퍼 [x_{t-29}, ..., x_t] → GRU → hidden_state h_t, 출력 o_t
+  2. pred_head(o_t) → x̂_{t+1}  (7차원 예측 feature)
+  3. x̂_{t+1}를 GRU 단일 스텝 입력 → h_{t+1}, o_{t+1}
+  4. 분류 헤드(o_{t+1}) → [p_smooth, p_slow, p_congested]
+  5. 2~4 반복 × N스텝
+
+반환값:
+  [{"step": 1, "p_smooth": 0.12, "p_slow": 0.71, "p_congested": 0.17,
+    "gru_score": 0.52}, ...]
+
+config.py 파라미터:
+  gru_forecast_steps: 150  (기본 150프레임 ≈ 5초@30fps)
+
+pretrain 개선:
+  기존: last_out[:, :7] 해킹 (hidden 앞 7차원을 feature로 근사)
+  수정: pred_head(last_out) 사용 (정식 예측 헤드, MSE 학습)
+
+학습 흐름:
+  - pretrain(): MSE Loss로 GRU + pred_head 가중치 학습 (x_{t+1} 예측)
+  - online_step(): CrossEntropy로 GRU + 분류 헤드(FC1+FC2) 학습
+  - pred_head는 pretrain에서만 학습됨 (온라인 학습 대상 아님)
+
+웹 연동:
+  predict_future() 결과를 WebSocket /ws/traffic 채널에 forecast 필드로 포함
+  프론트에서 gru_score 추이를 시계열 차트로 시각화
+```
+
 ### Phase 3 전환 체크리스트
-| 항목 | 기준 | 확인 방법 |
-|------|------|-----------|
-| GRU 수렴 | MAE(gru, rule) < 0.05 | frame_log.csv gru_score 컬럼 분석 |
-| 온라인 학습 | 누적 스텝 ≥ 500 | gru_module.py online_step_count |
-| 실영상 검증 | SMOOTH/SLOW/CONGESTED 오탐률 < 10% | run_test.py + 수동 검토 |
+| 항목 | 기준 | 확인 방법 | 상태 |
+|------|------|-----------|------|
+| pred_head 추가 | _GRUNet에 Linear(64→7) | 코드 확인 | ✅ |
+| pretrain 해킹 제거 | pred_head(last_out) 사용 | 코드 확인 | ✅ |
+| predict_future 구현 | 자기회귀 롤아웃 N스텝 | 코드 확인 | ✅ |
+| GRU 수렴 | MAE(gru, rule) < 0.05 | frame_log.csv gru_score 컬럼 분석 | ⬜ |
+| 온라인 학습 | 누적 스텝 ≥ 500 | gru_module.py online_step_count | ⬜ |
+| 실영상 검증 | SMOOTH/SLOW/CONGESTED 오탐률 < 10% | run_test.py + 수동 검토 | ⬜ |
+| 블렌드 비율 전환 | gru_blend_ratio 0.40 → 0.65 | config.py 변경 | ⬜ |
 
 ---
 

@@ -50,7 +50,7 @@
 ```
 Phase 1: 규칙 기반 jam_score (normalized_mag + dwell + count)   ✅ 완료
 Phase 2: GRU 병렬 추가 (40% 혼합)                              ✅ 완료
-Phase 3: GRU primary (65%) — dev_guide_phase2.md §13 참조       ⬜ 미구현
+Phase 3: GRU primary (65%) + 미래 예측 — dev_guide_phase2.md §13 참조  🔧 구현 중
 ```
 
 ### 3.1 정체 해결 조치 권고 (research.md §11 기반)

@@ -64,6 +64,7 @@ if _TORCH_AVAILABLE:                                   # PyTorch 있을 때만 �
             self.relu = nn.ReLU()                      # 활성화 함수
             self.fc2 = nn.Linear(32, 3)                # FC: 32 → 3클래스
             self.softmax = nn.Softmax(dim=-1)          # 확률 분포 정규화
+            self.pred_head = nn.Linear(hidden, input_dim)  # 미래 예측 헤드: hidden(64) → feature(7)
 
         def forward(self, x, h=None):
             """순전파 계산.
@@ -210,6 +211,76 @@ class GRUModule:
 
         return gru_score                               # 예측값 반환
 
+    # ── predict_future: N스텝 자기회귀 롤아웃 ───────────────────────────
+    def predict_future(self, steps: int | None = None) -> list | None:
+        """N스텝 미래 정체 상태를 자기회귀 롤아웃으로 예측한다.
+
+        현재 feature_buffer → GRU 통과 → pred_head로 x_{t+1} 예측 →
+        예측값을 다시 GRU 입력으로 반복하여 미래 상태를 추정한다.
+        실제 _hidden/_feature_buffer는 변경하지 않는다 (예측 전용).
+
+        Args:
+            steps: 예측 스텝 수 (프레임). None이면 cfg.gru_forecast_steps.
+
+        Returns:
+            [{"step": 1, "p_smooth": ..., "p_slow": ..., "p_congested": ...,
+              "gru_score": ...}, ...]
+            버퍼 부족·warmup·PyTorch 없으면 None.
+        """
+        if not self._torch_ok or self._net is None:    # PyTorch 없음 → fallback
+            return None                                # 예측 불가
+
+        if len(self._feature_buffer) < self.cfg.gru_seq_len:  # 시퀀스 버퍼 부족
+            return None                                # 예측 불가
+
+        if self._warmup_remaining > 0:                 # warmup 기간 중
+            return None                                # 예측 불가
+
+        if steps is None:                              # 기본 스텝 수 사용
+            steps = self.cfg.gru_forecast_steps         # config에서 읽기
+
+        # ── 현재 버퍼 → Tensor 변환 (실제 상태 변경 없음) ──────────────
+        seq = list(self._feature_buffer)               # deque → list 복사
+        x = torch.tensor([seq], dtype=torch.float32)   # (1, seq_len, 7)
+
+        self._net.eval()                               # eval 모드 확인
+        results = []                                   # 예측 결과 리스트
+
+        with torch.no_grad():                          # gradient 비활성화
+            # ── 현재 시퀀스로 초기 hidden state 획득 ──────────────────
+            gru_out, h = self._net.gru(x)              # (1, seq_len, 64), (layers, 1, 64)
+            cur_out = gru_out[:, -1, :]                # (1, 64) — 마지막 타임스텝 출력
+
+            for step_i in range(1, steps + 1):         # 1 ~ steps 반복
+                # ── 분류 확률 계산 (현재 스텝) ──────────────────────
+                fc_out = self._net.relu(               # FC1 + ReLU
+                    self._net.fc1(cur_out)             # (1, 32)
+                )
+                logits = self._net.fc2(fc_out)         # (1, 3) 로짓
+                probs = self._net.softmax(logits)      # (1, 3) softmax 확률
+                p = probs[0]                           # (3,) — [smooth, slow, congested]
+                gru_score = float(                     # 가중 합산 gru_score
+                    p[1] * 0.5 + p[2] * 1.0            # p_slow×0.5 + p_congested×1.0
+                )
+
+                results.append({                       # 스텝 결과 저장
+                    "step": step_i,                    # 예측 스텝 번호
+                    "p_smooth": float(p[0]),           # SMOOTH 확률
+                    "p_slow": float(p[1]),             # SLOW 확률
+                    "p_congested": float(p[2]),        # CONGESTED 확률
+                    "gru_score": max(0.0, min(1.0, gru_score)),  # clip 0~1
+                })
+
+                # ── 다음 feature 예측 (자기회귀) ───────────────────
+                pred_feat = self._net.pred_head(cur_out)  # (1, 7) — 다음 프레임 feature
+                next_input = pred_feat.unsqueeze(1)    # (1, 1, 7) — GRU 입력 형태
+                gru_step_out, h = self._net.gru(       # 단일 타임스텝 GRU 순전파
+                    next_input, h                      # 예측 feature + 현재 hidden
+                )
+                cur_out = gru_step_out[:, -1, :]       # (1, 64) — 다음 루프용 출력
+
+        return results                                 # 전체 예측 리스트 반환
+
     # ── pretrain: 학습 구간 완료 후 자기지도 학습 ─────────────────────────
     def pretrain(self, feature_sequence: list) -> list | None:
         """feature 시퀀스로 x_{t+1} 예측 자기지도 학습을 수행한다.
@@ -253,9 +324,8 @@ class GRUModule:
             self._optimizer.zero_grad()                # gradient 초기화
             out, _ = self._net.gru(X)                  # GRU 출력: (N, seq_len, hidden)
             last_out = out[:, -1, :]                   # 마지막 타임스텝: (N, hidden)
-            # hidden → 7차원 feature 예측용 임시 FC (신경망 헤드는 분류용이므로 GRU 출력 직접 사용)
-            # pretrain은 GRU 파라미터만 업데이트하기 위해 gru 출력 크기를 target 크기와 맞춤
-            pred = last_out[:, :_FEATURE_DIM]          # hidden 앞 7차원만 사용 (근사)
+            # pred_head(64→7)로 다음 프레임 feature 예측 — GRU + pred_head 가중치 갱신
+            pred = self._net.pred_head(last_out)       # (N, 7) — 정식 예측 헤드 사용
             loss = criterion(pred, Y)                  # MSE 손실 계산
             loss.backward()                            # 역전파
             self._optimizer.step()                     # 파라미터 갱신

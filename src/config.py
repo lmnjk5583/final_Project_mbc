@@ -105,6 +105,7 @@ class DetectorConfig:
     gru_replay_size: int = 200              # replay_buffer 최대 크기
     gru_online_interval: int = 10           # 온라인 학습 gradient step 주기 (프레임)
     gru_lr: float = 1e-3                    # Adam optimizer 학습률
+    gru_forecast_steps: int = 150           # 미래 예측 자기회귀 스텝 수 (150프레임 ≈ 5초@30fps)
 
     # ==================== 화면 표시 설정 ====================
     display_width: int = 1280              # 화면 출력 창 너비 (픽셀). 0이면 원본 해상도 그대로
