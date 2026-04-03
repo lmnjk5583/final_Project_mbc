@@ -4,6 +4,44 @@
 
 ---
 
+## 2026-04-01 (63차 — flow_map 개선 + 시각화 개편 + 파라미터 튜닝)
+
+### 오늘 한 작업
+
+**flow_map 학습 품질 개선 (3개 파일)**
+- `flow_map.py`: smoothed_mask 추가 — 보간 채움 셀 추적, 실 데이터 유입 시 자동 해제, save/load 포함
+- `detector.py`: 중간 평활화 150프레임 주기 → 80%/95% 시점 플래그 방식으로 변경 (정확히 1회씩)
+- `judge.py`: smoothed_mask 셀 cos_threshold 완화 — 단기 -0.50, 장기 -0.60, 전체 궤적 -0.75 유지
+
+**시각화 개편**
+- `visualizer.py`: 정체 패널 1개(380px 좌하단) → 2개(Down 좌하단, Up 우하단, 190px씩) 분리
+- 조치 권고 텍스트: 반투명 배경 추가, 폰트 크기 0.38→0.52, 두께 1→2
+- `C`키 단축키 추가 — 정체 패널 ON/OFF 토글
+
+**파라미터 튜닝**
+- `norm_stop_threshold`: 0.10 → 0.06, `density_max_vehicles`: 20 → 40
+- `direction_change_guard_frames`: 45 → 90, `wrong_count_threshold`: 5 → 8
+- `vote_threshold`: 0.60 → 0.70, `slow_jam_threshold`: → 0.60
+
+### 수정 파일
+`src/flow_map.py`, `src/detector.py`, `src/judge.py`, `src/visualizer.py`, `src/feature_extractor.py`, `src/config.py`
+
+---
+
+## 2026-04-01 (62차 — 정체 탐지 baseline 설계 확정 + 코드 수정)
+
+- **설계 확정**: flow_map(역주행 전용) / 정체 판정(fallback + LCS=0.36) 분리
+- **수정 파일**: `src/config.py` (default_lcs=0.36), `src/detector.py` (3곳)
+
+---
+
+## 2026-04-01 (61차 — LCS 수정 완료 확인 + 설계 방향 논의)
+
+- 베이스라인 재학습 결과: `passage=8404, lcs=0.36` 확인 (0.96→0.58→0.36)
+- LCS 0.36 = 품질 점수, 실제 판정 기준은 `norm_speed_ref` 임을 정리
+
+---
+
 ## 2026-03-31 (60차 — LCS compute_lcs() 3단계 수정)
 
 - `passage_tracker.py`: `compute_lcs()` 총 3차례 수정 (0.96 → 0.58 → 0.36)
