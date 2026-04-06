@@ -42,8 +42,7 @@ class TrafficAnalyzer:
     CONGESTED = "CONGESTED"                           # 정체 (LOS E~F)
 
     def __init__(self, cfg, frame_w: int, frame_h: int, fps: float,
-                 flow_map=None, passage_tracker=None,
-                 congestion_judge=None, gru_module=None):
+                 flow_map=None, congestion_judge=None, gru_module=None):
         self.cfg = cfg                                # 설정 객체 저장
         self.frame_w = frame_w                        # 프레임 너비 (픽셀)
         self.frame_h = frame_h                        # 프레임 높이 (픽셀)
@@ -62,8 +61,6 @@ class TrafficAnalyzer:
         else:                                         # None이면 내부 생성
             self.congestion_judge = CongestionJudge(cfg, fps)  # 자체 생성
 
-        # ── FeatureExtractor: passage_tracker 필수 ────────────────
-        self.passage_tracker = passage_tracker        # PassageTracker 참조 저장
         self.feature_extractor: FeatureExtractor | None = None  # set_state() 후 초기화
 
         # ── 내부 상태 ─────────────────────────────────────────────
@@ -74,6 +71,8 @@ class TrafficAnalyzer:
         self._last_frame_num = 0                      # 마지막 update 프레임 번호
         self._last_norm_speed_ratio = 0.0             # 마지막 속도 비율 (0~1)
         self._last_affected_count = 0                 # 마지막 저속(정지) 차량 수
+        self._last_rule_jam: float = 0.0              # 마지막 rule 기반 jam_score (로그용)
+        self._last_gru_score: float | None = None     # 마지막 GRU 예측값 (없으면 None)
 
     # ── DetectorState 설정 (detector.py에서 호출) ──────────────────
     def set_state(self, state):
@@ -86,8 +85,7 @@ class TrafficAnalyzer:
         """
         self.feature_extractor = FeatureExtractor(    # FeatureExtractor 생성
             self.cfg,                                 # 설정 객체
-            state,                                    # 런타임 상태
-            self.passage_tracker                      # PassageTracker
+            state                                     # 런타임 상태
         )
 
     # ── 기준선 전달 (학습 완료 후 detector.py에서 호출) ─────────────
@@ -137,12 +135,13 @@ class TrafficAnalyzer:
         # ── 1) 밀도맵 갱신 ────────────────────────────────────────
         self._update_density_map(tracks)              # footpoint 기반 밀도맵
 
-        # ── 차량 없으면 속도/영향 초기화 후 종료 ──────────────────
-        # 차량이 없을 때 norm_speed_ratio=0 → jam_score 급등 방지
+        # ── 차량 없으면 jam_score 점진 감소 후 종료 ───────────────
+        # return 대신 jam=0.0 으로 apply_level 호출 → alpha_down EMA로 서서히 감소
         if not tracks:                                # 현재 프레임 감지 차량 없음
             self._last_norm_speed_ratio = 0.0         # 속도 비율 초기화
             self._last_affected_count = 0             # 영향 차량 수 초기화
-            return                                    # judge.update() 스킵 → 레벨 유지
+            self.congestion_judge.apply_level(0.0, frame_num)  # jam=0 → EMA 감소
+            return
 
         # ── 2) feature 벡터 계산 → jam_score → 레벨 판정 ──────────
         if self.feature_extractor is None:            # set_state() 미호출 시
@@ -179,6 +178,9 @@ class TrafficAnalyzer:
             final_jam = (1.0 - blend) * rule_jam + blend * gru_score  # 가중 평균
         else:                                         # GRU 예측 불가 → Phase 1 모드
             final_jam = rule_jam                      # rule_jam 그대로 사용
+
+        self._last_rule_jam = rule_jam                # rule_jam 저장 (로그용)
+        self._last_gru_score = gru_score              # gru_score 저장 (로그용, None 허용)
 
         # ── 5) 레벨 판정 (히스테리시스 포함, final_jam 기준) ─────────
         level, jam = self.congestion_judge.apply_level(final_jam, frame_num)
@@ -217,6 +219,14 @@ class TrafficAnalyzer:
     def get_jam_score(self) -> float:
         """현재 jam_score(0.0~1.0)를 반환한다."""
         return self.congestion_judge.get_jam_score()   # CJ에서 마지막 계산 값
+
+    def get_rule_jam_score(self) -> float:
+        """마지막 rule 기반 jam_score(GRU 블렌딩 전)를 반환한다."""
+        return self._last_rule_jam                     # rule_jam (로그·진단용)
+
+    def get_gru_score(self) -> float | None:
+        """마지막 GRU 예측값을 반환한다. GRU 미사용 또는 warmup 중이면 None."""
+        return self._last_gru_score                    # gru_score (로그·진단용)
 
     def get_volume(self) -> float:
         """교통량(대/시)을 추정한다.

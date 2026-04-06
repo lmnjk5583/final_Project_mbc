@@ -4,6 +4,61 @@
 
 ---
 
+## 2026-04-06 (73~76차 — normal mode 제거 + jam_score 밀도 보정 + 방향 분류 nearest-neighbor) [대원]
+
+### 오늘 한 작업 [대원] — 추가
+
+**B방향(상행) jam_score 저평가 원인 분석 및 수정**
+- 원인: flow_map 상단 rows 0~6 (y < 252px) 전체 미학습 → `get_interpolated` = None → 기본값 'a' → 상행 차량 전부 A방향으로 오분류
+- track_log + flow_map 분석으로 확인: B방향 speed-known 차량 2대, 상단 미학습 115/400 셀
+- `flow_map.py`: `get_nearest_direction(x, y)` 추가 — count>0 셀 중 그리드 거리 최소 셀 벡터 반환 (20×20 브루트포스)
+- `detector.py._classify_direction`: `flow_v=None` 시 `get_nearest_direction` 호출 → 최종 None이면 'a' fallback
+
+**jam_score 공식 sqrt(bbox_coverage) 적용**
+- bbox weight: 0.25 → 0.35, 변환: linear → sqrt
+- count_ratio 항 추가 후 제거 (count_ref=15 > 실탐지 10대로 효과 미미)
+- 최종: `0.80×slow + 0.70×stop + 0.35×sqrt(bbox_coverage)`
+
+### 수정 파일 [대원]
+`src/congestion_judge.py`, `src/flow_map.py`, `src/detector.py`
+
+### 발생 오류 / 확인 사항
+- B방향 jam 0.07 → nearest-neighbor 적용 후 0.12~0.18 예상
+
+### 작업 재개 위치 [대원]
+- run_test.py 재실행 후 B방향 jam_score 실측 확인
+
+---
+
+## 2026-04-06 (73~74차 — normal mode 제거 + jam_score 밀도 보정) [대원]
+
+### 오늘 한 작업 [대원]
+
+**congestion_judge.py normal mode 전면 제거**
+- `compute_jam_score()` 함수 삭제 (LCS 기반 정상 모드)
+- `from baseline_stats import BaselineStats` import 제거
+- `self.baseline` → `self._baseline_set: bool` 단순화
+- `set_baseline()` 파라미터 무시 (`_baseline=None`)
+- `compute_jam()`: if/else 분기 → 항상 `compute_jam_score_fallback()` 호출
+- `get_smooth_threshold()` / `_get_slow_threshold()`: LCS 보정 제거 → 고정 임계값 반환
+
+**jam_score smooth 구간 바닥 점수 개선**
+- 기존 문제: 차량 많아도 smooth jam=0.01~0.05 (bbox_coverage 분자 작아 단독 효과 미미)
+- bbox_coverage 가중치: 0.25 → 0.35
+- count_ratio 항 추가: `+0.10 × min(count_ratio, 1.0)`
+- smooth 차량 많음 기대치: 0.04 → 0.15
+
+### 수정 파일 [대원]
+`src/congestion_judge.py`
+
+### 발생 오류 / 확인 사항
+- 없음
+
+### 작업 재개 위치 [대원]
+- run_test.py 실행 후 smooth/congested jam_score 실측 확인
+
+---
+
 ## 2026-04-06 (68~72차 — 역주행 오탐 근본 재설계 + bbox_coverage + nm 테스트) [대원]
 
 ### 오늘 한 작업 [대원]

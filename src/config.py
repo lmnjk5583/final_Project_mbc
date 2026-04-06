@@ -113,10 +113,15 @@ class DetectorConfig:
     display_height: int = 720              # 화면 출력 창 높이 (픽셀). 0이면 원본 해상도 그대로
 
     # ==================== 정체 탐지 slow_ratio 파라미터 ====================
-    slow_upper_nm: float = 0.50            # 서행 판정 상한 nm (이 값 미만 = 서행, 이상 = 정상 주행)
-                                           # norm_speed_gate_threshold(0.15)와 분리 — 역주행 게이트와 무관
-                                           # nm≈0.50: 속도 40~50km/h 수준 (카메라 화각에 따라 다름)
-                                           # 원활(80km/h nm≈0.90): slow 미해당, 서행(40km/h nm≈0.44): slow 해당
+    slow_upper_nm: float = 0.50            # 서행 판정 상한 nm (nm < 이 값 → 서행)
+    nm_cy_correction_k: float = 0.6        # nm cy 보정 계수 — 원근 대칭 보정
+                                           # nm_corrected = nm / (1 + k × (2×cy_ratio − 1))
+                                           # cy_ratio = cy / frame_h  (0=원거리/상단, 1=근거리/하단)
+                                           # 상단(원거리): 분모 < 1 → nm 증가 (부스트)
+                                           # 중앙(0.5):    분모 = 1 → nm 그대로
+                                           # 하단(근거리): 분모 > 1 → nm 감소
+                                           # k < 1.0 필수 — k≥1이면 원거리 분모가 0 이하로 발산
+                                           # k=0.4: 원거리 nm×1.67 / 근거리 nm×0.56
 
     # ==================== 방향별 차선 분리 파라미터 ====================
     lane_cos_threshold: float = 0.0        # 방향 분류 코사인 임계값 (≥ 이면 A방향, < 이면 B방향)

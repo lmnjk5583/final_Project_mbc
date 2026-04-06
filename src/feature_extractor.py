@@ -41,19 +41,16 @@ class FeatureExtractor:
         학습 완료 후 set_baseline()으로 설정.
     """
 
-    def __init__(self, cfg, state, passage_tracker,
-                 baseline_stats=None):
+    def __init__(self, cfg, state, baseline_stats=None):
         """FeatureExtractor 초기화.
 
         Args:
             cfg: DetectorConfig — grid_size, stop_mag_threshold 등.
             state: DetectorState — first_seen_frame, frame_w, frame_h.
-            passage_tracker: PassageTracker — dwell·exit 조회용.
             baseline_stats: BaselineStats or None — 학습 완료 전 None.
         """
         self.cfg = cfg                                 # 설정 객체 저장
         self.state = state                             # 런타임 상태 저장
-        self.passage_tracker = passage_tracker         # PassageTracker 참조
         self.baseline: BaselineStats | None = baseline_stats  # 기준선 (초기 None)
 
     # ── 기준선 설정 ──────────────────────────────────────────────────
@@ -96,6 +93,7 @@ class FeatureExtractor:
         slow_upper_nm = getattr(                       # 서행 상한 nm — 역주행 게이트(0.15)와 별개
             self.cfg, "slow_upper_nm", 0.50            # 기본 0.50: nm≥0.50 → 정상 주행
         )
+        nm_cy_k = getattr(self.cfg, "nm_cy_correction_k", 0.0)  # cy 보정 계수 (0=비활성)
         min_bbox_h = getattr(                          # min_bbox_h 없으면 구버전 호환 (30px)
             self.cfg, "min_bbox_h", 30.0
         )
@@ -113,6 +111,10 @@ class FeatureExtractor:
                 slow_count += 1                        # 정지는 서행의 부분집합 — 서행에도 포함
                 continue
             nm = mag / bbox_h                          # normalized_mag = mag / bbox_h (원근 보정)
+            if nm_cy_k > 0:                            # cy 보정 활성화 시
+                cy_ratio = t["cy"] / max(self.state.frame_h, 1)  # 0(상단/원거리)~1(하단/근거리)
+                denom = 1.0 + nm_cy_k * (2.0 * cy_ratio - 1.0)   # 중앙(0.5) 기준 대칭
+                nm = nm / max(denom, 0.1)              # 원거리 부스트·근거리 감소, 0 방지
             norm_mags.append(nm)                       # 속도 목록에 추가
             if nm < norm_stop_thr:                     # nm < 0.06 → 저속 정지
                 stopped_count += 1                     # 정지 카운트
@@ -120,16 +122,9 @@ class FeatureExtractor:
             elif nm < slow_upper_nm:                   # 0.06 ≤ nm < 0.50 → 서행 구간
                 slow_count += 1                        # 서행 카운트
 
-        # ── 활성 차량의 현재 dwell 조회 ──────────────────────────────
-        active_ids = {t["id"] for t in tracks}         # 활성 차량 ID 집합
-        current_dwells = self.passage_tracker.get_current_dwells(  # 체류 프레임 리스트
-            active_ids, frame_num
-        )
-
-        # ── 최근 퇴장 차량 수 (exit_rate_window 기본 30프레임) ───────
-        exit_last_30 = self.passage_tracker.get_exit_count_recent(  # 최근 30프레임 퇴장 수
-            self.cfg.exit_rate_window
-        )
+        # ── dwell / exit_rate: fallback 공식에서 미사용 → 상수 처리 ──
+        # normal 모드 전환 시 passage_tracker 재연결 필요
+        exit_last_30 = 0                               # 미사용 (fallback 공식 무관)
 
         # ── bbox_coverage: flow_map 유효 도로 면적 대비 탐지 차량 bbox 면적 비율 ──
         # 차선 수·차량 대수에 독립적 — 분자(bbox 합)와 분모(도로 면적) 모두
@@ -205,12 +200,8 @@ class FeatureExtractor:
             0.0, 3.0                                   # 상한 3.0
         ))
 
-        # [4] dwell_ratio: 자유흐름 체류 / 현재 평균 체류 (1.0이면 정상)
-        avg_dwell = float(np.mean(current_dwells)) if current_dwells else 1.0  # 평균 체류
-        dwell_ratio = float(np.clip(                   # 체류 비율 clip(0, 1)
-            bl.free_flow_dwell / max(avg_dwell, 1),    # 자유흐름 / 현재 (1.0이면 동일)
-            0.0, 1.0                                   # 상한 1.0
-        ))
+        # [4] dwell_ratio: fallback 공식 미사용 → 1.0 고정 (중립값)
+        dwell_ratio = 1.0                              # passage_tracker 제거로 상수화
 
         # [5] bbox_coverage: 도로 면적 대비 bbox 점유율 (density_score 대체)
         # [6] rule_jam_score: CongestionJudge가 채워넣을 예정 (초기 0.0)

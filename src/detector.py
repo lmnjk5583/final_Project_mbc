@@ -5,7 +5,7 @@
 import cv2                                          # OpenCV — 영상 입출력·시각화
 import numpy as np                                  # 수치 계산
 import time                                         # FPS 측정용 타이머
-from copy import copy                               # baseline 방향별 독립 복사용
+from copy import copy                               # fallback baseline 방향별 독립 복사용
 
 from .config import DetectorConfig                  # 모든 파라미터가 담긴 설정 클래스
 from .state import DetectorState                    # 프레임 번호·궤적·역주행 카운트 등 런타임 상태
@@ -46,9 +46,6 @@ class Detector:
         # ── 메인 PassageTracker (학습 시 on_entry/on_exit 전담) ────────
         self.passage_tracker = PassageTracker(cfg, self.state)      # 차량 진입·퇴장 기록 관리
 
-        # ── 방향별 PassageTracker (탐지 시 record_frame_stats 전담) ──
-        self.passage_tracker_a = PassageTracker(cfg, self.state)    # A방향 PT (state 공유)
-        self.passage_tracker_b = PassageTracker(cfg, self.state)    # B방향 PT (state 공유)
 
         # ── 방향별 GRU/TrafficAnalyzer/Predictor (run()에서 초기화) ──
         # frame 크기(fw, fh)와 fps는 run()에서 영상을 열어야 확정되므로
@@ -133,12 +130,18 @@ class Detector:
 
     # ==================== 차량 방향 분류 ====================
     def _classify_direction(self, fx, fy):
-        """footpoint 위치의 flow_map 셀 방향과 기준 방향을 비교해 'a' 또는 'b' 반환."""
+        """footpoint 위치의 flow_map 셀 방향과 기준 방향을 비교해 'a' 또는 'b' 반환.
+
+        미학습 셀(flow_v=None)이면 nearest-neighbor로 가장 가까운 학습 셀 방향을 사용한다.
+        flow_map 상단(rows 0~6)이 미학습인 환경에서 상행 차량이 A로 오분류되던 문제 해결.
+        """
         if self._ref_direction is None:                           # 기준 방향 미설정
             return 'a'                                            # 기본값: A방향
         flow_v = self.flow.get_interpolated(fx, fy)               # 해당 위치 흐름 벡터
-        if flow_v is None:                                        # 벡터 없으면 (경계·flow 없음)
-            return 'a'                                            # fallback: A방향
+        if flow_v is None:                                        # 미학습 구역 → nearest-neighbor
+            flow_v = self.flow.get_nearest_direction(fx, fy)      # 가장 가까운 학습 셀 벡터
+        if flow_v is None:                                        # 학습 셀 자체가 없음
+            return 'a'                                            # 최종 fallback: A방향
         ref_x, ref_y = self._ref_direction                        # 기준 방향 분해
         cos_val = flow_v[0] * ref_x + flow_v[1] * ref_y          # 코사인 유사도
         return 'a' if cos_val >= self.cfg.lane_cos_threshold else 'b'  # 임계값 기준 분류
@@ -184,7 +187,6 @@ class Detector:
         self.traffic_analyzer_a = TrafficAnalyzer(                  # A방향 정체 탐지
             cfg, frame_w=fw, frame_h=fh, fps=fps,
             flow_map=self.flow,                                     # flow_map 주입 (bbox_coverage 계산용)
-            passage_tracker=self.passage_tracker_a,                 # A방향 PT 연결
             gru_module=self.gru_module_a                            # A방향 GRU 연결
         )
         self.traffic_analyzer_a.set_state(self.state)               # state 주입
@@ -192,7 +194,6 @@ class Detector:
         self.traffic_analyzer_b = TrafficAnalyzer(                  # B방향 정체 탐지
             cfg, frame_w=fw, frame_h=fh, fps=fps,
             flow_map=self.flow,                                     # flow_map 주입 (bbox_coverage 계산용)
-            passage_tracker=self.passage_tracker_b,                 # B방향 PT 연결
             gru_module=self.gru_module_b                            # B방향 GRU 연결
         )
         self.traffic_analyzer_b.set_state(self.state)               # state 주입
@@ -206,10 +207,9 @@ class Detector:
         # flow_map은 역주행 탐지 전용으로만 사용하며 정체 판정 기준으로 쓰지 않는다.
         _fb = BaselineStats(                                        # fallback baseline 생성
             free_flow_dwell=90.0,                                  # dwell_ratio 계산 기준 (원활 차량 기준 체류: 3초×30fps=90f)
-                                                                   # avg_dwell < 90이면 dwell_jam≈0 (원활), 200이면 0.55 (서행), 350이면 0.74 (정체)
             typical_dwell=180.0,                                   # 미사용 (참조용)
             norm_speed_ref=0.15,                                   # 미사용
-            count_ref=15.0,                                        # 미사용
+            count_ref=8.0,                                         # fallback 방향당 기준 차량 수 (실탐지 최대 대수 기준, 15→8)
             bbox_slope=0.0,                                        # 미사용
             bbox_intercept=50.0,                                   # 미사용
             lcs=cfg.default_lcs,                                   # 한강 측정값 0.36 — 임계값 보정에만 사용
@@ -314,6 +314,11 @@ class Detector:
                 _lo = {"SMOOTH": 0, "SLOW": 1, "CONGESTED": 2}     # 레벨 순위
                 _worst_lvl = (_lvl_a if _lo.get(_lvl_a, 0) >= _lo.get(_lvl_b, 0)  # 더 나쁜 레벨
                               else _lvl_b)
+                # worst-of-both 방향의 rule_jam / gru_score 선택 (jam 기준)
+                _src = (self.traffic_analyzer_a                     # jam 높은 쪽 analyzer
+                        if _jam_a >= _jam_b else self.traffic_analyzer_b)
+                _rule_jam = _src.get_rule_jam_score() if _src else 0.0  # rule_jam (블렌딩 전)
+                _gru_score = _src.get_gru_score() if _src else None     # gru_score (None 허용)
                 self.logger.log_frame(                              # 프레임 로그 기록
                     frame_num=st.frame_num,
                     time_sec=time_sec,
@@ -323,7 +328,9 @@ class Detector:
                     camera_switch_triggered=False,
                     mode="DETECTING",
                     jam_score=_worst_jam,                           # worst-of-both jam_score
-                    congestion_level=_worst_lvl                     # worst-of-both 레벨
+                    congestion_level=_worst_lvl,                    # worst-of-both 레벨
+                    rule_jam_score=_rule_jam,                       # rule 기반 jam (블렌딩 전)
+                    gru_score=_gru_score                            # GRU 예측값 (warmup 중 None)
                 )
 
             # ── 카메라 전환 감지 ──
@@ -332,8 +339,6 @@ class Detector:
                     st.reset_for_relearn()                          # 상태 초기화
                     self.flow.reset()                               # flow_map 초기화
                     self.passage_tracker.reset()                    # 메인 PT 초기화 (재학습 시작)
-                    self.passage_tracker_a.reset()                  # A방향 PT 초기화
-                    self.passage_tracker_b.reset()                  # B방향 PT 초기화
                     self.traffic_analyzer_a.congestion_judge.reset()  # A방향 EMA·히스테리시스 초기화
                     self.traffic_analyzer_b.congestion_judge.reset()  # B방향 EMA·히스테리시스 초기화
                     if self.gru_module_a is not None:               # A방향 GRU 있으면
@@ -351,26 +356,19 @@ class Detector:
 
             # ── 초기 학습 완료 처리 ──
             if st.is_learning:                                      # 학습 모드일 때만 체크
-                enough_passages = (                                 # 최소 passage 조건 충족 여부
-                    self.passage_tracker.get_completed_count()
-                    >= cfg.min_passages_required
-                )
-                # 조건: (기본 학습 프레임 도달 + passage 충분) 또는 최대 학습 프레임 도달
+                # 학습 완료 조건: learning_frames 도달 또는 최대 프레임 강제 종료
                 learning_done = (
-                    (st.frame_num >= cfg.learning_frames and enough_passages)
-                    or st.frame_num >= max_learning_frames          # 강제 종료 조건
+                    st.frame_num >= cfg.learning_frames
+                    or st.frame_num >= max_learning_frames
                 )
                 if learning_done:                                   # 학습 완료이면
                     self.flow.apply_spatial_smoothing(verbose=True) # 공간 보정 (상세 진단)
                     self.flow.apply_boundary_erosion()              # 경계 셀 제거 (오탐 차단)
-                    baseline = self.passage_tracker.finalize_baseline()  # passage 통계 산출 (LCS 확인용)
-                    # 정체 탐지 baseline은 default_lcs 기반 fallback 유지 — 교체하지 않음
                     self._compute_ref_direction()                   # 기준 방향 벡터 계산
                     if cfg.flow_map_path:                           # 저장 경로 있으면
-                        self.flow.save(cfg.flow_map_path)           # flow_map만 저장 (baseline 미포함)
+                        self.flow.save(cfg.flow_map_path)           # flow_map만 저장
                     st.is_learning = False                          # 학습 모드 종료
-                    print(f"학습 완료! (passage={self.passage_tracker.get_completed_count()}, "
-                          f"lcs={baseline.lcs:.2f})")
+                    print(f"학습 완료! (frame={st.frame_num})")
                     # GRU pretrain: 버퍼에 쌓인 feature로 자기지도 사전학습
                     # (학습 완료 후 feature가 아직 없으므로 push()가 충분히 쌓이면 호출)
                     self._gru_pretrain_pending_a = True             # A방향 pretrain 예약
@@ -393,8 +391,6 @@ class Detector:
                 if relearn_done:                                    # 재학습 완료이면
                     self.flow.apply_spatial_smoothing(verbose=True) # 공간 보정 (상세 진단)
                     self.flow.apply_boundary_erosion()              # 경계 셀 제거 (오탐 차단)
-                    baseline = self.passage_tracker.finalize_baseline()  # passage 통계 산출 (LCS 확인용)
-                    # 정체 탐지 baseline은 default_lcs 기반 fallback 유지 — 교체하지 않음
                     self._compute_ref_direction()                   # 기준 방향 벡터 재계산
                     if cfg.flow_map_path:                           # 저장 경로 있으면
                         self.flow.save(cfg.flow_map_path)           # flow_map만 저장 (baseline 미포함)
@@ -493,18 +489,6 @@ class Detector:
                                     traj[-cfg.velocity_window][1],
                                     fx, fy, _learn_min_mag          # nm 기반 min_move (학습과 동일 기준)
                                 )
-                                # 방향별 SMOOTH + 최소 활성 차량 조건 충족 시 baseline 온라인 갱신
-                                _dir = self._track_direction.get(tid, 'a')  # 해당 차량 방향
-                                _ta = self.traffic_analyzer_a if _dir == 'a' else self.traffic_analyzer_b
-                                _pt = self.passage_tracker_a if _dir == 'a' else self.passage_tracker_b
-                                if (_ta is not None and
-                                        len(tracks) >= cfg.min_active_for_baseline and
-                                        _ta.get_congestion_level() == "SMOOTH"):
-                                    bbox_h = max(y2 - y1, 1)        # 바운딩박스 높이 (0 방지)
-                                    norm_mag = speed / bbox_h       # normalized_mag 계산
-                                    _pt.update_baseline(             # 방향별 기준선 점진 갱신
-                                        fx, fy, norm_mag
-                                    )
 
                             # 역주행 확정 시 라벨 부여
                             if is_wrong and tid in st.wrong_way_ids:
@@ -583,10 +567,10 @@ class Detector:
                     self.vis.draw_direction_arrow(frame, cx, cy, ndx, ndy,
                                                  speed, is_wrong_display)
 
-                if is_wrong_display:                                # 역주행 차량이면
-                    self.vis.draw_wrong_way_alert(frame, tid, x1, y1, x2, y2)  # 경고 표시
-                else:                                               # 정상 차량이면
-                    self.vis.draw_normal_box(frame, tid, x1, y1, x2, y2)       # 초록 박스
+                if is_wrong_display:                                # 역주행 차량은 항상 표시
+                    self.vis.draw_wrong_way_alert(frame, tid, x1, y1, x2, y2)      # 경고 표시
+                elif self.vis.show_bbox:                            # 정상 차량은 B키 ON일 때만
+                    self.vis.draw_normal_box(frame, tid, x1, y1, x2, y2)           # 초록 박스
 
                 if self.vis.show_speed and speed > 3:               # 속도 표시 활성화 시
                     self.vis.draw_speed_label(frame, x1, y2, speed, cy, is_wrong_display)
@@ -675,18 +659,6 @@ class Detector:
                     norm_mags=norm_mags_all, cy_vals=cy_vals_all,
                     bbox_h_vals=bbox_h_vals_all
                 )
-            else:                                                   # 탐지 모드
-                self.passage_tracker_a.record_frame_stats(          # A방향 PT에 A 통계
-                    active_count=len(tracks_a), exit_count=exit_count_a,
-                    norm_mags=norm_mags_a, cy_vals=cy_vals_a,
-                    bbox_h_vals=bbox_h_vals_a
-                )
-                self.passage_tracker_b.record_frame_stats(          # B방향 PT에 B 통계
-                    active_count=len(tracks_b), exit_count=exit_count_b,
-                    norm_mags=norm_mags_b, cy_vals=cy_vals_b,
-                    bbox_h_vals=bbox_h_vals_b
-                )
-
             # ── 이전 프레임 활성 ID 갱신 ─────────────────────────────────
             prev_active_ids = active_ids.copy()                     # 다음 프레임 비교용으로 저장
 

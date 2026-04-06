@@ -21,6 +21,7 @@ class Visualizer:
         self.show_dot_product = False     # 내적(코사인 유사도) 값 표시 ON/OFF
         self.show_detection_stats = True # 탐지 소요시간 패널 ON/OFF
         self.show_congestion_panel = True  # 하단 Down/Up 정체 패널 ON/OFF (단축키 C)
+        self.show_bbox = False           # 차량 바운딩박스 표시 ON/OFF (단축키 B, 기본 OFF)
 
     # ==================== 키보드 입력 처리 ====================
     def handle_keys(self, key):
@@ -49,6 +50,9 @@ class Visualizer:
         elif key == ord("c"):                                      # C키: 정체 패널 토글
             self.show_congestion_panel = not self.show_congestion_panel
             print(f"정체 패널: {'ON' if self.show_congestion_panel else 'OFF'}")
+        elif key == ord("b"):                                      # B키: 바운딩박스 토글
+            self.show_bbox = not self.show_bbox
+            print(f"바운딩박스: {'ON' if self.show_bbox else 'OFF'}")
 
     # ==================== 궤적 그리기 ====================
     def draw_trajectory(self, frame, track_id, is_wrong=False):

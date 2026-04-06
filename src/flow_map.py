@@ -384,6 +384,37 @@ class FlowMap:
         c = int(np.clip(c, 0, self.grid_size - 1))       # 범위 보정
         return bool(self.smoothed_mask[r, c])             # bool 변환 후 반환
 
+    def get_nearest_direction(self, x: float, y: float):
+        """get_interpolated가 None을 반환할 때 가장 가까운 학습된 셀의 방향 벡터를 반환한다.
+
+        미학습 구역(예: 프레임 상단) 차량의 방향 분류 fallback으로 사용.
+        가장 가까운 학습 셀(count > 0)을 그리드 좌표 기준 유클리드 거리로 탐색한다.
+
+        Args:
+            x: 픽셀 x 좌표 (차량 footpoint).
+            y: 픽셀 y 좌표 (차량 footpoint).
+
+        Returns:
+            단위 벡터 (numpy array) 또는 학습 셀이 없으면 None.
+        """
+        fr, fc = self._cell_coords(x, y)               # 차량 위치의 그리드 좌표 (실수)
+        best_dist_sq = float("inf")                    # 최소 거리 제곱 (초기 무한대)
+        best_v = None                                  # 최근접 셀 벡터 (초기 None)
+
+        for ri in range(self.grid_size):               # 전체 셀 순회 (20×20 = 400회)
+            for ci in range(self.grid_size):
+                if self.count[ri, ci] <= 0:            # 미학습 셀 건너뜀
+                    continue
+                dist_sq = (ri - fr) ** 2 + (ci - fc) ** 2  # 거리 제곱 (sqrt 생략)
+                if dist_sq < best_dist_sq:             # 더 가까운 셀 발견
+                    best_dist_sq = dist_sq             # 거리 갱신
+                    best_v = self.flow[ri, ci]         # 벡터 갱신
+
+        if best_v is None:                             # 학습된 셀 없음
+            return None
+        mag = np.linalg.norm(best_v)                   # 벡터 크기
+        return best_v / (mag + 1e-6) if mag > 0.1 else None  # 단위 벡터 반환
+
     def get_cell_rc(self, px: float, py: float):
         """픽셀 좌표(px, py)를 정수 셀 좌표(r, c)로 변환.
 

@@ -1,8 +1,8 @@
 # 파일 경로: C:\final_pj\src\congestion_judge.py
-# 역할: jam_score 계산(정상/fallback) + 레벨 판정(SMOOTH/SLOW/CONGESTED) + 히스테리시스
-# 의존성: baseline_stats(로컬)
+# 역할: jam_score 계산(fallback) + 레벨 판정(SMOOTH/SLOW/CONGESTED) + 히스테리시스
+# 의존성: math (표준 라이브러리 — sqrt)
 
-from baseline_stats import BaselineStats               # 학습 기준선 통계 데이터 클래스
+import math                                            # sqrt — bbox_coverage 비선형 변환
 
 
 # ======================================================================
@@ -26,53 +26,6 @@ def _clip(value: float, lo: float, hi: float) -> float:
         return hi                                      # 상한 반환
     return value                                       # 범위 내이면 그대로
 
-
-def compute_jam_score(x_t: dict, lcs: float, cfg) -> float:
-    """baseline이 있을 때 jam_score를 계산한다 (정상 운영 모드).
-
-    설계 목표:
-      - 원활(속도 정상, 정지 없음): 0.0~0.15
-      - 서행(속도 60~80%, 정지 20~40%): 0.30~0.55
-      - 극심한 정체(속도 거의 0, 정지 70%+): 0.85~1.0
-
-    가중치: 0.55×speed + 0.35×stop + 0.10×congestion_bonus
-    congestion_bonus: 속도 저하 + 정지 동시 발생 시 추가 가산 (곱셈 항)
-
-    Args:
-        x_t: 7차원 feature 벡터 dict.
-        lcs: Learning Congestion Score (0~1).
-        cfg: DetectorConfig — smooth_jam_threshold, slow_jam_threshold 등.
-
-    Returns:
-        jam_score (0.0~1.0).
-    """
-    # ── 각 지표의 기여도 계산 ────────────────────────────────────────
-    speed_score = _clip(                               # 속도 기여: 1-ratio (느릴수록 높음)
-        1.0 - x_t["norm_speed_ratio"], 0.0, 1.0
-    )
-    stop_score = _clip(                                # 정지 기여: 정지 비율 그대로
-        x_t["stop_ratio"], 0.0, 1.0                   # 정지 차량 많을수록 높음
-    )
-    # 복합 정체 가산항: 속도 저하와 정지가 동시에 높을 때 추가 점수
-    # 예) speed_score=0.8, stop_score=0.7 → bonus=0.56×0.10=0.056 추가
-    # 원활 시: speed_score≈0, stop_score≈0 → 기여 거의 0
-    congestion_synergy = speed_score * stop_score      # 두 지표 곱 (동시 악화 시 증폭)
-
-    # ── 가중 합산 ─────────────────────────────────────────────────────
-    jam = (0.55 * speed_score                          # 속도 가중 55%
-           + 0.35 * stop_score                         # 정지 가중 35%
-           + 0.10 * congestion_synergy)                # 복합 정체 가산 10%
-
-    # ── 원활 보너스 차감 (원활할수록 더 많이 깎임) ────────────────────
-    bonus = 0.0                                        # 보너스 초기화
-    if x_t["exit_rate_ratio"] > 1.3:                   # 유출이 기준의 1.3배 초과
-        bonus += 0.06                                  # 유출 원활 보너스
-    if x_t["stop_ratio"] < 0.05:                       # 정지 차량 5% 미만
-        bonus += 0.06                                  # 거의 정지 없음 보너스
-    if x_t["norm_speed_ratio"] > 0.9:                  # 속도가 기준의 90% 초과 (원활)
-        bonus += 0.08                                  # 원활 주행 보너스 (강화)
-
-    return _clip(jam - bonus, 0.0, 1.0)                # 보너스 차감 후 [0, 1] 클램프
 
 
 def compute_jam_score_fallback(x_t: dict) -> float:
@@ -121,21 +74,36 @@ def compute_jam_score_fallback(x_t: dict) -> float:
         x_t["stop_ratio"], 0.0, 1.0
     )
 
-    # ── bbox 점유율 기여 (flow_map 유효 도로 면적 대비 bbox 면적 합) ───
-    # 차선 수·차량 대수에 독립적 — 도로가 차량으로 얼마나 꽉 찼는지
-    bbox_contribution = _clip(                         # bbox 점유율 (0~1)
+    # ── bbox 점유율 기여 — sqrt 비선형 변환 ──────────────────────────
+    # sqrt(bbox_coverage): 낮은 coverage를 증폭, 높은 coverage는 완만하게 반영
+    # 예) coverage=0.05 → sqrt=0.22(4.5×), coverage=0.35 → sqrt=0.59(1.7×)
+    # count_ref 같은 임의 기준값 없이 coverage 자체에서 밀도 신호를 키움
+    raw_bbox = _clip(                                  # coverage 원값 (0~1)
         x_t.get("bbox_coverage", x_t.get("density_score", 0.0)), 0.0, 1.0
     )
+    bbox_contribution = math.sqrt(raw_bbox)            # sqrt 변환 (0~1 유지)
 
-    # ── 가중 합산 (slow 60% + stop 60% + bbox 25%, 합=1.45) ──────────
+    # ── 차량 수 기여 (count_ref=8 대비 비율, 1.0 상한) ──────────────
+    # 원거리 차량(B방향 상행)은 bbox가 작아 bbox_coverage만으로 밀도 반영 한계
+    # count_ratio로 차량 수 자체를 직접 반영 — count_ref=8 (실탐지 최대 대수 기준)
+    count_contribution = _clip(                        # 차량 수 비율 (0~1 상한)
+        x_t.get("count_ratio", 0.0), 0.0, 1.0
+    )
+
+    # ── 가중 합산 (slow 80% + stop 70% + sqrt(bbox) 35% + count 10%, 합=1.95) ──
     # 가중치 합 > 1.0: 극심 정체 시 clip 전 1.0 초과 → 1.0으로 포화
-    # 원활:  0.60×0.02 + 0.60×0.01 + 0.25×0.08 = 0.012+0.006+0.020 = 0.038
-    # 서행:  0.60×0.60 + 0.60×0.05 + 0.25×0.20 = 0.360+0.030+0.050 = 0.440
-    # 정체:  0.60×0.20 + 0.60×0.70 + 0.25×0.35 = 0.120+0.420+0.088 = 0.628
-    # 극심:  0.60×0.95 + 0.60×0.90 + 0.25×0.40 = 0.570+0.540+0.100 = 1.210 → clip 1.0
-    jam = (0.60 * slow_contribution                    # 서행 가중 60%
-           + 0.60 * stop_contribution                  # 정지 가중 60%
-           + 0.25 * bbox_contribution)                 # bbox 점유율 25% (보조)
+    # B방향 7대 fast (slow=0, stop=0, bbox_cov=0.011→sqrt=0.10, count=0.875):
+    #   0 + 0 + 0.35×0.10 + 0.10×0.875 = 0.035+0.088 = 0.123
+    # smooth 8대    (slow=0.05, stop=0.01, bbox→sqrt=0.22, count=1.0):
+    #   0.040+0.007+0.077+0.10 = 0.224
+    # 서행          (slow=0.60, stop=0.05, bbox→sqrt=0.45, count=1.0):
+    #   0.480+0.035+0.157+0.10 = 0.772
+    # 정체          (slow=0.20, stop=0.70, bbox→sqrt=0.59, count=1.0):
+    #   0.160+0.490+0.207+0.10 = 0.957 → clip 1.0
+    jam = (0.80 * slow_contribution                    # 서행 가중 80%
+           + 0.70 * stop_contribution                  # 정지 가중 70%
+           + 0.35 * bbox_contribution                  # sqrt(bbox 점유율) 35%
+           + 0.10 * count_contribution)                # 차량 수 비율 10% (count_ref=8)
 
     return _clip(jam, 0.0, 1.0)                        # [0, 1] 범위 클램프
 
@@ -167,7 +135,7 @@ class CongestionJudge:
         """
         self.cfg = cfg                                 # 설정 객체 저장
         self.fps = fps                                 # 영상 FPS 저장
-        self.baseline: BaselineStats | None = None     # 학습 기준선 (초기 None)
+        self._baseline_set: bool = False               # 학습 완료 여부 (set_baseline 호출 시 True)
 
         # ── 히스테리시스 상태 ────────────────────────────────────────
         self._current_level: str = "SMOOTH"            # 현재 확정 레벨
@@ -205,8 +173,8 @@ class CongestionJudge:
         self._last_jam_score = 0.0                     # jam_score 초기화
 
     # ── 기준선 설정 ──────────────────────────────────────────────────
-    def set_baseline(self, baseline: BaselineStats):
-        """학습 완료 후 BaselineStats를 설정하고 EMA를 중립값(0.5)으로 초기화한다.
+    def set_baseline(self, _baseline=None):
+        """학습 완료 신호를 받아 EMA를 중립값(0.5)으로 초기화한다.
 
         EMA 초기값을 0.0이 아닌 0.5로 설정하는 이유:
           - 0.0 시작 시 원활 상황에서도 0.5까지 올라오는 데 수십 프레임 걸림
@@ -215,18 +183,14 @@ class CongestionJudge:
           - 학습 직후 "중립 → 실제 상태" 방향으로 빠르게 수렴
 
         Args:
-            baseline: finalize_baseline()이 반환한 기준선 객체.
+            baseline: 무시됨 (fallback 전용 — BaselineStats 불필요).
         """
-        self.baseline = baseline                       # 기준선 저장
+        self._baseline_set = True                      # 학습 완료 표시
         self._ema_jam = 0.5                            # EMA 중립값으로 초기화 (학습 직후 빠른 수렴)
 
-    # ── 레벨 판정 (LCS 보정 포함) ────────────────────────────────────
+    # ── 레벨 판정 ────────────────────────────────────────────────────
     def _classify(self, jam_score: float) -> str:
-        """jam_score와 LCS로 원시 레벨을 판정한다 (히스테리시스 미적용).
-
-        LCS가 높으면 threshold를 낮춰서 정체를 더 쉽게 판정한다.
-        smooth: jam < smooth_thr × (1 - lcs×0.40)   최저 0.15
-        slow:   jam < slow_thr   × (1 - lcs×0.30)   최저 0.38
+        """jam_score로 원시 레벨을 판정한다 (히스테리시스 미적용).
 
         Args:
             jam_score: 0.0~1.0.
@@ -234,8 +198,8 @@ class CongestionJudge:
         Returns:
             "SMOOTH", "SLOW", or "CONGESTED".
         """
-        smooth_thr = self.get_smooth_threshold()       # LCS 보정된 SMOOTH 임계값
-        slow_thr = self._get_slow_threshold()          # LCS 보정된 SLOW 임계값
+        smooth_thr = self.get_smooth_threshold()       # SMOOTH 임계값
+        slow_thr = self._get_slow_threshold()          # SLOW 임계값
 
         if jam_score < smooth_thr:                     # SMOOTH 임계값 미만
             return "SMOOTH"                            # 원활
@@ -243,36 +207,22 @@ class CongestionJudge:
             return "SLOW"                              # 서행
         return "CONGESTED"                             # 정체
 
-    # ── LCS 보정 임계값 접근자 ────────────────────────────────────────
+    # ── 임계값 접근자 ─────────────────────────────────────────────────
     def get_smooth_threshold(self) -> float:
-        """SMOOTH 판정 임계값을 반환한다.
-
-        fallback 모드에서는 LCS 보정 미적용 — fallback 공식은 score 범위가
-        정상 모드보다 보수적이므로 임계값을 낮추면 SLOW 오판 발생.
-        정상 모드에서만 LCS로 임계값을 낮춰 정체 감지 민감도를 높인다.
+        """SMOOTH 판정 임계값을 반환한다 (기본 0.30).
 
         Returns:
-            fallback: smooth_jam_threshold 그대로 (기본 0.30).
-            정상:     smooth_jam_threshold × (1 - lcs × 0.40).
+            smooth_jam_threshold (LCS 보정 없음 — fallback 전용).
         """
-        if self.baseline is not None and self.baseline.is_fallback:  # fallback 모드
-            return self.cfg.smooth_jam_threshold               # LCS 보정 없음
-        lcs = self.baseline.lcs if self.baseline else 0.0      # 정상 모드: LCS 적용
-        return self.cfg.smooth_jam_threshold * (1.0 - lcs * 0.40)  # LCS 보정
+        return self.cfg.smooth_jam_threshold           # 고정 임계값 반환
 
     def _get_slow_threshold(self) -> float:
-        """SLOW 판정 임계값을 반환한다.
-
-        fallback 모드에서는 LCS 보정 미적용 (get_smooth_threshold 참고).
+        """SLOW 판정 임계값을 반환한다 (기본 0.60).
 
         Returns:
-            fallback: slow_jam_threshold 그대로 (기본 0.55).
-            정상:     slow_jam_threshold × (1 - lcs × 0.30).
+            slow_jam_threshold (LCS 보정 없음 — fallback 전용).
         """
-        if self.baseline is not None and self.baseline.is_fallback:  # fallback 모드
-            return self.cfg.slow_jam_threshold                 # LCS 보정 없음
-        lcs = self.baseline.lcs if self.baseline else 0.0      # 정상 모드: LCS 적용
-        return self.cfg.slow_jam_threshold * (1.0 - lcs * 0.30)  # LCS 보정
+        return self.cfg.slow_jam_threshold             # 고정 임계값 반환
 
     # ── 히스테리시스 적용 ────────────────────────────────────────────
     def _apply_hysteresis(self, raw_level: str) -> str:
@@ -314,12 +264,7 @@ class CongestionJudge:
         Returns:
             rule_jam_score (0.0~1.0).
         """
-        if self.baseline is None or self.baseline.is_fallback:  # 기준선 없음/fallback
-            jam = compute_jam_score_fallback(x_t)      # fallback 모드 계산
-        else:                                          # 정상 기준선 있음
-            jam = compute_jam_score(                   # 정상 모드 계산
-                x_t, self.baseline.lcs, self.cfg
-            )
+        jam = compute_jam_score_fallback(x_t)          # fallback 모드 (항상)
         x_t["rule_jam_score"] = jam                    # feature 벡터에 역주입 (GRU 입력용)
         return jam                                     # rule_jam_score 반환
 

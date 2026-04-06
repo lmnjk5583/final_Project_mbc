@@ -19,13 +19,14 @@ from src.tracker import YoloTracker                                # YOLO+ByteTr
 
 # ── 설정 ─────────────────────────────────────────────────────────────
 MODEL_PATH  = PROJECT_ROOT / "runs" / "yolo11n_v1" / "weights" / "best.pt"
-VIDEO_PATH  = Path(r"N:\개인\대원&수빈\최종 프로젝트\임시") / "정체_완화_테스트.mp4"
+VIDEO_PATH  = Path(r"N:\개인\대원&수빈\최종 프로젝트\임시\2026-04-01_17-11-32\videos") / "record_2026-04-01_17-11-32.mp4"
 CONF        = 0.35          # YOLO 신뢰도 임계값
 
-VELOCITY_WINDOW = 20        # nm 계산 프레임 간격 (detector.py와 동일)
-MIN_BBOX_H      = 30.0      # bbox_h 최솟값 클램프
-NORM_STOP_THR   = 0.06      # nm < 이 값 → stop
-SLOW_UPPER_NM   = 0.50      # nm < 이 값 → slow, 이상 → normal
+VELOCITY_WINDOW    = 20        # nm 계산 프레임 간격 (detector.py와 동일)
+MIN_BBOX_H         = 30.0      # bbox_h 최솟값 클램프
+NORM_STOP_THR      = 0.06      # nm < 이 값 → stop
+SLOW_UPPER_NM      = 0.50      # nm < 이 값 → slow, 이상 → normal
+NM_CY_CORRECTION_K = 0.4        # cy 보정 계수 (config.py nm_cy_correction_k와 동일)
 
 # ── 색상 ─────────────────────────────────────────────────────────────
 COLOR = {
@@ -96,15 +97,21 @@ def main():
                 ox, oy  = traj[-VELOCITY_WINDOW]         # VELOCITY_WINDOW 전 위치
                 mag     = np.sqrt((cx - ox)**2 + (cy - oy)**2)  # 이동량 (픽셀)
                 bbox_h  = max(y2 - y1, MIN_BBOX_H)       # bbox 높이 클램프
-                nm      = mag / bbox_h                   # normalized_mag
+                nm_raw  = mag / bbox_h                   # normalized_mag (보정 전)
+                if NM_CY_CORRECTION_K > 0:               # cy 보정 적용
+                    cy_ratio = cy / max(fh, 1)            # 0(상단/원거리)~1(하단/근거리)
+                    denom = 1.0 + NM_CY_CORRECTION_K * (2.0 * cy_ratio - 1.0)  # 대칭 보정
+                    nm = nm_raw / max(denom, 0.1)         # 원거리 부스트·근거리 감소
+                else:
+                    nm = nm_raw
                 label   = classify_nm(nm)
                 color   = COLOR[label]
 
                 # bbox 그리기
                 cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
 
-                # nm 값 + 분류 표시 (bbox 상단)
-                text = f"nm={nm:.2f} [{label}]"
+                # nm 값 + 분류 표시 (bbox 상단) — raw→보정 후 함께 표시
+                text = f"nm={nm:.2f}(raw={nm_raw:.2f}) [{label}]"
                 (tw, th), _ = cv2.getTextSize(
                     text, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1
                 )
@@ -119,7 +126,7 @@ def main():
                 cv2.putText(frame, sub_text, (x1 + 2, y2 + 14),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.38, (200, 200, 200), 1, cv2.LINE_AA)
 
-                nm_log.append((tid, nm, label, mag, bbox_h))
+                nm_log.append((tid, nm, label, mag, bbox_h, nm_raw))
             else:
                 # 궤적 부족 — 회색 박스만
                 cv2.rectangle(frame, (x1, y1), (x2, y2), (128, 128, 128), 1)
@@ -164,8 +171,8 @@ def main():
             print(f"{'[일시정지]' if paused else '[재개]'}")
         elif key == ord("s"):
             print(f"\n=== Frame {frame_num} nm 상세 ===")
-            for tid, nm, label, mag, bbox_h in sorted(nm_log, key=lambda x: x[1]):
-                print(f"  ID:{tid:4d}  nm={nm:.3f}  [{label:6s}]  "
+            for tid, nm, label, mag, bbox_h, nm_raw in sorted(nm_log, key=lambda x: x[1]):
+                print(f"  ID:{tid:4d}  nm={nm:.3f}(raw={nm_raw:.3f})  [{label:6s}]  "
                       f"mag={mag:5.1f}px  bbox_h={bbox_h:5.1f}px")
             if nm_log:
                 nms = [r[1] for r in nm_log]
