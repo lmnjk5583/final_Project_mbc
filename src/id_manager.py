@@ -164,6 +164,11 @@ class IDManager:
                     st.wrong_way_count.pop(tid, None)         # 역주행 카운트 삭제
                     st._stale_counter.pop(tid, None)          # 스테일 카운터 삭제
                     st.wrong_way_ids.discard(tid)             # 역주행 확정 집합에서도 제거
+                    st.last_velocity.pop(tid, None)           # 방향 벡터 삭제
+                    st.last_correct_frame.pop(tid, None)      # 정상 판정 프레임 삭제
+                    st.stable_velocity.pop(tid, None)         # 안정 방향 기준점 삭제
+                    st.direction_change_frame.pop(tid, None)  # 급변 감지 시점 삭제
+                    st.direction_was_stable.pop(tid, None)    # 안정 상태 플래그 삭제
                     # (ByteTrack이 동일 ID를 새 차량에 재할당해도 역주행으로 오탐 방지)
             else:
                 # 이번 프레임에 다시 나타난 ID면 카운터 삭제

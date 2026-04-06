@@ -42,6 +42,11 @@ class DetectorState:
         # ==================== 정상 주행 이력 필터용 ====================
         self.last_correct_frame = {}  # {track_id: frame_num} 마지막으로 정상 주행 판정된 프레임
 
+        # ==================== 방향 급변 가드용 ====================
+        self.stable_velocity = {}        # {track_id: (ndx, ndy)} 마지막 정상 투표 시 방향 (급변 기준점)
+        self.direction_change_frame = {} # {track_id: frame_num} stable_velocity 대비 급변 감지된 시점
+        self.direction_was_stable = {}   # {track_id: bool} 직전 프레임 방향 안정 여부 (edge 감지용)
+
         # ==================== Phase 1 정체 탐지용 ====================
         self.entry_positions = {}   # {track_id: (fx, fy)} footpoint 진입 위치 — PassageTracker가 관리
 
@@ -59,6 +64,12 @@ class DetectorState:
         self.trajectories.clear()           # 궤적 정보 초기화
         self.last_cos_values.clear()        # 내적값 히스토리 초기화
         self._stale_counter.clear()         # 스테일 카운터 초기화
+
+        self.last_velocity.clear()          # 방향 벡터 이력 초기화
+        self.last_correct_frame.clear()    # 정상 판정 프레임 초기화
+        self.stable_velocity.clear()       # 안정 방향 기준점 초기화
+        self.direction_change_frame.clear()  # 급변 감지 시점 초기화
+        self.direction_was_stable.clear()  # 안정 상태 플래그 초기화
 
         self.relearning = True              # 재학습 모드 진입
         self.relearn_start_frame = self.frame_num  # 재학습 시작 프레임 기록

@@ -16,7 +16,6 @@ from .id_manager import IDManager                   # W라벨 관리 + occlusion
 from .camera_switch import CameraSwitchDetector     # 장면/카메라 전환 감지 (grayscale diff)
 from .visualizer import Visualizer                  # 시각화(박스/궤적/패널/디버그)
 from .logger import CSVLogger                       # 프레임/트랙/이벤트 CSV 로그 저장
-from .bbox_stabilizer import BBoxStabilizer         # 바운딩박스 EMA 안정화
 from .traffic_analyzer import TrafficAnalyzer, CongestionPredictor  # 정체 탐지 + 단기 예측
 from passage_tracker import PassageTracker          # 차량 진입·퇴장 기록 + baseline 산출
 from baseline_stats import BaselineStats           # fallback baseline 생성용
@@ -44,7 +43,6 @@ class Detector:
         self.switch = CameraSwitchDetector(cfg)                     # 카메라 전환 감지기
         self.vis = Visualizer(cfg, self.state, self.flow)           # 시각화 모듈
         self.logger = CSVLogger(cfg.log_dir) if cfg.log_dir else None  # CSV 로거 (log_dir 없으면 None)
-        self.bbox_stab = BBoxStabilizer(alpha=0.5)                  # bbox EMA 안정화기
         # ── 메인 PassageTracker (학습 시 on_entry/on_exit 전담) ────────
         self.passage_tracker = PassageTracker(cfg, self.state)      # 차량 진입·퇴장 기록 관리
 
@@ -185,6 +183,7 @@ class Detector:
         # ── 방향별 TrafficAnalyzer 초기화 ─────────────────────────────
         self.traffic_analyzer_a = TrafficAnalyzer(                  # A방향 정체 탐지
             cfg, frame_w=fw, frame_h=fh, fps=fps,
+            flow_map=self.flow,                                     # flow_map 주입 (bbox_coverage 계산용)
             passage_tracker=self.passage_tracker_a,                 # A방향 PT 연결
             gru_module=self.gru_module_a                            # A방향 GRU 연결
         )
@@ -192,6 +191,7 @@ class Detector:
 
         self.traffic_analyzer_b = TrafficAnalyzer(                  # B방향 정체 탐지
             cfg, frame_w=fw, frame_h=fh, fps=fps,
+            flow_map=self.flow,                                     # flow_map 주입 (bbox_coverage 계산용)
             passage_tracker=self.passage_tracker_b,                 # B방향 PT 연결
             gru_module=self.gru_module_b                            # B방향 GRU 연결
         )
@@ -280,9 +280,9 @@ class Detector:
             for t in tracks:                                        # 각 트랙 순회
                 if t["id"] not in st.first_seen_frame:              # 처음 보는 ID이면
                     st.first_seen_frame[t["id"]] = st.frame_num     # 등장 프레임 기록
-                    # footpoint: x 중심 = (x1+x2)/2, y = y2 (바운딩박스 하단)
-                    entry_fx = (t["x1"] + t["x2"]) / 2             # 진입 footpoint x
-                    entry_fy = t["y2"]                              # 진입 footpoint y (하단)
+                    # footpoint: bbox 중앙 (x 중심, y 중심)
+                    entry_fx = (t["x1"] + t["x2"]) / 2             # 진입 footpoint x (bbox 중심)
+                    entry_fy = (t["y1"] + t["y2"]) / 2             # 진입 footpoint y (bbox 중심)
                     self.passage_tracker.on_entry(                  # 진입 기록
                         t["id"], entry_fx, entry_fy, st.frame_num
                     )
@@ -411,15 +411,14 @@ class Detector:
             # ── 차량별 처리 ──
             for t in tracks:                                        # 각 트랙 순회
                 tid = t["id"]                                       # 트랙 ID
-                # 바운딩박스 EMA 안정화 적용
-                raw_bbox = (t["x1"], t["y1"], t["x2"], t["y2"])     # YOLO 원본 bbox
-                x1, y1, x2, y2, cx, cy = self.bbox_stab.stabilize( # 안정화된 bbox·중심점
-                    tid, raw_bbox, st.frame_num
-                )
+                # YOLO 원본 bbox 그대로 사용 (EMA 안정화 제거 — 방향 급변 가드로 jitter 대응)
+                x1, y1, x2, y2 = t["x1"], t["y1"], t["x2"], t["y2"]  # 원본 bbox 좌표
+                cx = (x1 + x2) / 2                                  # bbox 가로 중심
+                cy = (y1 + y2) / 2                                  # bbox 세로 중심
 
-                # ── footpoint 계산 (원근 보정 기준점: 바운딩박스 하단 중심) ──
-                fx = (x1 + x2) / 2                                  # footpoint x = bbox 가로 중심
-                fy = y2                                             # footpoint y = bbox 하단
+                # ── footpoint 계산 (추적 기준점: bbox 중앙) ──────────────
+                fx = cx                                              # footpoint x = bbox 중심 x
+                fy = cy                                              # footpoint y = bbox 중심 y
 
                 # 마지막 footpoint 갱신 (퇴장 시 on_exit에 사용)
                 last_footpoints[tid] = (fx, fy)                     # 최신 footpoint 저장
@@ -432,8 +431,10 @@ class Detector:
                 if not st.is_learning and not st.relearning:        # 탐지 모드일 때만
                     self.idm.check_reappear(tid, cx, cy)            # 재매칭 시도
 
-                # 궤적에 현재 위치 추가 (footpoint 기준 — bbox 크기 변화에 무관하게 안정적)
-                st.trajectories[tid].append((fx, fy))               # cx,cy 대신 fx,fy 사용
+                # 궤적에 현재 위치 추가 — 첫 등장 3프레임은 YOLO 초기 bbox가 불안정하므로 건너뜀
+                _age = st.frame_num - st.first_seen_frame.get(tid, st.frame_num)  # 트랙 경과 프레임
+                if _age >= 3:                                        # 3프레임 이상 된 트랙만 궤적 추가
+                    st.trajectories[tid].append((fx, fy))           # footpoint(중심점) 기준 궤적 추가
                 if len(st.trajectories[tid]) > cfg.trail_length:    # 최대 길이 초과 시
                     st.trajectories[tid].pop(0)                     # 오래된 궤적 제거
 
@@ -469,10 +470,8 @@ class Detector:
                         speed = mag                                 # 속도 = 픽셀 이동량
                         speeds[tid] = speed                         # 속도 딕셔너리 갱신 (이미 mag이나 명시적 유지)
 
+                        _learn_min_mag = max(1.0, _bh * cfg.norm_learn_threshold)  # nm 역산 최소 mag (학습·온라인 공용)
                         if st.is_learning or st.relearning:         # 학습/재학습 모드
-                            # nm 기반 min_move: 외부 조건(_nm_move>norm_learn_threshold)과 일관성 유지
-                            # learn_step 내부 자체 mag<min_move 체크가 외부 조건을 무효화하지 않도록
-                            _learn_min_mag = max(1.0, _bh * cfg.norm_learn_threshold)  # nm 역산 최소 mag
                             self.flow.learn_step(                   # 흐름장 업데이트 (footpoint 기준)
                                 traj[-cfg.velocity_window][0],
                                 traj[-cfg.velocity_window][1],
@@ -744,7 +743,6 @@ class Detector:
             # ── 트랙 정리 ──
             if st.frame_num % 30 == 0:                              # 30프레임마다
                 self.idm.cleanup(active_ids)                        # ID 관리자 정리
-                self.bbox_stab.cleanup(active_ids)                  # bbox 안정화 캐시 정리
 
             # 흐름장(배경 화살표) 표시
             if self.vis.show_flow:                                  # 흐름장 활성화 시

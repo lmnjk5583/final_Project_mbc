@@ -115,6 +115,27 @@ class WrongWayJudge:
                 return False, 0, {"status": "dir_jump_filtered", "cos_values": []}
         st.last_velocity[track_id] = (ndx, ndy)            # 현재 방향 기록 (다음 프레임용)
 
+        # ── 안정 방향 대비 급변 감지 (edge detection) ────────────────────
+        # stable_velocity = 마지막으로 정상 투표(disagree_ratio < threshold)를 통과할 때의 방향 벡터.
+        # 현재 방향이 stable 방향과 cos < direction_change_cos_threshold(0.0=90°+) 이상 벗어나면 급변.
+        # 단, stable→unstable 전환 '순간'만 기록 (매 프레임 갱신 방지 = edge 감지).
+        _stable = st.stable_velocity.get(track_id)                  # 기준 안정 방향
+        if _stable is not None:                                      # 기준이 있을 때만 검사
+            _cos_vs_stable = float(ndx * _stable[0] + ndy * _stable[1])       # 안정 방향 대비 cos
+            _was_stable = st.direction_was_stable.get(track_id, True)          # 직전 프레임 안정 여부
+            _is_stable_now = (_cos_vs_stable >= cfg.direction_change_cos_threshold)  # 현재 안정 여부
+            if _was_stable and not _is_stable_now:                   # 안정→불안정 전환 순간만 기록
+                st.direction_change_frame[track_id] = st.frame_num   # 급변 시점 저장
+            st.direction_was_stable[track_id] = _is_stable_now       # 다음 프레임 비교용 갱신
+
+        # ── 방향 급변 가드 early-exit (투표 루프 전 단락 처리) ────────────
+        # 급변 감지 시점 이후 guard_frames 이내면 투표 루프 진입 없이 즉시 반환.
+        # (가드가 없을 때도 투표를 마친 뒤 걸러냈지만, 불필요한 flow 조회·코사인 연산을 줄임)
+        _last_chg = st.direction_change_frame.get(track_id, 0)
+        if _last_chg > 0 and (st.frame_num - _last_chg) <= cfg.direction_change_guard_frames:
+            st.wrong_way_count[track_id] = 0
+            return False, 0, {"status": "direction_change_guard", "cos_values": []}
+
         # ── 단기 투표: 궤적 포인트 샘플링 → disagree_ratio 계산 ─────────
         n_points = min(len(traj), 8)                   # 최대 8포인트 샘플링
         step = max(1, len(traj) // n_points)           # 궤적 샘플링 간격
@@ -175,6 +196,8 @@ class WrongWayJudge:
                 0, st.wrong_way_count[track_id] - 2
             )
             st.last_correct_frame[track_id] = st.frame_num  # 정상 주행 프레임 갱신
+            st.stable_velocity[track_id] = (ndx, ndy)       # 정상 방향 기준점 갱신 (급변 감지 기준)
+            st.direction_was_stable[track_id] = True         # 안정 상태로 복귀 기록
             return False, disagree_ratio, debug_info
 
         # ── ③ 장기 윈도우 검사 (다중 스케일) ───────────────────────────
@@ -215,20 +238,9 @@ class WrongWayJudge:
                 0, st.wrong_way_count[track_id] - 2
             )
             st.last_correct_frame[track_id] = st.frame_num  # 장기 정상 = 정상으로 기록
+            st.stable_velocity[track_id] = (ndx, ndy)       # 정상 방향 기준점 갱신 (short-vote pass와 동기화)
+            st.direction_was_stable[track_id] = True         # 안정 상태 복귀 기록
             debug_info["status"] = "long_window_ok"   # 장기 윈도우 통과로 필터링
-            return False, disagree_ratio, debug_info
-
-        # ── 정상→역방향 급전환 가드 ─────────────────────────────────────
-        # 방금 전까지 정상 주행하던 차량이 갑자기 역방향으로 바뀌는 경우,
-        # CCTV 글자 가림 등 일시 노이즈일 가능성이 높다.
-        # 마지막 정상 주행 판정 프레임으로부터 direction_change_guard_frames 이내이면
-        # wrong_way_count 증가를 막고 건너뜀.
-        last_ok = st.last_correct_frame.get(track_id, 0)        # 마지막 정상 프레임
-        frames_since_correct = st.frame_num - last_ok            # 정상 판정 후 경과 프레임
-        if frames_since_correct <= cfg.direction_change_guard_frames:
-            st.wrong_way_count[track_id] = 0              # 가드 발동 시 카운트 완전 리셋
-            # (가드 만료 후 잠깐 누적된 카운트도 초기화 → 장시간 텍스트 겹침 방지)
-            debug_info["status"] = "change_guard_filtered"       # 가드로 필터링됨
             return False, disagree_ratio, debug_info
 
         # ── 의심 카운트 증가 (단기·장기 모두 역방향 통과) ───────────────

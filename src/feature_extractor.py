@@ -131,28 +131,32 @@ class FeatureExtractor:
             self.cfg.exit_rate_window
         )
 
-        # ── 밀도 점수 (셀 점유율) ────────────────────────────────────
-        grid_size = self.cfg.grid_size                 # 그리드 크기 (15)
-        cell_h = self.state.frame_h / grid_size        # 셀 높이 (픽셀)
-        cell_w = self.state.frame_w / grid_size        # 셀 너비 (픽셀)
-        occupied_cells = set()                         # 차량이 있는 셀 좌표 집합
-        for t in tracks:                               # 각 차량 순회
-            fx = t.get("fx", (t["x1"] + t["x2"]) / 2) # footpoint x (없으면 cx 대용)
-            fy = t.get("fy", t["y2"])                  # footpoint y (없으면 y2)
-            r = int(np.clip(fy / cell_h, 0, grid_size - 1))  # 셀 행 (범위 클램프)
-            c = int(np.clip(fx / cell_w, 0, grid_size - 1))  # 셀 열 (범위 클램프)
-            occupied_cells.add((r, c))                 # 셀 좌표 추가
-        total_cells = grid_size * grid_size            # 전체 셀 수 (400 = 20×20)
-        raw_density = len(occupied_cells) / total_cells    # 원시 점유율 (고속도로 20대 = 0.05 수준)
+        # ── bbox_coverage: flow_map 유효 도로 면적 대비 탐지 차량 bbox 면적 비율 ──
+        # 차선 수·차량 대수에 독립적 — 분자(bbox 합)와 분모(도로 면적) 모두
+        # YOLO 탐지 범위에 비례하므로 탐지 범위가 좁아도 비율은 유효.
+        # 트럭·버스처럼 큰 차량이 더 많이 기여 (차량 크기 반영).
+        cell_w = self.state.frame_w / self.cfg.grid_size   # 셀 너비 (픽셀)
+        cell_h = self.state.frame_h / self.cfg.grid_size   # 셀 높이 (픽셀)
+        cell_area = cell_w * cell_h                        # 셀 1개 면적 (픽셀²)
+        if flow_map is not None and hasattr(flow_map, "count"):
+            valid_cell_count = int(np.sum(flow_map.count > 0))  # 학습된 유효 셀 수
+        else:
+            valid_cell_count = self.cfg.grid_size * self.cfg.grid_size  # flow_map 없으면 전체 셀 사용
+        road_area = valid_cell_count * cell_area           # 유효 도로 면적 (픽셀²)
 
-        # ── density 정규화: 현실적 최대 차량 수 기준으로 0~1 확장 ───────
-        # 20×20 그리드에서 차량 20대 → raw_density = 0.05 → 기여 거의 0
-        # density_max_vehicles 대 이상이면 포화(1.0)로 처리
-        density_max = getattr(self.cfg, "density_max_vehicles", 20.0)  # 포화 기준 차량 수
-        density_scale = density_max / total_cells          # 포화 기준 점유율 (예: 20/400 = 0.05)
-        density_score = float(np.clip(                     # 정규화: raw / 포화기준, 최대 1.0
-            raw_density / density_scale, 0.0, 1.0
-        ))
+        total_bbox_area = sum(                             # 탐지된 전체 bbox 면적 합
+            (t["x2"] - t["x1"]) * (t["y2"] - t["y1"])
+            for t in tracks
+        )
+        if road_area > 0:                                  # 유효 도로 면적 있으면
+            bbox_coverage = float(np.clip(                 # 도로 대비 bbox 점유율 (0~1)
+                total_bbox_area / road_area, 0.0, 1.0
+            ))
+        else:                                              # flow_map 미학습 상태
+            bbox_coverage = 0.0                            # 계산 불가 → 0
+
+        # density_score: 하위 호환 유지 (GRU feature 벡터 구조 변경 최소화)
+        density_score = bbox_coverage                      # bbox_coverage로 대체
 
         # ── 7차원 feature 벡터 계산 ──────────────────────────────────
         # [0] norm_speed_ratio: 현재 속도 / 기준 속도 (1.0이면 정상)
@@ -208,17 +212,18 @@ class FeatureExtractor:
             0.0, 1.0                                   # 상한 1.0
         ))
 
-        # [5] density_score: 셀 점유율 (위에서 계산)
+        # [5] bbox_coverage: 도로 면적 대비 bbox 점유율 (density_score 대체)
         # [6] rule_jam_score: CongestionJudge가 채워넣을 예정 (초기 0.0)
 
         # ── feature 딕셔너리 조립 ────────────────────────────────────
-        return {                                       # 8차원 feature 벡터
+        return {                                       # 9차원 feature 벡터
             "norm_speed_ratio": norm_speed_ratio,      # [0] 속도 비율
             "count_ratio":      count_ratio,           # [1] 차량 수 비율
             "stop_ratio":       stop_ratio,            # [2] 정지 비율 (nm < 0.06)
-            "slow_ratio":       slow_ratio,            # [2.5] 서행 비율 (0.06 ≤ nm < 0.15)
+            "slow_ratio":       slow_ratio,            # [2.5] 서행 비율 (0.06 ≤ nm < 0.50)
             "exit_rate_ratio":  exit_rate_ratio,       # [3] 퇴장률 비율
             "dwell_ratio":      dwell_ratio,           # [4] 체류 비율
-            "density_score":    density_score,         # [5] 밀도 점수
+            "density_score":    density_score,         # [5] bbox_coverage 별칭 (하위 호환)
+            "bbox_coverage":    bbox_coverage,         # [5] 도로 면적 대비 bbox 점유율
             "rule_jam_score":   0.0,                   # [6] jam_score (CJ 채움)
         }

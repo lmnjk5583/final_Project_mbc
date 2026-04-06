@@ -24,12 +24,13 @@ VIDEO_DIR = Path(                                       # 영상이 들어있는
 VIDEO_FILE = "정체_완화_테스트.mp4"          # 실행할 영상 파일명
 
 FLOW_MAP_PATH = PROJECT_ROOT / "flow_maps" / "flow_map.npy"  # 한강 학습 완료 flow_map
-RESULT_DIR    = PROJECT_ROOT / "results"            # 결과 영상 저장 폴더
+# RESULT_DIR    = PROJECT_ROOT / "results"            # 결과 영상 저장 폴더
+RESULT_DIR    = VIDEO_DIR / "results"           # 결과 영상 저장 폴더
 
 # ── DetectorConfig 구성 ───────────────────────────────────────────
 cfg = DetectorConfig(
     model_path=MODEL_PATH,                              # YOLO 모델 경로
-    conf=0.3,                                           # 검출 신뢰도 임계값
+    conf=0.35,                                           # 검출 신뢰도 임계값
     grid_size=20,                                       # 20×20 Flow Map 그리드
     target_classes=None,                                # 모든 클래스 탐지
     enable_online_flow_update=True,                     # 정상 흐름 온라인 학습 활성

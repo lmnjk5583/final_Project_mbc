@@ -4,7 +4,59 @@
 
 ---
 
-## 2026-04-03 (68차 — 웹 정체 모니터링 탭 구현)
+## 2026-04-06 (68~72차 — 역주행 오탐 근본 재설계 + bbox_coverage + nm 테스트) [대원]
+
+### 오늘 한 작업 [대원]
+
+**역주행 오탐 가드 — edge detection 방식으로 전면 재설계**
+- 기존: 마지막 정상 판정 프레임(`last_correct_frame`) 기준 경과 시간 체크 → 신규 등장 차량 무력화 문제
+- 신규: 방향이 "급변하는 순간(edge)"을 감지해 그 시점부터 guard_frames 동안 보호
+  - `stable_velocity`: 정상 투표 통과 시 방향 벡터 저장
+  - `direction_change_frame`: cos < cos_threshold(0.0) 이탈 순간 기록
+  - `direction_was_stable`: 직전 프레임 안정 여부 → edge 감지용
+  - early-exit 가드: 투표 루프 진입 전 guard 확인 → cos 연산 스킵
+- `config.py`: `direction_change_cos_threshold = 0.0` 추가
+
+**BBoxStabilizer 제거 + footpoint 중앙(cy)으로 변경 + 3프레임 warmup**
+- BBoxStabilizer(alpha=0.5 EMA): 초기 이상 bbox가 후속 프레임에 오염 → 제거
+- footpoint: `fy = (y1+y2)//2` (하단 y2 → 중앙 cy)
+- 3프레임 warmup: `_age = frame_num - first_seen_frame < 3` 이면 궤적 추가 건너뜀
+
+**bbox_coverage — density_score 대체**
+- 기존 density_score: `vehicle_count / density_max_vehicles(40)` → 실탐지 20대도 드문 환경에서 실효 없음
+- bbox_coverage: `Σbbox면적 / (flow_map 유효 셀 수 × 셀 면적)` — 차선 수 독립
+- feature_extractor.py에 `"bbox_coverage"` 추가, density_score는 alias로 유지
+
+**fallback jam_score 공식 교체**
+- 기존: `0.50×slow + 0.30×stop + 0.20×density`
+- 신규: `0.60×slow + 0.60×stop + 0.25×bbox_coverage` (가중치 합 1.45, 정체 시 1.0 초과 가능 → clip)
+
+**nm 테스트 코드 작성**
+- `tests/test_nm_measurement.py`: nm 계산 단위 테스트 8케이스 (pytest)
+- `test_nm_live.py`: 실제 영상에서 차량별 nm 실시간 표시 (빨강=stop, 주황=slow, 초록=normal)
+
+**버그 수정**
+- `AttributeError: NoneType.count`: detector.py에서 `TrafficAnalyzer(flow_map=self.flow)` 미전달 → 수정
+- `UnboundLocalError: _learn_min_mag`: if 블록 안에서만 정의 → 블록 바깥(공통 위치)으로 이동
+
+### 수정 파일 [대원]
+`src/config.py`, `src/state.py`, `src/judge.py`, `src/id_manager.py`,
+`src/detector.py`, `src/feature_extractor.py`, `src/congestion_judge.py`,
+`tests/test_nm_measurement.py` (신규), `test_nm_live.py` (신규)
+
+### 발생 오류 / 확인 사항
+- `AttributeError: 'NoneType' object has no attribute 'count'` → 수정 완료
+- `UnboundLocalError: local variable '_learn_min_mag' referenced before assignment` → 수정 완료
+- flow_map.npy는 footpoint가 y2 → cy로 변경되었으므로 **재학습 필요** (detect_only=False 실행)
+
+### 작업 재개 위치 [대원]
+- `run_test.py` detect_only=True 재실행으로 오류 수정 확인
+- 역주행 오탐 edge detection 가드 실제 영상 검증
+- flow_map 재학습 후 jam_score(bbox_coverage 포함) 실제 영상 테스트
+
+---
+
+## 2026-04-03 (68차 — 웹 정체 모니터링 탭 구현) [수빈]
 
 ### 오늘 한 작업 [수빈]
 
@@ -35,133 +87,4 @@
 - 현재는 API 구조만 완성, 탐지기 미연결 상태 (초기값 SMOOTH 반환)
 
 ---
-
-## 2026-04-03 (67차 — 웹 탄소/정체 탭 설계 논의 + 벤치마킹)
-
-### 오늘 한 작업 [수빈]
-
-**웹 화면 구조 파악**
-- `C:\finalPj_웹` 기존 팀원 웹 프로젝트 구조 분석 완료
-  - React(Vite) + Flask + Socket.IO, 다크 테마, 인라인 스타일
-  - `carbon` 탭: Sidebar·라우팅 이미 등록됨, `carbon/index.jsx`는 플레이스홀더
-  - `backend_flask/modules/carbon/carbon.py`: `/health` 엔드포인트만 존재
-- 데이터 소스 결정: **웹 백엔드가 `src/` 탐지 모듈 직접 import해서 실행**
-
-**탄소/정체 탭 설계 논의**
-- 탄소배출 계산: 신규 ML 개발 없이 배출계수 공식으로 추정 가능 확인
-  - 정체 수준별 배출계수 (EMEP/EEA 기준): 정상 2.3 / 서행 4.1 / 정체 6.8 g/s/대
-- 팀원 탄소 중복 여부 미확정 → 탄소 포함/제외 두 안 도출, 결정 보류
-
-**벤치마킹 조사 완료**
-- TOPIS, View-T, ITS 국가교통정보센터 (국내) + TomTom, INRIX, JamVis (해외) 참조
-- 공통 구성: 정체 레벨 상태 카드 + 시계열 차트 + KPI 카드 + 이벤트 로그
-
-### 수정 파일 [수빈]
-- 없음 (설계·조사 단계)
-
-### 발생 오류 / 확인 사항
-- 없음
-
-### 작업 재개 위치 [수빈]
-- 탄소 포함/제외 결정 후 `carbon/index.jsx` UI 구현 시작
-- 안 A (정체 전용): 상태 카드 + jam_score 차트 + KPI 3개 + 이벤트 로그
-- 안 B (정체 + 간이 탄소): 안 A + 탄소 추정 사이드 카드 추가
-- 백엔드 `carbon.py`에 정체 데이터 API 라우트 추가 필요
-
----
-
-## 2026-04-02 (66차 — 역주행 오탐 파라미터 조정)
-
-### 오늘 한 작업 [대원]
-
-**역주행 오탐 감소를 위한 파라미터 조정 (`src/config.py`)**
-- `wrong_count_threshold`: 8 → 12 (연속 의심 횟수 기준 강화 — 단발성 오탐 차단)
-- `direction_change_guard_frames`: 90 → 120 (정상 판정 후 4초간 의심 카운트 차단 — 커브/차선변경 오탐 차단)
-
-**파라미터 조정 범위 외 확인된 추가 오탐 원인** (코드 수정 필요 시 별도 진행)
-- `judge.py` 하드코딩: `smoothed_mask` 역방향 판정 임계값 `-0.50` → `-0.65` (코사인 130°)
-- 단기 투표 커브 오탐: 과거 궤적에 현재 방향벡터 적용하는 구조적 문제
-
-### 수정 파일 [대원]
-`src/config.py`
-
-### 발생 오류 / 확인 사항
-- jam_score 개선(slow_ratio 도입) 후 테스트 계속 중 (서행 0.3~0.4 → 0.5+ 목표)
-- 역주행 오탐 파라미터 조정 후 검증 필요
-
-### 작업 재개 위치 [대원]
-- 역주행 오탐 추가 검증 (파라미터 조정 후)
-- 필요 시 `judge.py` smoothed_mask 임계값 코드 수정 (사용자 요청 시)
-
----
-
-## 2026-04-02 (65차 — fallback jam_score 근본 수정: slow_ratio 도입)
-
-### 오늘 한 작업 [대원]
-
-**jam_score 로직 전체 분석 및 근본 문제 발견**
-- `norm_speed_ratio` fallback 적용 불가 이유 확인:
-  - fallback baseline의 `norm_speed_ref=0.15` (고정값)
-  - 실제 고속도로 nm = 0.5~2.0 → ratio가 항상 1.0으로 clip → speed_contribution = 0
-  - `upper_half` 중앙값 방식: 혼합 방향 차량 존재 시 빠른 차량이 서행 신호 덮어버림
-- `stop_ratio`만으로는 nm 0.06~0.15 구간 서행 차량 감지 불가
-
-**slow_ratio 신규 feature 도입 (`src/feature_extractor.py`)**
-- nm 구간별 분류 추가:
-  - nm < 0.06 → `stopped_count` (정지, 기존)
-  - 0.06 ≤ nm < 0.15 → `slow_count` (서행, 신규)
-  - nm ≥ 0.15 → 정상 주행 (카운트 없음)
-- `slow_ratio = slow_count / speed_known_count` (소표본 보정 동일 적용)
-- feature 딕셔너리에 `"slow_ratio"` 추가 (8차원으로 확장)
-
-**fallback 공식 최종 교체 (`src/congestion_judge.py`)**
-- 기존: `0.40×density + 0.60×stop` (서행 감지 불가)
-- 최종: `0.50×slow + 0.30×stop + 0.20×density`
-- 설계 목표: 원활 jam=0.06, 서행 jam=0.40, 극심 jam=0.48
-
-### 수정 파일 [대원]
-`src/config.py`, `src/flow_map.py`, `src/judge.py`, `src/detector.py`,
-`src/feature_extractor.py`, `src/traffic_analyzer.py`, `src/congestion_judge.py`
-
-### 발생 오류 / 확인 사항
-- norm_speed_ratio 기반 접근 4차례 시도 → 근본 원인(norm_speed_ref 고정값) 확인 후 포기
-- slow_ratio 방식으로 전환: nm 기준값 의존 없이 직접 구간 카운트
-
-### 작업 재개 위치 [대원]
-- 서행/정체 영상에서 slow_ratio 도입 후 jam_score 확인 (목표: 서행 ≥ 0.30)
-
----
-
-## 2026-04-02 (64차 — 문서 체계 정비 + 화면설계서 v1.1 재생성)
-
-### 오늘 한 작업 [수빈]
-
-**문서 체계 정비**
-- `CLAUDE.md`: guide.md 운영 규칙 확립 (산출물↔guide 동기화 원칙 명시), 수빈_노트/대원_노트 참조 제외, N드라이브 산출물 경로·읽기 방법·충돌 보고 형식 고정
-- `FILE_INDEX.md`: N드라이브 산출물 경로 명시, 인터페이스명세서 v1.2 경로 업데이트
-- `Docs/dev_guide.md`: §0 체크리스트 전체 ✅ 업데이트 (Phase 1·2 완료 반영), guide 역할 명시, 파라미터 기준값 실제값과 동기화
-- `Docs/dev_guide_phase2.md`: Phase 1·2 완료 상태 명시, **Phase 3 설계 명세 신규 추가** (§13)
-- `Docs/plan.md`: Phase 1·2 완료 / Phase 3 미구현 상태 반영, 역할 분담 업데이트
-
-**화면설계서 v1.1 재생성**
-- `generate_screen_design_docx.py` 수정: km/h → 정상 대비 속도(%) 전환 (7곳), LSTM → GRU, 정체 판정 기준 jam_score 기반으로 변경, 개정이력 v1.1 추가
-- 재생성 후 `N:\개인\대원&수빈\최종 프로젝트\산출물\교통흐름모니터링_화면설계서.docx` 덮어쓰기 완료
-
-**산출물 충돌 잔존 확인** (수빈이 직접 수정 필요)
-- 인터페이스 명세서 v1.2: 표지 버전 표기·§1.1 Phase 상태·§4.4.2 임계값·§2.2 C키 누락 (4곳)
-- 프로그램설계서: §4.1·§8.1·§8.2 파라미터값 (3곳)
-
-### 수정 파일 [수빈]
-`CLAUDE.md`, `FILE_INDEX.md`, `Docs/dev_guide.md`, `Docs/dev_guide_phase2.md`, `Docs/plan.md`
-`N드라이브: generate_screen_design_docx.py`, `교통흐름모니터링_화면설계서.docx`
-
-### 발생 오류
-- python-docx 미설치 → cv 환경에 설치 완료
-
-### 작업 재개 위치 [수빈]
-- 웹 화면 구성(React 뼈대) 작업 시작 예정
-- 산출물 인터페이스명세서·프로그램설계서 수동 수정 대기 중
-
----
-
 

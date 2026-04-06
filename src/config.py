@@ -28,7 +28,8 @@ class DetectorConfig:
     vote_threshold: float = 0.7       # 투표 시 역방향 비율 임계값 (원본값 복원 — 60% 이상이면 역주행 의심)
     min_move_distance: float = 10.0    # 최소 누적 이동 거리 (이하면 정지로 판단) — 원래 20.0, 원거리 CCTV 대응 완화
     min_move_per_frame: float = 0.4   # 프레임당 평균 이동거리 (이하면 정지) — 원래 1.5, 원거리 CCTV 대응 완화
-    direction_change_guard_frames: int = 120 # 정상→역방향 급전환 가드: 정상 판정 후 이 프레임 이내 의심 카운트 차단 — 45→90→120 (오탐 감소)
+    direction_change_guard_frames: int = 120 # 방향 급변 이후 가드 기간 (프레임 수) — 급변 감지 시점부터 이 프레임 동안 의심 카운트 차단
+    direction_change_cos_threshold: float = 0.0  # 급변 감지 임계값 (cos 기준, 0.0=90°+, 0.5=60°+) — stable 방향 대비 이 이상 벗어나면 급변으로 기록
 
     # ==================== ID 매핑 관련 ====================
     id_match_distance: int = 120      # ID 재매칭 허용 거리 (픽셀 단위, 이전 ID와 새 ID 위치 비교)
@@ -83,7 +84,7 @@ class DetectorConfig:
 
     # ==================== jam_score 임계값 ====================
     smooth_jam_threshold:    float = 0.30   # jam_score 이 값 미만 → SMOOTH — 0.25→0.30 (원활 차량 dwell/density 기여 흡수)
-    slow_jam_threshold:      float = 0.60   # jam_score 이 값 미만 → SLOW, 이상 → CONGESTED — 0.42→0.55 복원 (density 정규화로 범위 0~1.0 확보)
+    slow_jam_threshold:      float = 0.60   # jam_score 이 값 미만 → SLOW, 이상 → CONGESTED
     density_max_vehicles:   float = 40.0   # density 정규화 기준 차량 수 — 이 값 이상이면 density=1.0 (포화) — 20→40 (10대 원활 시 density 50%→25% 보정)
     default_lcs:             float = 0.36   # 한강대교 베이스라인 학습 결과 — 모든 카메라 임계값 보정에 사용
 
