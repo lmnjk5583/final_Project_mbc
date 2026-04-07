@@ -99,6 +99,19 @@ class TrafficAnalyzer:
             self.feature_extractor.set_baseline(baseline)  # FE에 기준선 설정
         self.congestion_judge.set_baseline(baseline)  # CJ에 기준선 설정
 
+    # ── 방향별 유효 셀 수 전달 (학습 완료 후 detector.py에서 호출) ──
+    def set_valid_cell_count(self, n: int):
+        """방향별 유효 셀 수를 FeatureExtractor에 전달한다.
+
+        bbox_coverage를 셀 점유율로 계산할 때 방향별 road area 편향 제거용.
+        detector.py가 _compute_direction_cell_counts() 후 호출한다.
+
+        Args:
+            n: 이 방향에 속하는 유효 flow_map 셀 수.
+        """
+        if self.feature_extractor is not None:        # FE 초기화된 경우
+            self.feature_extractor.set_valid_cell_count(n)  # FE에 전달
+
     # ── 밀도맵 갱신 (내부) ─────────────────────────────────────────
     def _update_density_map(self, tracks: list):
         """tracks의 footpoint 위치를 기반으로 15×15 밀도맵을 갱신한다.

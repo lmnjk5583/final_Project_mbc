@@ -19,14 +19,14 @@ from src.tracker import YoloTracker                                # YOLO+ByteTr
 
 # ── 설정 ─────────────────────────────────────────────────────────────
 MODEL_PATH  = PROJECT_ROOT / "runs" / "yolo11n_v1" / "weights" / "best.pt"
-VIDEO_PATH  = Path(r"N:\개인\대원&수빈\최종 프로젝트\임시\2026-04-01_17-11-32\videos") / "record_2026-04-01_17-11-32.mp4"
-CONF        = 0.35          # YOLO 신뢰도 임계값
+VIDEO_PATH  = Path(r"N:\개인\대원&수빈\최종 프로젝트\임시\2026-03-31_10-44-07\videos") / "record_2026-03-31_10-44-07.mp4"
+CONF        = 0.45          # YOLO 신뢰도 임계값
 
 VELOCITY_WINDOW    = 20        # nm 계산 프레임 간격 (detector.py와 동일)
 MIN_BBOX_H         = 30.0      # bbox_h 최솟값 클램프
 NORM_STOP_THR      = 0.06      # nm < 이 값 → stop
-SLOW_UPPER_NM      = 0.50      # nm < 이 값 → slow, 이상 → normal
-NM_CY_CORRECTION_K = 0.4        # cy 보정 계수 (config.py nm_cy_correction_k와 동일)
+SLOW_UPPER_NM      = 2.5       # nm < 이 값 → slow, 이상 → normal  ← config.py 동기화 (0.50→2.5)
+NM_CY_CORRECTION_K = 0.0       # cy 보정 계수 ← config.py 동기화 (0.4→0.0, cy 이중보정 비활성화)
 
 # ── 색상 ─────────────────────────────────────────────────────────────
 COLOR = {

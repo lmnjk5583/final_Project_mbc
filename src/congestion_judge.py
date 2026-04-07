@@ -38,16 +38,17 @@ def compute_jam_score_fallback(x_t: dict) -> float:
       slow_ratio는 정지와 정상 주행 사이의 "서행 구간"을 직접 카운트하여
       nm 기준값(norm_speed_ref) 의존 없이 서행을 감지한다.
 
-    설계 목표:
-      - 원활  (slow≈0.02, stop≈0.01, density≈0.25):  jam ≈ 0.06 → SMOOTH
-      - 서행  (slow≈0.60, stop≈0.05, density≈0.40):  jam ≈ 0.40 → SLOW
-      - 정체  (slow≈0.20, stop≈0.70, density≈0.70):  jam ≈ 0.45 → SLOW~CONGESTED
-      - 극심  (slow≈0.10, stop≈0.90, density≈0.80):  jam ≈ 0.48 → CONGESTED
+    설계 목표 (slow_upper_nm=1.0 기준 — 20~30 km/h 서행 포착):
+      - 원활  (slow=0,    stop=0,    cell_occ=0.04): jam ≈ 0.08 → SMOOTH
+      - 서행  (slow=0.80, stop=0.10, cell_occ=0.08): jam ≈ 0.39 → SLOW
+      - 정체  (slow=1.0,  stop=0.70, cell_occ=0.12): jam ≈ 0.61 → CONGESTED
+      - 극심  (slow=1.0,  stop=0.90, cell_occ=0.15): jam ≈ 0.67 → CONGESTED
 
-    가중치:
-      0.50 × slow_contribution    — 서행 비율: 서행 핵심 감지 (nm 0.06~0.15)
-      0.30 × stop_contribution    — 정지 비율: 완전 정체 핵심 감지 (nm < 0.06)
-      0.20 × density_contribution — 밀도: 보조 지표 (차량 많을수록 가산)
+    가중치 (slow_upper_nm=1.0에 맞춰 재조정):
+      0.29 × slow_contribution — 서행 비율 (nm < 1.0). 1.0으로 올려도 CONGESTED 미초과
+      0.25 × stop_contribution — 정지 비율 (nm < 0.06). 0.70↑시 서행→정체 전환 핵심
+      0.20 × bbox_contribution — 셀 점유율 sqrt (cell occupancy, 원근 독립)
+      0.08 × count_contribution — 차량 수 (count_ref=8 대비)
 
     유출(exit_rate_ratio) 미사용 이유:
       fallback 모드에서 count_ref=15 고정값 기반 exit_rate_ratio는
@@ -90,20 +91,18 @@ def compute_jam_score_fallback(x_t: dict) -> float:
         x_t.get("count_ratio", 0.0), 0.0, 1.0
     )
 
-    # ── 가중 합산 (slow 80% + stop 70% + sqrt(bbox) 35% + count 10%, 합=1.95) ──
-    # 가중치 합 > 1.0: 극심 정체 시 clip 전 1.0 초과 → 1.0으로 포화
-    # B방향 7대 fast (slow=0, stop=0, bbox_cov=0.011→sqrt=0.10, count=0.875):
-    #   0 + 0 + 0.35×0.10 + 0.10×0.875 = 0.035+0.088 = 0.123
-    # smooth 8대    (slow=0.05, stop=0.01, bbox→sqrt=0.22, count=1.0):
-    #   0.040+0.007+0.077+0.10 = 0.224
-    # 서행          (slow=0.60, stop=0.05, bbox→sqrt=0.45, count=1.0):
-    #   0.480+0.035+0.157+0.10 = 0.772
-    # 정체          (slow=0.20, stop=0.70, bbox→sqrt=0.59, count=1.0):
-    #   0.160+0.490+0.207+0.10 = 0.957 → clip 1.0
-    jam = (0.80 * slow_contribution                    # 서행 가중 80%
-           + 0.70 * stop_contribution                  # 정지 가중 70%
-           + 0.35 * bbox_contribution                  # sqrt(bbox 점유율) 35%
-           + 0.10 * count_contribution)                # 차량 수 비율 10% (count_ref=8)
+    # ── 가중 합산 (slow 29% + stop 25% + cell_occ 20% + count 8%) ──────
+    # slow_upper_nm=1.0 기준: slow_ratio가 포화(1.0)되어도 CONGESTED 미초과
+    # 원활 (slow=0, stop=0, cell_occ=0.04→sqrt=0.20, count=0.5):
+    #   0 + 0 + 0.20×0.20 + 0.08×0.5 = 0.04+0.04 = 0.08 → SMOOTH
+    # 서행 (slow=0.80, stop=0.10, cell_occ=0.08→sqrt=0.28, count=1.0):
+    #   0.29×0.8 + 0.25×0.1 + 0.20×0.28 + 0.08 = 0.232+0.025+0.056+0.08 = 0.393 → SLOW
+    # 정체 (slow=1.0, stop=0.70, cell_occ=0.12→sqrt=0.35, count=1.0):
+    #   0.29 + 0.25×0.7 + 0.20×0.35 + 0.08 = 0.29+0.175+0.070+0.08 = 0.615 → CONGESTED
+    jam = (0.29 * slow_contribution                    # 서행 가중 29% (1.0→재조정: slow_ratio 포화 방지)
+           + 0.25 * stop_contribution                  # 정지 가중 25% (서행↔정체 전환 핵심)
+           + 0.20 * bbox_contribution                  # 셀 점유율 20% (cell occupancy, 원근 독립)
+           + 0.08 * count_contribution)                # 차량 수 비율 8% (count_ref=8)
 
     return _clip(jam, 0.0, 1.0)                        # [0, 1] 범위 클램프
 

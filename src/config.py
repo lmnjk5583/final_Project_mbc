@@ -113,15 +113,15 @@ class DetectorConfig:
     display_height: int = 720              # 화면 출력 창 높이 (픽셀). 0이면 원본 해상도 그대로
 
     # ==================== 정체 탐지 slow_ratio 파라미터 ====================
-    slow_upper_nm: float = 0.50            # 서행 판정 상한 nm (nm < 이 값 → 서행)
-    nm_cy_correction_k: float = 0.6        # nm cy 보정 계수 — 원근 대칭 보정
-                                           # nm_corrected = nm / (1 + k × (2×cy_ratio − 1))
-                                           # cy_ratio = cy / frame_h  (0=원거리/상단, 1=근거리/하단)
-                                           # 상단(원거리): 분모 < 1 → nm 증가 (부스트)
-                                           # 중앙(0.5):    분모 = 1 → nm 그대로
-                                           # 하단(근거리): 분모 > 1 → nm 감소
-                                           # k < 1.0 필수 — k≥1이면 원거리 분모가 0 이하로 발산
-                                           # k=0.4: 원거리 nm×1.67 / 근거리 nm×0.56
+    slow_upper_nm: float = 2.5             # 서행 판정 상한 nm (nm < 이 값 → 서행)
+                                           # 실측 기반 조정 (0.50→1.0→2.5):
+                                           #   서행(20~40 km/h) → nm ≈ 0.8~2.0 → 전부 포착
+                                           #   중속(40~60 km/h) → nm ≈ 2.5~4.0 → NORMAL 분류
+                                           #   고속(80+ km/h)   → nm ≈ 5.0+   → NORMAL 분류
+    nm_cy_correction_k: float = 0.0        # nm cy 보정 계수 — 비활성화 (0.6→0.0)
+                                           # 이유: nm=mag/bbox_h이 이미 원근 보정 중
+                                           #      cy 이중보정 시 서행 nm을 과증폭 → slow_upper_nm 초과 오분류
+                                           # 예) 서행 nm=0.43 → 보정 후 0.52 → NORMAL 오분류 방지
 
     # ==================== 방향별 차선 분리 파라미터 ====================
     lane_cos_threshold: float = 0.0        # 방향 분류 코사인 임계값 (≥ 이면 A방향, < 이면 B방향)

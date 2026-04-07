@@ -52,6 +52,7 @@ class FeatureExtractor:
         self.cfg = cfg                                 # 설정 객체 저장
         self.state = state                             # 런타임 상태 저장
         self.baseline: BaselineStats | None = baseline_stats  # 기준선 (초기 None)
+        self._valid_cell_count_override: int | None = None  # 방향별 유효 셀 수 (None=전체 사용)
 
     # ── 기준선 설정 ──────────────────────────────────────────────────
     def set_baseline(self, baseline_stats: BaselineStats):
@@ -61,6 +62,19 @@ class FeatureExtractor:
             baseline_stats: finalize_baseline()이 반환한 기준선 객체.
         """
         self.baseline = baseline_stats                 # 기준선 갱신
+
+    # ── 방향별 유효 셀 수 설정 ────────────────────────────────────────
+    def set_valid_cell_count(self, n: int):
+        """방향별 유효 셀 수를 설정한다 (bbox_coverage 원근 보정용).
+
+        detector.py가 학습 완료 후 방향 분류를 통해 A/B 셀 수를 계산해 전달.
+        None(전체 셀)이 아닌 방향별 셀 수를 사용하면 상행/하행 bbox_coverage가
+        동등하게 비교된다.
+
+        Args:
+            n: 이 방향에 속하는 유효 flow_map 셀 수.
+        """
+        self._valid_cell_count_override = max(n, 1)   # 0 방지 후 저장
 
     # ── feature 벡터 계산 ────────────────────────────────────────────
     def compute(self, tracks: list, speeds: dict,
@@ -126,29 +140,31 @@ class FeatureExtractor:
         # normal 모드 전환 시 passage_tracker 재연결 필요
         exit_last_30 = 0                               # 미사용 (fallback 공식 무관)
 
-        # ── bbox_coverage: flow_map 유효 도로 면적 대비 탐지 차량 bbox 면적 비율 ──
-        # 차선 수·차량 대수에 독립적 — 분자(bbox 합)와 분모(도로 면적) 모두
-        # YOLO 탐지 범위에 비례하므로 탐지 범위가 좁아도 비율은 유효.
-        # 트럭·버스처럼 큰 차량이 더 많이 기여 (차량 크기 반영).
+        # ── bbox_coverage: 셀 점유율 (cell occupancy) 방식 ──────────────
+        # 구 방식: bbox 면적 / 도로 면적 → 원거리 차량(小bbox)이 4~5배 불리
+        # 신 방식: 차량 footpoint가 위치한 고유 셀 수 / 방향별 유효 셀 수
+        #   → 원근 무관하게 차량 1대 = 1셀 기여 → 상행/하행 공정 비교
+        #   → 방향별 유효 셀 수(set_valid_cell_count)로 편향 추가 제거
         cell_w = self.state.frame_w / self.cfg.grid_size   # 셀 너비 (픽셀)
         cell_h = self.state.frame_h / self.cfg.grid_size   # 셀 높이 (픽셀)
-        cell_area = cell_w * cell_h                        # 셀 1개 면적 (픽셀²)
-        if flow_map is not None and hasattr(flow_map, "count"):
+
+        # 유효 셀 수: 방향별 override > flow_map 실측 > 전체 그리드 순서로 사용
+        if self._valid_cell_count_override is not None:    # 방향별 셀 수 주입됨
+            valid_cell_count = self._valid_cell_count_override
+        elif flow_map is not None and hasattr(flow_map, "count"):
             valid_cell_count = int(np.sum(flow_map.count > 0))  # 학습된 유효 셀 수
         else:
-            valid_cell_count = self.cfg.grid_size * self.cfg.grid_size  # flow_map 없으면 전체 셀 사용
-        road_area = valid_cell_count * cell_area           # 유효 도로 면적 (픽셀²)
+            valid_cell_count = self.cfg.grid_size * self.cfg.grid_size  # fallback: 전체
 
-        total_bbox_area = sum(                             # 탐지된 전체 bbox 면적 합
-            (t["x2"] - t["x1"]) * (t["y2"] - t["y1"])
+        # 차량 footpoint가 위치한 고유 셀 집합
+        occupied_cells = len(set(
+            (int(np.clip(t["cy"] / cell_h, 0, self.cfg.grid_size - 1)),   # 행 인덱스
+             int(np.clip(t["cx"] / cell_w, 0, self.cfg.grid_size - 1)))   # 열 인덱스
             for t in tracks
-        )
-        if road_area > 0:                                  # 유효 도로 면적 있으면
-            bbox_coverage = float(np.clip(                 # 도로 대비 bbox 점유율 (0~1)
-                total_bbox_area / road_area, 0.0, 1.0
-            ))
-        else:                                              # flow_map 미학습 상태
-            bbox_coverage = 0.0                            # 계산 불가 → 0
+        ))
+        bbox_coverage = float(np.clip(                     # 셀 점유율 (0~1)
+            occupied_cells / max(valid_cell_count, 1), 0.0, 1.0
+        ))
 
         # density_score: 하위 호환 유지 (GRU feature 벡터 구조 변경 최소화)
         density_score = bbox_coverage                      # bbox_coverage로 대체

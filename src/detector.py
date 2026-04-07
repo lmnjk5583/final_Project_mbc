@@ -62,6 +62,8 @@ class Detector:
         self._track_direction = {}                                  # {tid: 'a' or 'b'} 차량별 방향
         self._dir_label_a = "상행"                                  # A방향 표시 레이블 (기본값)
         self._dir_label_b = "하행"                                  # B방향 표시 레이블 (기본값)
+        self._valid_cells_a: int = 1                                # A방향 유효 셀 수 (bbox_coverage 원근 보정용)
+        self._valid_cells_b: int = 1                                # B방향 유효 셀 수
 
         # ── flow_map 로드 (탐지 전용이라면 필수) ────────────────────
         self._saved_baseline = None                                 # 파일에서 불러온 baseline (없으면 None)
@@ -127,6 +129,40 @@ class Detector:
         print(f"🧭 기준 방향: ({self._ref_direction[0]:.3f}, {self._ref_direction[1]:.3f})"
               f" [셀({best_r},{best_c}), 샘플={best_count}]"
               f" → A={self._dir_label_a}, B={self._dir_label_b}")
+
+    # ==================== 방향별 유효 셀 수 계산 ====================
+    def _compute_direction_cell_counts(self):
+        """flow_map 유효 셀을 A/B방향으로 분류해 각 셀 수를 계산한다.
+
+        bbox_coverage 계산 시 전체 road_area 대신 방향별 road_area를 사용하기 위해
+        학습 완료 직후 _compute_ref_direction() 다음에 호출한다.
+
+        결과를 _valid_cells_a/b에 저장 후 각 TrafficAnalyzer에 주입.
+        """
+        if self._ref_direction is None:                           # 기준 방향 미설정이면
+            return                                                # 계산 불가 → 기본값 유지
+        ref_x, ref_y = self._ref_direction                        # 기준 방향 벡터
+        count_a, count_b = 0, 0                                   # 방향별 셀 카운터
+        for r in range(self.flow.grid_size):                      # 행 순회
+            for c in range(self.flow.grid_size):                  # 열 순회
+                if self.flow.count[r, c] <= 0:                    # 미학습 셀 건너뜀
+                    continue
+                vx = float(self.flow.flow[r, c, 0])               # 셀 흐름 x
+                vy = float(self.flow.flow[r, c, 1])               # 셀 흐름 y
+                cos_val = vx * ref_x + vy * ref_y                 # 기준 방향과 코사인 유사도
+                if cos_val >= self.cfg.lane_cos_threshold:         # A방향 기준 이상
+                    count_a += 1                                  # A방향 셀 카운트
+                else:                                             # B방향
+                    count_b += 1                                  # B방향 셀 카운트
+        self._valid_cells_a = max(count_a, 1)                     # 0 방지
+        self._valid_cells_b = max(count_b, 1)                     # 0 방지
+        print(f"📐 방향별 셀 수: A={self._valid_cells_a}, B={self._valid_cells_b}"
+              f" (전체 유효={count_a + count_b})")
+        # TrafficAnalyzer에 방향별 셀 수 주입
+        if self.traffic_analyzer_a is not None:                   # A방향 analyzer 있으면
+            self.traffic_analyzer_a.set_valid_cell_count(self._valid_cells_a)
+        if self.traffic_analyzer_b is not None:                   # B방향 analyzer 있으면
+            self.traffic_analyzer_b.set_valid_cell_count(self._valid_cells_b)
 
     # ==================== 차량 방향 분류 ====================
     def _classify_direction(self, fx, fy):
@@ -221,6 +257,7 @@ class Detector:
         self.traffic_analyzer_b.set_baseline(copy(_fb))            # B방향 baseline 설정
         if not st.is_learning:                                     # 탐지 전용이면 flow_map 로드됨 → 기준 방향 계산
             self._compute_ref_direction()
+            self._compute_direction_cell_counts()                  # 방향별 셀 수 계산 → TA 주입
         print(f"✅ 정체 탐지 baseline 설정 완료 (fallback 모드, LCS={cfg.default_lcs})")
 
         save_path = self._get_next_filename()                       # 결과 저장 파일명
@@ -365,6 +402,7 @@ class Detector:
                     self.flow.apply_spatial_smoothing(verbose=True) # 공간 보정 (상세 진단)
                     self.flow.apply_boundary_erosion()              # 경계 셀 제거 (오탐 차단)
                     self._compute_ref_direction()                   # 기준 방향 벡터 계산
+                    self._compute_direction_cell_counts()           # 방향별 셀 수 계산 → TA 주입
                     if cfg.flow_map_path:                           # 저장 경로 있으면
                         self.flow.save(cfg.flow_map_path)           # flow_map만 저장
                     st.is_learning = False                          # 학습 모드 종료
@@ -392,6 +430,7 @@ class Detector:
                     self.flow.apply_spatial_smoothing(verbose=True) # 공간 보정 (상세 진단)
                     self.flow.apply_boundary_erosion()              # 경계 셀 제거 (오탐 차단)
                     self._compute_ref_direction()                   # 기준 방향 벡터 재계산
+                    self._compute_direction_cell_counts()           # 방향별 셀 수 재계산 → TA 주입
                     if cfg.flow_map_path:                           # 저장 경로 있으면
                         self.flow.save(cfg.flow_map_path)           # flow_map만 저장 (baseline 미포함)
                     st.relearning = False                           # 재학습 모드 종료
@@ -420,8 +459,29 @@ class Detector:
                 last_footpoints[tid] = (fx, fy)                     # 최신 footpoint 저장
 
                 # ── 방향 분류 (탐지 모드에서만, 기준 방향 설정 후) ─────
+                # 기존: flow_map 기반 → 미학습 셀(상단) 에서 nearest-neighbor가
+                #       반대 방향 셀을 반환해 상행 차량을 A로 오분류
+                # 개선: 궤적 3점 이상이면 velocity 벡터로 즉시 분류
+                #       원거리 차량은 YOLO가 자주 끊겨 traj<20인 경우 많음 →
+                #       velocity_window(20) 대기 없이 조기 정확 분류
                 if not st.is_learning and not st.relearning and self._ref_direction is not None:
-                    self._track_direction[tid] = self._classify_direction(fx, fy)
+                    _traj_dir = st.trajectories[tid]                # 이번 프레임 추가 전 궤적
+                    _DIR_WIN = min(cfg.velocity_window, len(_traj_dir))  # 가용 최대 window
+                    if _DIR_WIN >= 3:                               # 3포인트 이상이면 velocity 사용
+                        _ddx = _traj_dir[-1][0] - _traj_dir[-_DIR_WIN][0]  # x 변위
+                        _ddy = _traj_dir[-1][1] - _traj_dir[-_DIR_WIN][1]  # y 변위
+                        _dmag = np.sqrt(_ddx ** 2 + _ddy ** 2)     # 이동 거리
+                        if _dmag > 1.0:                             # 움직임 확인
+                            _ref_x, _ref_y = self._ref_direction    # 기준 방향
+                            _cos_dir = ((_ddx / _dmag) * _ref_x    # 코사인 유사도
+                                        + (_ddy / _dmag) * _ref_y)
+                            self._track_direction[tid] = (
+                                'a' if _cos_dir >= cfg.lane_cos_threshold else 'b'
+                            )
+                        else:                                       # 거의 정지 → flow_map fallback
+                            self._track_direction[tid] = self._classify_direction(fx, fy)
+                    else:                                           # 궤적 없음 → flow_map fallback
+                        self._track_direction[tid] = self._classify_direction(fx, fy)
 
                 # ID 재매칭 시도 (학습 모드가 아닐 때만)
                 if not st.is_learning and not st.relearning:        # 탐지 모드일 때만
@@ -453,6 +513,22 @@ class Detector:
                     avg_move = mag / cfg.velocity_window             # 프레임당 평균 이동
 
                     speeds[tid] = mag                               # 실제 이동량 기록 — feature_extractor에서 nm으로 정지 판정
+
+                    # ── 속도 벡터 기반 방향 분류 override ───────────────────────
+                    # flow_map 기반(_classify_direction)은 미학습 셀(상단)에서
+                    # nearest-neighbor가 반대 방향 셀을 반환해 오분류 발생.
+                    # velocity 벡터(vdx, vdy)는 실제 이동 방향 → 더 신뢰도 높음.
+                    if (not st.is_learning and not st.relearning
+                            and self._ref_direction is not None
+                            and mag > 1.0):                         # 최소 이동 확인
+                        _vn_x = vdx / mag                          # 정규화 속도 x
+                        _vn_y = vdy / mag                          # 정규화 속도 y
+                        _ref_x, _ref_y = self._ref_direction       # 기준 방향
+                        _cos_v = _vn_x * _ref_x + _vn_y * _ref_y  # 코사인 유사도
+                        self._track_direction[tid] = (             # flow_map 분류 덮어쓰기
+                            'a' if _cos_v >= cfg.lane_cos_threshold else 'b'
+                        )
+
                     # ── nm 기반 이동 조건 (학습·판정 임계값 분리) ────────────────
                     # 학습:  nm_move > norm_learn_threshold(0.05)  — 서행·정체 차량 방향도 학습
                     # 판정:  judge.check() 내부에서 nm > norm_speed_gate_threshold(0.15) 재검사
