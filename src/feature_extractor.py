@@ -101,6 +101,7 @@ class FeatureExtractor:
         )
         speed_known_count = 0                          # 궤적 확인된 차량 수 (신규 제외)
         speed_known_tids = set()                       # speeds 확인된 tid 집합 (bbox_coverage 필터용)
+        speed_known_tids_deficit = {}                  # {tid: velocity_deficit} — speed_ref 학습된 셀만
         for t in tracks:                               # 각 차량 순회
             raw_bbox_h = t["y2"] - t["y1"]            # 바운딩박스 높이 (픽셀)
             bbox_h = max(raw_bbox_h, min_bbox_h)       # 최솟값 클램프 — 원거리 소형 박스 과대평가 방지
@@ -142,6 +143,21 @@ class FeatureExtractor:
                 slow_count += 1                        # 정지 ⊂ 서행
             elif _med_nm < slow_upper_nm:              # 0.06 ≤ 중앙값 nm < 0.70 → 서행
                 slow_count += 1
+
+            # ── velocity_deficit 계산 (flow_map.speed_ref 활용) ────────
+            # speed_ref[cell] = SMOOTH 구간에서 학습된 이 위치의 정상 nm
+            # deficit = 1 - nm / speed_ref  (0=정상속도, 1=완전정지)
+            # speed_ref가 0이면(미학습) fallback으로 slow_upper_nm 사용
+            _cell_r = int(np.clip(t["cy"] / cell_h, 0, self.cfg.grid_size - 1))
+            _cell_c = int(np.clip(t["cx"] / cell_w, 0, self.cfg.grid_size - 1))
+            _ref_nm = (float(flow_map.speed_ref[_cell_r, _cell_c])
+                       if (flow_map is not None
+                           and hasattr(flow_map, "speed_ref")
+                           and flow_map.speed_ref[_cell_r, _cell_c] > 0.01)
+                       else 0.0)                       # 0이면 deficit 계산 스킵
+            if _ref_nm > 0.01:                         # speed_ref 학습된 셀만
+                _deficit = float(np.clip(1.0 - _med_nm / _ref_nm, 0.0, 1.0))
+                speed_known_tids_deficit[tid] = _deficit  # tid별 deficit 저장
 
         # ── bbox_coverage: 셀 점유율 (cell occupancy) 방식 ──────────────
         cell_w = self.state.frame_w / self.cfg.grid_size   # 셀 너비 (픽셀)
@@ -199,6 +215,16 @@ class FeatureExtractor:
             rep_norm_mag / _speed_ref, 0.0, 1.0
         ))
 
+        # ── velocity_deficit_ratio 집계 ──────────────────────────────
+        # speed_ref가 학습된 셀에 있는 차량들만 대상
+        # deficit_ratio = 평균 velocity_deficit (0=전원 정상, 1=전원 완전정지)
+        # speed_ref 미학습 구간(warmup 초기) → deficit_count=0 → fallback으로 slow_ratio 사용
+        _deficit_vals = list(speed_known_tids_deficit.values())
+        deficit_count = len(_deficit_vals)             # speed_ref 유효 차량 수
+        velocity_deficit_ratio = (                     # 평균 deficit (0~1)
+            float(np.mean(_deficit_vals)) if deficit_count > 0 else -1.0
+        )                                              # -1 = speed_ref 미학습 (fallback 신호)
+
         # ── nm_history 만료 처리: 이번 프레임에 없는 tid 제거 ────────
         for old_tid in list(self._nm_history.keys()):
             if old_tid not in speed_known_tids:            # 이번 프레임에 없는 차량
@@ -224,11 +250,13 @@ class FeatureExtractor:
 
         # ── feature 딕셔너리 조립 ────────────────────────────────────
         return {                                       # feature 벡터
-            "norm_speed_ratio":   norm_speed_ratio,    # [0] 속도 비율 (자기보정 baseline 기준)
-            "nm_baseline_valid":  _nm_baseline_valid,  # baseline 준비 여부
-            "stop_ratio":         stop_ratio,          # [1] 정지 비율 (nm < 0.06)
-            "slow_ratio":         slow_ratio,          # [1.5] 서행 비율 (0.06 ≤ nm < 0.50)
-            "density_score":      density_score,       # [2] bbox_coverage 별칭 (하위 호환)
-            "bbox_coverage":      bbox_coverage,       # [2] 도로 면적 대비 셀 점유율
-            "rule_jam_score":     0.0,                 # [3] jam_score (CJ 채움)
+            "norm_speed_ratio":      norm_speed_ratio,       # [0] 속도 비율 (자기보정 baseline 기준)
+            "nm_baseline_valid":     _nm_baseline_valid,     # baseline 준비 여부
+            "stop_ratio":            stop_ratio,             # [1] 정지 비율 (nm_median < 0.06)
+            "slow_ratio":            slow_ratio,             # [1.5] 순수 서행 비율 (정지 제외)
+            "density_score":         density_score,          # [2] bbox_coverage 별칭 (하위 호환)
+            "bbox_coverage":         bbox_coverage,          # [2] 도로 면적 대비 셀 점유율 (궤적확인 차량만)
+            "velocity_deficit_ratio": velocity_deficit_ratio, # [2.5] 평균 속도 부족률 (-1=미학습)
+            "deficit_count":         deficit_count,          # speed_ref 유효 차량 수
+            "rule_jam_score":        0.0,                    # [3] jam_score (CJ 채움)
         }

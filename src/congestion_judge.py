@@ -29,16 +29,22 @@ def _clip(value: float, lo: float, hi: float) -> float:
 
 
 def compute_jam_score_fallback(x_t: dict) -> float:
-    """서행비율·정지비율·셀점유율로 jam_score를 계산한다.
+    """velocity_deficit·정지비율·셀점유율로 jam_score를 계산한다.
 
-    slow_ratio: 순수 서행 (정지 제외, 0.06 ≤ nm_median < 0.70)
-    stop_ratio: 완전 정지 (nm_median < 0.06) — slow와 독립 기여
-    bbox_coverage: 궤적 확인 차량의 셀 점유율 (신규 차량 제외)
+    주 신호 선택 (우선순위):
+      1) velocity_deficit_ratio >= 0  → flow_map speed_ref 기반 위치별 속도 부족률
+         - SMOOTH 구간 실측으로 학습된 셀별 정상속도 대비 현재 감속 정도
+         - 카메라 각도·거리 무관하게 자동 보정
+      2) velocity_deficit_ratio == -1 → speed_ref 미학습 (warmup 초기)
+         - slow_ratio fallback: 고정 임계값(0.70) 기반
 
-    설계 목표 (stop 분리 후):
-      - 원활  (slow=0,    stop=0,    bbox=0.04): jam ≈ 0.09 → SMOOTH
-      - 서행  (slow=0.55, stop=0.05, bbox=0.10): jam ≈ 0.46 → SLOW
-      - 정체  (slow=0.40, stop=0.50, bbox=0.20): jam ≈ 0.87 → CONGESTED
+    stop_ratio: 완전 정지 (nm_median < 0.06) — 주 신호와 독립 기여
+    bbox_coverage: 궤적 확인 차량의 셀 점유율
+
+    설계 목표:
+      - 원활  (deficit=0.05, stop=0,    bbox=0.04): jam ≈ 0.09 → SMOOTH
+      - 서행  (deficit=0.50, stop=0.05, bbox=0.10): jam ≈ 0.52 → SLOW
+      - 정체  (deficit=0.80, stop=0.40, bbox=0.20): jam ≈ 1.0  → CONGESTED
 
     Args:
         x_t: feature 벡터 dict.
@@ -46,10 +52,16 @@ def compute_jam_score_fallback(x_t: dict) -> float:
     Returns:
         jam_score (0.0~1.0).
     """
-    # ── 서행 비율 기여 (순수 서행 = 정지 제외) ───────────────────────
-    slow_contribution = _clip(x_t.get("slow_ratio", 0.0), 0.0, 1.0)
+    # ── 주 신호: velocity_deficit 또는 slow_ratio fallback ───────────
+    _vdr = x_t.get("velocity_deficit_ratio", -1.0)     # -1=미학습
+    if _vdr >= 0.0:                                     # speed_ref 학습된 셀 존재
+        main_contribution = _clip(_vdr, 0.0, 1.0)      # 위치별 속도 부족률 (0=정상, 1=완전정지)
+    else:                                               # speed_ref 미학습 → fallback
+        main_contribution = _clip(                      # slow_ratio 기반 fallback
+            x_t.get("slow_ratio", 0.0), 0.0, 1.0
+        )
 
-    # ── 정지 비율 기여 (slow와 독립 — 이중 증폭 방지) ────────────────
+    # ── 정지 비율 기여 (주 신호와 독립) ──────────────────────────────
     stop_contribution = _clip(x_t.get("stop_ratio", 0.0), 0.0, 1.0)
 
     # ── bbox 점유율 기여 — sqrt 비선형 변환 ──────────────────────────
@@ -59,11 +71,11 @@ def compute_jam_score_fallback(x_t: dict) -> float:
     bbox_contribution = math.sqrt(raw_bbox)
 
     # ── 가중 합산 ──────────────────────────────────────────────────────
-    # slow(0.85): 정지 제외 순수 서행 — 주 신호 (0.70→0.85: reliability 제곱감쇠로 깎인 만큼 보정)
-    # stop(0.90): 완전 정지는 심각한 정체 신호 — slow보다 높은 가중치
-    # bbox(0.35): 밀도 보조 신호 (sqrt 비선형으로 희소 구간 민감도 확보)
-    jam = (0.85 * slow_contribution                     # 순수 서행 비율
-           + 0.90 * stop_contribution                   # 완전 정지 비율 (강한 정체 신호)
+    # main(0.85): velocity_deficit(학습 후) 또는 slow_ratio(warmup)
+    # stop(0.90): 완전 정지 — 심각한 정체 신호
+    # bbox(0.35): 밀도 보조 신호
+    jam = (0.85 * main_contribution                     # 주 신호 (위치별 속도 부족률)
+           + 0.90 * stop_contribution                   # 완전 정지 비율
            + 0.35 * bbox_contribution)                  # 셀 점유율
 
     return _clip(jam, 0.0, 1.0)                         # [0, 1] 범위 클램프
