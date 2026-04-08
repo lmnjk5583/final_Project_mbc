@@ -29,22 +29,18 @@ def _clip(value: float, lo: float, hi: float) -> float:
 
 
 def compute_jam_score_fallback(x_t: dict) -> float:
-    """velocity_deficit·정지비율·셀점유율로 jam_score를 계산한다.
+    """slow_density·stop_ratio·nm_variance·bbox_coverage로 jam_score를 계산한다.
 
-    주 신호 선택 (우선순위):
-      1) velocity_deficit_ratio >= 0  → flow_map speed_ref 기반 위치별 속도 부족률
-         - SMOOTH 구간 실측으로 학습된 셀별 정상속도 대비 현재 감속 정도
-         - 카메라 각도·거리 무관하게 자동 보정
-      2) velocity_deficit_ratio == -1 → speed_ref 미학습 (warmup 초기)
-         - slow_ratio fallback: 고정 임계값(0.70) 기반
-
-    stop_ratio: 완전 정지 (nm_median < 0.06) — 주 신호와 독립 기여
-    bbox_coverage: 궤적 확인 차량의 셀 점유율
+    slow_density  = slow_ratio × √bbox_coverage
+                    차가 없어지면 0으로 수렴 — 밀도 없이 비율만 높은 오탐 방지
+    stop_ratio    = 완전 정지 비율 — 심각한 정체 신호
+    nm_variance   = nm 표준편차/slow_upper_nm — 속도 분산 (정체 시 혼재 패턴)
+    bbox_coverage = 셀 점유율 — 도로 밀도 신호
 
     설계 목표:
-      - 원활  (deficit=0.05, stop=0,    bbox=0.04): jam ≈ 0.09 → SMOOTH
-      - 서행  (deficit=0.50, stop=0.05, bbox=0.10): jam ≈ 0.52 → SLOW
-      - 정체  (deficit=0.80, stop=0.40, bbox=0.20): jam ≈ 1.0  → CONGESTED
+      - 원활 (slow_d=0.01, stop=0,    var=0.05, bbox=0.05): jam ≈ 0.05 → SMOOTH
+      - 서행 (slow_d=0.30, stop=0,    var=0.25, bbox=0.18): jam ≈ 0.72 → SLOW
+      - 정체 (slow_d=0.19, stop=0.30, var=0.40, bbox=0.22): jam ≈ 0.94 → CONGESTED
 
     Args:
         x_t: feature 벡터 dict.
@@ -52,29 +48,30 @@ def compute_jam_score_fallback(x_t: dict) -> float:
     Returns:
         jam_score (0.0~1.0).
     """
-    # ── 주 신호: slow_ratio ───────────────────────────────────────────
-    # velocity_deficit(vdr)은 SMOOTH 구간에서 speed_ref를 먼저 학습해야 동작하는데
-    # 서행/정체 영상에서는 SMOOTH 오분류로 서행 속도가 speed_ref에 오염돼
-    # vdr ≈ 0 → jam ≈ 0 악순환 발생 → slow_ratio를 주 신호로 고정
-    # (vdr 인프라는 유지 — 향후 원활 선행학습 시나리오에서 활용 가능)
-    main_contribution = _clip(x_t.get("slow_ratio", 0.0), 0.0, 1.0)
+    # ── slow_density: 속도×밀도 결합 주 신호 ─────────────────────────
+    slow_density = _clip(x_t.get("slow_density", 0.0), 0.0, 1.0)
 
-    # ── 정지 비율 기여 (주 신호와 독립) ──────────────────────────────
+    # ── 정지 비율 (독립 기여) ─────────────────────────────────────────
     stop_contribution = _clip(x_t.get("stop_ratio", 0.0), 0.0, 1.0)
 
-    # ── bbox 점유율 기여 — sqrt 비선형 변환 ──────────────────────────
+    # ── nm 분산 (정체 징후 보조) ──────────────────────────────────────
+    var_contribution = _clip(x_t.get("nm_variance_score", 0.0), 0.0, 1.0)
+
+    # ── bbox 점유율 — sqrt 비선형 변환 ───────────────────────────────
     raw_bbox = _clip(
         x_t.get("bbox_coverage", x_t.get("density_score", 0.0)), 0.0, 1.0
     )
     bbox_contribution = math.sqrt(raw_bbox)
 
-    # ── 가중 합산 ──────────────────────────────────────────────────────
-    # main(0.85): velocity_deficit(학습 후) 또는 slow_ratio(warmup)
-    # stop(0.90): 완전 정지 — 심각한 정체 신호
-    # bbox(0.35): 밀도 보조 신호
-    jam = (0.85 * main_contribution                     # 주 신호 (위치별 속도 부족률)
-           + 0.90 * stop_contribution                   # 완전 정지 비율
-           + 0.35 * bbox_contribution)                  # 셀 점유율
+    # ── 가중 합산 ─────────────────────────────────────────────────────
+    # slow_density(1.20): 속도×밀도 결합 주 신호 — 차 없을 때 자동 0
+    # stop(0.90):         완전 정지 — 심각한 정체 신호
+    # nm_variance(0.40):  속도 분산 — 정체 보조 신호
+    # bbox(0.60):         도로 밀도 — 속도 신호 약할 때 보완
+    jam = (1.20 * slow_density                          # 속도×밀도 주 신호
+           + 0.90 * stop_contribution                   # 완전 정지
+           + 0.40 * var_contribution                    # 속도 분산
+           + 0.60 * bbox_contribution)                  # 셀 점유율
 
     return _clip(jam, 0.0, 1.0)                         # [0, 1] 범위 클램프
 

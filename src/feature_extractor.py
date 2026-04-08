@@ -252,9 +252,11 @@ class FeatureExtractor:
         _hist_slow = 0                                     # 히스토리 전체 slow 관측 수
         _hist_stop = 0                                     # 히스토리 전체 stop 관측 수
         _hist_total = 0                                    # 히스토리 전체 관측 수
+        _all_nm_vals = []                                  # nm 분산 계산용 전체 관측값
         for _, _hist_q in self._nm_history.items():       # 모든 차량 히스토리 순회
             for _nm_h in _hist_q:                         # 해당 차량의 최근 nm 값들
                 _hist_total += 1
+                _all_nm_vals.append(_nm_h)
                 if _nm_h < norm_stop_thr:                  # 정지
                     _hist_stop += 1
                     _hist_slow += 1                        # 정지 ⊂ 서행
@@ -269,11 +271,29 @@ class FeatureExtractor:
             slow_ratio = 0.0
             stop_ratio = 0.0
 
+        # ── nm_variance: 속도 분산 (정체 징후 보조 신호) ─────────────
+        # 정체: 정지 차량 + 서행 차량 혼재 → nm 분산 높음
+        # 원활: 모든 차량 비슷한 속도 → nm 분산 낮음
+        # 정규화: slow_upper_nm 기준으로 [0, 1] 스케일
+        if len(_all_nm_vals) >= 4:                         # 최소 4관측 이상일 때만 신뢰
+            _nm_std = float(np.std(_all_nm_vals))          # nm 표준편차
+            nm_variance_score = float(np.clip(             # slow_upper_nm 기준 정규화
+                _nm_std / slow_upper_nm, 0.0, 1.0
+            ))
+        else:
+            nm_variance_score = 0.0                        # 관측 부족 → 0
+
+        # ── slow_density: 속도×밀도 결합 신호 ───────────────────────────
+        # slow_ratio만 쓰면 차가 없어져도 비율이 올라 jam 상승하는 역효과
+        # bbox_coverage(밀도)를 곱해 "얼마나 많은 차량이 느린가"를 단일 값으로
+        slow_density = slow_ratio * float(np.sqrt(bbox_coverage))  # 속도×밀도 결합
+
         # ── 디버그 출력 (30프레임마다) ───────────────────────────────
         if frame_num % 30 == 0:
             print(f"[FE] f={frame_num} known={speed_known_count} "
                   f"slow_r={slow_ratio:.3f} stop_r={stop_ratio:.3f} "
-                  f"bbox={bbox_coverage:.3f}")
+                  f"bbox={bbox_coverage:.3f} slow_d={slow_density:.3f} "
+                  f"nm_var={nm_variance_score:.3f}")
 
         # ── feature 딕셔너리 조립 ────────────────────────────────────
         return {                                       # feature 벡터
@@ -281,10 +301,12 @@ class FeatureExtractor:
             "nm_baseline_valid":     _nm_baseline_valid,     # baseline 준비 여부
             "stop_ratio":            stop_ratio,             # [1] 정지 비율 (nm_median < 0.06)
             "slow_ratio":            slow_ratio,             # [1.5] 순수 서행 비율 (정지 제외)
+            "slow_density":          slow_density,           # [1.6] 속도×밀도 결합 (차없을때 jam 상승 방지)
+            "nm_variance_score":     nm_variance_score,      # [1.7] nm 분산 (정체 징후 보조)
             "density_score":         density_score,          # [2] bbox_coverage 별칭 (하위 호환)
             "bbox_coverage":         bbox_coverage,          # [2] 도로 면적 대비 셀 점유율 (궤적확인 차량만)
             "velocity_deficit_ratio": velocity_deficit_ratio, # [2.5] 평균 속도 부족률 (-1=미학습)
             "deficit_count":         deficit_count,          # speed_ref 유효 차량 수
-            "vdr_ready":             _vdr_ready,             # warmup 완료 여부 (False→slow_ratio fallback)
+            "vdr_ready":             _vdr_ready,             # warmup 완료 여부
             "rule_jam_score":        0.0,                    # [3] jam_score (CJ 채움)
         }
