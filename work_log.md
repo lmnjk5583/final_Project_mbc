@@ -4,6 +4,63 @@
 
 ---
 
+## 2026-04-08 (75차 — jam_score 과도 상승 원인 수정 + 파일 정리) [수빈]
+
+### 오늘 한 작업
+
+**jam_score 근본 수정**
+- `reverse_detector.py`: `src/congestion_judge.py` 직접 import (웹 복사본 제거) → 대원 수정사항 자동 반영
+- `reverse_detector.py`: `n==0` 시 세 CongestionJudge 모두 `reset()` 호출 → 차량 0대 시 즉시 0.00
+- `reverse_modules/config.py`: `src/config.py` 와 jam_score 관련 파라미터 전체 동기화 (slow_upper_nm 등)
+- `reverse_detector.py`: nm 계산을 velocity_window 기반으로 수정 (traj[-3] → traj[-1×velocity_window])
+
+**경부선 초록선 복구**
+- `its.py` `highway_line()`: Overpass 실패 시 정적 fallback 좌표 반환 → 서버 재시작 후에도 선 표시
+
+**파일 정리 (미니프로젝트 잔재 제거)**
+- 삭제: `plate/`, `raspi/`, `streaming.py`, `simulation.py`, `fire_detector.py`
+- 삭제: 프론트 `plate/`, `raspi/`, `stats/`, `traffic/components/`, `traffic/hooks/`, `traffic/api.js`
+- `app.py`: 제거 모듈 import/register 정리
+- `its.py`: `fire_feed` 라우트 제거
+- `models.py`: `FireResult`, `ManualResult` 제거
+
+**DB 초기화**
+- `detection_results`, `reverse_results`, `fire_results`, `manual_results` 전부 TRUNCATE
+
+### 수정 파일
+`C:\finalPj_웹` —
+- `backend_flask/modules/traffic/detectors/reverse_detector.py`
+- `backend_flask/modules/traffic/detectors/reverse_modules/config.py`
+- `backend_flask/modules/traffic/its.py`
+- `backend_flask/app.py`
+- `backend_flask/models.py`
+
+### 발생 오류 / 확인 사항
+- jam_score 과도 상승 원인: ①웹 congestion_judge가 구버전 복사본 ②nm 2프레임 기반 계산 → 모든 차량 slow 분류 ③slow_upper_nm 웹 config 미동기화
+
+### 작업 재개 위치
+- 플라스크 재시작 후 CCTV 탐지 → jam_score 정상 범위 확인
+
+---
+
+## 2026-04-08 (74차 — cctv_state 키 불일치 버그픽스) [수빈]
+
+### 오늘 한 작업
+
+**CCTV 팝업 상태 미표시 버그 수정**
+- `reverse_detector.py`: `self.display_name` 추가 — cctv_name이 `{명칭}_reverse` 형태일 때 `_reverse` 접미사 제거
+- `its.py` `cctv_state()`: `{name}_reverse` 키 우선 조회, 없으면 `{name}` 시도
+
+### 수정 파일
+`C:\finalPj_웹` —
+- `backend_flask/modules/traffic/detectors/reverse_detector.py`
+- `backend_flask/modules/traffic/its.py`
+
+### 발생 오류 / 확인 사항
+- CCTV 팝업 열어도 방향별 jam 카드가 전부 0 → 키 불일치가 원인
+
+---
+
 ## 2026-04-07 (77~80차 — 상행선 서행 탐지 공정성 개선) [대원]
 
 ### 오늘 한 작업
@@ -21,69 +78,16 @@
 **velocity 기반 방향 분류 조기 적용 (3프레임~)**
 - 기존: flow_map 기반 → 상단 미학습 셀은 'a' fallback → 상행 차량 오분류
 - 신규: trajectory 3프레임 이상이면 속도 벡터 코사인으로 A/B 판정
-- velocity_window(20) 미만 구간도 조기 분류 가능 → 원거리 차량 tracks_b 포함률 향상
 
 **jam_score 가중치 재보정 (slow_upper_nm=2.5 기준)**
 - 기존: `0.80×slow + 0.70×stop + 0.35×sqrt(bbox)` → slow_ratio≈1.0 시 CONGESTED 오판
 - 신규: `0.29×slow + 0.25×stop + 0.20×sqrt(bbox) + 0.08×count`
-- 설계 목표: 원활→0.08, 서행→0.39, 정체→0.61
 
 **slow_upper_nm 임계값 상향 조정**
-- 실측 nm 분포: 서행(20~40 km/h) → nm ≈ 0.8~2.5 (avg=1.15)
-- `config.py`: `slow_upper_nm` 0.50 → 2.5, `nm_cy_correction_k` 0.6 → 0.0 (이중보정 비활성화)
-- `test_nm_live.py` 상수도 동기화
+- `config.py`: `slow_upper_nm` 0.50 → 2.5, `nm_cy_correction_k` 0.6 → 0.0
 
 ### 수정 파일
 `src/config.py`, `src/congestion_judge.py`, `src/detector.py`,
 `src/feature_extractor.py`, `src/traffic_analyzer.py`, `test_nm_live.py`
-
-### 발생 오류 / 확인 사항
-- 하행 SLOW→CONGESTED: slow_upper_nm 1.0 적용 시 slow_ratio≈1.0 → 구 공식 가중치 과도 → 가중치 재보정으로 해결
-- .pyc 캐시 오염 → `__pycache__` 전체 삭제로 해결
-
-### 작업 재개 위치
-- run_test.py 재실행 후 상행(B) jam_score SLOW(≥0.30) 확인
-- 상행 slow_ratio ≥ 0.6 달성 여부 실측 확인
-
----
-
-## 2026-04-07 (69차 — 웹 교통 정체 모니터링 UI 고도화) [수빈]
-
-### 오늘 한 작업
-
-**경부고속도로 실제 도로 형상 시각화 (Overpass OSM)**
-- VWorld 타일 제거 → CartoDB Positron 단일 레이어 (OSM 좌표 정합)
-- `/api/its/highway_line`: Overpass API 3-미러 fallback, 1312 세그먼트 캐시
-- simCenter 반경(0.35°) 내 세그먼트만 정체 색상, 나머지 초록 유지
-
-**CCTV 스트림 아키텍처 변경**
-- Nimble Streamer nimblesessionid IP-bound → 서버가 토큰 URL 반환, 브라우저 직접 연결
-- `/api/its/stream_cctv`: 전체 ITS 목록에서 name 검색 (20개 샘플 제거)
-
-**UI 정리**
-- 미사용 탭 전부 제거, "교통흐름모니터링" 단일 탭만 유지
-
-**YOLO 모델 연동**
-- `C:\final_pj\runs\yolo11n_v1\weights\best.pt` 연동 (reverse_detector.py)
-- CCTV 팝업: MJPEG 탐지 스트림 전폭 표시, HLS 제거
-
-**상행/하행 분리 jam_score**
-- `reverse_detector.py`: dx 부호로 상행(서울)/하행(부산) 분리, 방향별 EMA 계산
-- `shared/state.py`: `jam_up`, `jam_down`, `level_up`, `level_down`, `count_up`, `count_down` 추가
-- `carbon.py /status`: 6개 신규 필드 반환
-- `index.jsx`: `DirectionJamCard` 컴포넌트 — 상행/하행 카드 나란히 표시 (전체 jam 바·차량 대수 제거)
-- 지도 높이 600px, 팝업 오버레이 스크롤 가능
-
-### 수정 파일
-`C:\finalPj_웹` — state.py, carbon.py, its.py, reverse_detector.py, index.jsx, api.js, traffic/index.jsx, Sidebar.jsx
-
-### 발생 오류 / 확인 사항
-- Overpass Gateway Timeout → 3-mirror fallback으로 해결
-- nimblesessionid 400 → 브라우저 직접 연결로 해결
-- dx 기반 방향 판단: CCTV 촬영 방향에 따라 상행/하행 라벨 반전 가능 → 실차 테스트 필요
-
-### 작업 재개 위치
-- 상행/하행 라벨이 실제 촬영 방향과 맞는지 확인
-- `C:\finalPj_웹` 깃 업로드 예정 (현재 미업로드)
 
 ---

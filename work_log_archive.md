@@ -4,6 +4,45 @@
 
 ---
 
+## 2026-04-06 (73~76차 — normal mode 제거 + jam_score 밀도 보정 + 방향 분류 nearest-neighbor) [대원]
+
+### 오늘 한 작업 [대원] — 추가
+
+**B방향(상행) jam_score 저평가 원인 분석 및 수정**
+- 원인: flow_map 상단 rows 0~6 (y < 252px) 전체 미학습 → `get_interpolated` = None → 기본값 'a' → 상행 차량 전부 A방향으로 오분류
+- `flow_map.py`: `get_nearest_direction(x, y)` 추가 — count>0 셀 중 그리드 거리 최소 셀 벡터 반환 (20×20 브루트포스)
+- `detector.py._classify_direction`: `flow_v=None` 시 `get_nearest_direction` 호출 → 최종 None이면 'a' fallback
+
+**jam_score 공식 sqrt(bbox_coverage) 적용**
+- 최종: `0.80×slow + 0.70×stop + 0.35×sqrt(bbox_coverage)`
+
+### 수정 파일 [대원]
+`src/congestion_judge.py`, `src/flow_map.py`, `src/detector.py`
+
+---
+
+## 2026-04-06 (73~74차 — normal mode 제거 + jam_score 밀도 보정) [대원]
+
+**congestion_judge.py normal mode 전면 제거** (LCS 기반 → 항상 fallback 호출)
+**bbox_coverage 가중치**: 0.25 → 0.35, count_ratio 항 추가
+
+### 수정 파일 [대원]
+`src/congestion_judge.py`
+
+---
+
+## 2026-04-06 (68~72차 — 역주행 오탐 근본 재설계 + bbox_coverage + nm 테스트) [대원]
+
+**역주행 오탐 가드** — edge detection 방식, direction_change_cos_threshold=0.0
+**bbox_coverage** — density_score 대체
+**fallback jam_score**: `0.60×slow + 0.60×stop + 0.25×bbox_coverage`
+**nm 테스트**: `tests/test_nm_measurement.py`, `test_nm_live.py`
+
+### 수정 파일 [대원]
+`src/config.py`, `src/state.py`, `src/judge.py`, `src/id_manager.py`, `src/detector.py`, `src/feature_extractor.py`, `src/congestion_judge.py`
+
+---
+
 ## 2026-04-03 (67차 — 웹 탄소/정체 탭 설계 논의 + 벤치마킹)
 
 ### 오늘 한 작업 [수빈]
