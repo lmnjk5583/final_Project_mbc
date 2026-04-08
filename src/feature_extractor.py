@@ -61,10 +61,6 @@ class FeatureExtractor:
         # ── slow_ratio / stop_ratio EMA (프레임 간 비율 튐 흡수) ─────
         # 차량 출입으로 speed_known_count가 바뀌면 slow_ratio가 프레임마다 크게 달라짐
         # EMA로 스무딩해서 jam 계산에 안정된 값 전달
-        self._slow_ema: float = 0.0                    # slow_ratio EMA 누적값
-        self._stop_ema: float = 0.0                    # stop_ratio EMA 누적값
-        self._ratio_ema_alpha: float = 0.10            # EMA 속도 (0.20→0.10: 10프레임 평균 수준)
-        self._ratio_initialized: bool = False          # 첫 프레임 초기화 여부
 
     # ── 준비 신호 (학습 완료 후 호출) ────────────────────────────────
     def set_ready(self):
@@ -247,28 +243,31 @@ class FeatureExtractor:
             if old_tid not in speed_known_tids:            # 이번 프레임에 없는 차량
                 del self._nm_history[old_tid]              # 윈도우 삭제 (메모리 누수 방지)
 
-        # ── stop_ratio / slow_ratio 계산 + EMA 스무딩 ───────────────────
-        pure_slow_count = slow_count - stopped_count       # 순수 서행 (정지 제외)
-        if speed_known_count >= 2:                         # 차량 2대 이상 → 신뢰도 충분
-            _raw_stop = stopped_count / speed_known_count
-            _raw_slow = pure_slow_count / speed_known_count
-        else:                                              # 차량 0~1대 → 신호 불충분
-            _raw_stop = 0.0
-            _raw_slow = 0.0
+        # ── stop_ratio / slow_ratio: nm_history 전체 관측 집계 ──────────
+        # 문제: 이번 프레임 차량 수 기준 비율은 차량 출입마다 크게 달라짐
+        #   프레임 t  : 차량 8대 slow 8대 → 1.00
+        #   프레임 t+1: 차량 9대 slow 2대 → 0.22 (신규 7대 nm 히스토리 없음)
+        # 해결: nm_history 전체(차량별 최근 5프레임) 관측값 합산으로 비율 계산
+        #   차량 10대 × 5프레임 = 50관측 → 1대 출입 시 비율 변화 1/50 수준
+        _hist_slow = 0                                     # 히스토리 전체 slow 관측 수
+        _hist_stop = 0                                     # 히스토리 전체 stop 관측 수
+        _hist_total = 0                                    # 히스토리 전체 관측 수
+        for _, _hist_q in self._nm_history.items():       # 모든 차량 히스토리 순회
+            for _nm_h in _hist_q:                         # 해당 차량의 최근 nm 값들
+                _hist_total += 1
+                if _nm_h < norm_stop_thr:                  # 정지
+                    _hist_stop += 1
+                    _hist_slow += 1                        # 정지 ⊂ 서행
+                elif _nm_h < slow_upper_nm:                # 서행
+                    _hist_slow += 1
 
-        # EMA 스무딩: 차량 출입으로 비율이 프레임마다 크게 달라지는 현상 흡수
-        # alpha=0.20 → 약 5프레임 평균 수준의 안정화
-        if not self._ratio_initialized:                    # 첫 프레임 → 바로 설정
-            self._slow_ema = _raw_slow
-            self._stop_ema = _raw_stop
-            self._ratio_initialized = True
-        else:
-            a = self._ratio_ema_alpha
-            self._slow_ema = a * _raw_slow + (1 - a) * self._slow_ema
-            self._stop_ema = a * _raw_stop + (1 - a) * self._stop_ema
-
-        slow_ratio = self._slow_ema
-        stop_ratio = self._stop_ema
+        if _hist_total >= 2:                               # 최소 2관측 이상
+            _pure_slow_hist = _hist_slow - _hist_stop      # 순수 서행 관측 수
+            slow_ratio = _pure_slow_hist / _hist_total
+            stop_ratio = _hist_stop / _hist_total
+        else:                                              # 관측 없음
+            slow_ratio = 0.0
+            stop_ratio = 0.0
 
         # ── 디버그 출력 (30프레임마다) ───────────────────────────────
         if frame_num % 30 == 0:
