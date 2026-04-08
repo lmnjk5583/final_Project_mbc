@@ -233,24 +233,19 @@ class FeatureExtractor:
             if old_tid not in speed_known_tids:            # 이번 프레임에 없는 차량
                 del self._nm_history[old_tid]              # 윈도우 삭제 (메모리 누수 방지)
 
-        # ── 소표본 신뢰도 보정 ────────────────────────────────────────
-        # 차량 3대 미만이면 제곱 감쇠: 1대→0.11, 2대→0.44, 3대→1.0
-        # 5대 기준은 너무 강해 서행 구간(2~3대)에서 jam이 0.1대로 깎임
-        _MIN_RELIABLE = 3                                  # 신뢰 가능 최소 차량 수 (5→3)
-        if speed_known_count < _MIN_RELIABLE:
-            _reliability = (speed_known_count / _MIN_RELIABLE) ** 2  # 제곱 감쇠
-        else:
-            _reliability = 1.0                             # 충분한 차량 수 → 보정 없음
-
-        # ── stop_ratio: 정지 차량(nm_median < norm_stop_thr) 비율 ─────
-        # stop은 slow에서 분리 — 이중 증폭 방지
-        # (정지 차량은 slow_count에 포함하지 않음 → 공식에서 독립 기여)
-        pure_slow_count = slow_count - stopped_count       # 서행만 (정지 제외)
-        _raw_stop = stopped_count / max(speed_known_count, 1)
-        _raw_slow = pure_slow_count / max(speed_known_count, 1)  # 순수 서행 비율
-
-        stop_ratio = _raw_stop * _reliability              # 소표본 감쇠 적용
-        slow_ratio = _raw_slow * _reliability              # 소표본 감쇠 적용
+        # ── stop_ratio / slow_ratio 계산 ─────────────────────────────
+        # 소표본 감쇠 제거: bbox_coverage를 신규차량 제외로 이미 안정화했으므로
+        # ratio에 추가 감쇠를 걸면 서행 구간(2~3대)에서 jam이 0.1대로 깎히는 역효과
+        # 대신: speed_known_count < 2이면 slow/stop 신호 자체를 0으로 처리 (최소 guard)
+        #   → 차 1대만 있으면 신뢰도 부족 → slow/stop 기여 없음 (bbox만 반영)
+        #   → 차 2대 이상이면 비율 그대로 사용
+        pure_slow_count = slow_count - stopped_count       # 순수 서행 (정지 제외)
+        if speed_known_count >= 2:                         # 차량 2대 이상 → 신뢰도 충분
+            stop_ratio = stopped_count / speed_known_count
+            slow_ratio = pure_slow_count / speed_known_count
+        else:                                              # 차량 0~1대 → 신호 불충분
+            stop_ratio = 0.0                               # slow/stop 기여 차단
+            slow_ratio = 0.0                               # bbox만 반영됨
 
         # ── feature 딕셔너리 조립 ────────────────────────────────────
         return {                                       # feature 벡터
