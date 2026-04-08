@@ -34,7 +34,6 @@ cfg = DetectorConfig(
     conf=0.7,                                           # 검출 신뢰도 임계값
     grid_size=20,                                       # 20×20 Flow Map 그리드
     target_classes=None,                                # None이면 모든 클래스 탐지
-    enable_online_flow_update=True,                     # 정상 흐름 온라인 학습 활성
     detect_only=True,                                   # 기존 flow_map 로드 후 탐지 전용
     log_dir=LOG_DIR,                                    # 로그 저장 폴더
     flow_map_path=FLOW_MAP_PATH,                        # flow_map 저장/로드 경로

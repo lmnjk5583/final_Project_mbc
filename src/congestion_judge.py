@@ -29,82 +29,41 @@ def _clip(value: float, lo: float, hi: float) -> float:
 
 
 def compute_jam_score_fallback(x_t: dict) -> float:
-    """baseline 없이 서행비율·정지비율·밀도로 jam_score를 계산한다 (fallback 모드).
+    """서행비율·정지비율·밀도·차량수로 jam_score를 계산한다.
 
-    핵심 지표: slow_ratio (0.06 ≤ nm < 0.15 차량 비율).
-      기존 문제: norm_speed_ref=0.15 하드코딩 → 실제 고속도로 nm은 0.5~2.0이므로
-      norm_speed_ratio가 항상 1.0으로 clip → speed_contribution이 항상 0.
-      또한 stop_ratio(nm<0.06)만으로는 서행(nm=0.08~0.14) 감지 불가.
-      slow_ratio는 정지와 정상 주행 사이의 "서행 구간"을 직접 카운트하여
-      nm 기준값(norm_speed_ref) 의존 없이 서행을 감지한다.
+    핵심 지표: slow_ratio (norm_stop_threshold ≤ nm < slow_upper_nm 차량 비율).
 
-    설계 목표 (slow_upper_nm=1.0 기준 — 20~30 km/h 서행 포착):
-      - 원활  (slow=0,    stop=0,    cell_occ=0.04): jam ≈ 0.08 → SMOOTH
-      - 서행  (slow=0.80, stop=0.10, cell_occ=0.08): jam ≈ 0.39 → SLOW
-      - 정체  (slow=1.0,  stop=0.70, cell_occ=0.12): jam ≈ 0.61 → CONGESTED
-      - 극심  (slow=1.0,  stop=0.90, cell_occ=0.15): jam ≈ 0.67 → CONGESTED
-
-    가중치 (slow_upper_nm=1.0에 맞춰 재조정):
-      0.29 × slow_contribution — 서행 비율 (nm < 1.0). 1.0으로 올려도 CONGESTED 미초과
-      0.25 × stop_contribution — 정지 비율 (nm < 0.06). 0.70↑시 서행→정체 전환 핵심
-      0.20 × bbox_contribution — 셀 점유율 sqrt (cell occupancy, 원근 독립)
-      0.08 × count_contribution — 차량 수 (count_ref=8 대비)
-
-    유출(exit_rate_ratio) 미사용 이유:
-      fallback 모드에서 count_ref=15 고정값 기반 exit_rate_ratio는
-      실제 교통량과 무관하게 outflow_contribution을 과대 산출함 → 신뢰 불가.
-
-    norm_speed_ratio 미사용 이유:
-      fallback baseline의 norm_speed_ref=0.15는 임의 고정값.
-      실제 고속도로 nm은 0.5~2.0 → ratio가 항상 1.0으로 clip되어
-      speed_contribution이 0으로 무효화됨. slow_ratio가 직접 대체.
+    설계 목표:
+      - 원활  (slow=0,    stop=0,    bbox=0.04, count=0.2): jam ≈ 0.09 → SMOOTH
+      - 서행  (slow=0.60, stop=0.05, bbox=0.08, count=0.5): jam ≈ 0.55 → SLOW
+      - 정체  (slow=1.0,  stop=0.50, bbox=0.15, count=0.8): jam ≈ 1.39 → clip 1.0 → CONGESTED
 
     Args:
-        x_t: 8차원 feature 벡터 dict.
+        x_t: feature 벡터 dict.
 
     Returns:
         jam_score (0.0~1.0).
     """
-    # ── 서행 비율 기여 (0.06 ≤ nm < 0.50 차량 비율) ──────────────────
-    slow_contribution = _clip(                         # 서행 비율 (0~1)
-        x_t.get("slow_ratio", 0.0), 0.0, 1.0
-    )
+    # ── 서행 비율 기여 ────────────────────────────────────────────────
+    slow_contribution = _clip(x_t.get("slow_ratio", 0.0), 0.0, 1.0)
 
-    # ── 정지 비율 기여 (nm < 0.06 차량 비율) ──────────────────────────
-    stop_contribution = _clip(                         # 정지 비율 (0~1)
-        x_t["stop_ratio"], 0.0, 1.0
-    )
+    # ── 정지 비율 기여 (nm < norm_stop_threshold 차량 비율) ───────────
+    stop_contribution = _clip(x_t["stop_ratio"], 0.0, 1.0)
 
     # ── bbox 점유율 기여 — sqrt 비선형 변환 ──────────────────────────
-    # sqrt(bbox_coverage): 낮은 coverage를 증폭, 높은 coverage는 완만하게 반영
-    # 예) coverage=0.05 → sqrt=0.22(4.5×), coverage=0.35 → sqrt=0.59(1.7×)
-    # count_ref 같은 임의 기준값 없이 coverage 자체에서 밀도 신호를 키움
-    raw_bbox = _clip(                                  # coverage 원값 (0~1)
+    raw_bbox = _clip(
         x_t.get("bbox_coverage", x_t.get("density_score", 0.0)), 0.0, 1.0
     )
-    bbox_contribution = math.sqrt(raw_bbox)            # sqrt 변환 (0~1 유지)
+    bbox_contribution = math.sqrt(raw_bbox)
 
-    # ── 차량 수 기여 (count_ref=8 대비 비율, 1.0 상한) ──────────────
-    # 원거리 차량(B방향 상행)은 bbox가 작아 bbox_coverage만으로 밀도 반영 한계
-    # count_ratio로 차량 수 자체를 직접 반영 — count_ref=8 (실탐지 최대 대수 기준)
-    count_contribution = _clip(                        # 차량 수 비율 (0~1 상한)
-        x_t.get("count_ratio", 0.0), 0.0, 1.0
-    )
+    # ── 가중 합산 ──────────────────────────────────────────────────────
+    # count_contribution 제거: 차량 대수는 4차선 등 도로 폭에 따라 달라져 오판 유발
+    # bbox_coverage(셀 점유율)가 밀도를 더 공정하게 반영 → 비중 0.35→0.45로 증가
+    jam = (0.80 * slow_contribution                     # 서행 비율 80%
+           + 0.70 * stop_contribution                   # 정지 비율 70%
+           + 0.45 * bbox_contribution)                  # 셀 점유율 45% (count 흡수)
 
-    # ── 가중 합산 (slow 29% + stop 25% + cell_occ 20% + count 8%) ──────
-    # slow_upper_nm=1.0 기준: slow_ratio가 포화(1.0)되어도 CONGESTED 미초과
-    # 원활 (slow=0, stop=0, cell_occ=0.04→sqrt=0.20, count=0.5):
-    #   0 + 0 + 0.20×0.20 + 0.08×0.5 = 0.04+0.04 = 0.08 → SMOOTH
-    # 서행 (slow=0.80, stop=0.10, cell_occ=0.08→sqrt=0.28, count=1.0):
-    #   0.29×0.8 + 0.25×0.1 + 0.20×0.28 + 0.08 = 0.232+0.025+0.056+0.08 = 0.393 → SLOW
-    # 정체 (slow=1.0, stop=0.70, cell_occ=0.12→sqrt=0.35, count=1.0):
-    #   0.29 + 0.25×0.7 + 0.20×0.35 + 0.08 = 0.29+0.175+0.070+0.08 = 0.615 → CONGESTED
-    jam = (0.29 * slow_contribution                    # 서행 가중 29% (1.0→재조정: slow_ratio 포화 방지)
-           + 0.25 * stop_contribution                  # 정지 가중 25% (서행↔정체 전환 핵심)
-           + 0.20 * bbox_contribution                  # 셀 점유율 20% (cell occupancy, 원근 독립)
-           + 0.08 * count_contribution)                # 차량 수 비율 8% (count_ref=8)
-
-    return _clip(jam, 0.0, 1.0)                        # [0, 1] 범위 클램프
+    return _clip(jam, 0.0, 1.0)                         # [0, 1] 범위 클램프
 
 
 # ======================================================================
@@ -172,7 +131,7 @@ class CongestionJudge:
         self._last_jam_score = 0.0                     # jam_score 초기화
 
     # ── 기준선 설정 ──────────────────────────────────────────────────
-    def set_baseline(self, _baseline=None):
+    def set_baseline(self):
         """학습 완료 신호를 받아 EMA를 중립값(0.5)으로 초기화한다.
 
         EMA 초기값을 0.0이 아닌 0.5로 설정하는 이유:
@@ -180,9 +139,6 @@ class CongestionJudge:
           - 0.5 시작 시 원활이면 즉시 차감되어 0.1~0.2로 내려가고,
             정체이면 즉시 증가하여 0.7~0.9로 올라감
           - 학습 직후 "중립 → 실제 상태" 방향으로 빠르게 수렴
-
-        Args:
-            baseline: 무시됨 (fallback 전용 — BaselineStats 불필요).
         """
         self._baseline_set = True                      # 학습 완료 표시
         self._ema_jam = 0.5                            # EMA 중립값으로 초기화 (학습 직후 빠른 수렴)

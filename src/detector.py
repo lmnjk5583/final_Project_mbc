@@ -1,11 +1,9 @@
 # 파일 경로: 최종 프로젝트/src/detector.py
 # 역할: 모든 모듈을 조립하고 run() 루프를 실행하는 메인 오케스트레이터.
-#        TrafficAnalyzer + PassageTracker 연동 추가 (정체 탐지 결과 매 프레임 갱신)
 
 import cv2                                          # OpenCV — 영상 입출력·시각화
 import numpy as np                                  # 수치 계산
 import time                                         # FPS 측정용 타이머
-from copy import copy                               # fallback baseline 방향별 독립 복사용
 
 from .config import DetectorConfig                  # 모든 파라미터가 담긴 설정 클래스
 from .state import DetectorState                    # 프레임 번호·궤적·역주행 카운트 등 런타임 상태
@@ -17,8 +15,6 @@ from .camera_switch import CameraSwitchDetector     # 장면/카메라 전환 �
 from .visualizer import Visualizer                  # 시각화(박스/궤적/패널/디버그)
 from .logger import CSVLogger                       # 프레임/트랙/이벤트 CSV 로그 저장
 from .traffic_analyzer import TrafficAnalyzer, CongestionPredictor  # 정체 탐지 + 단기 예측
-from passage_tracker import PassageTracker          # 차량 진입·퇴장 기록 + baseline 산출
-from baseline_stats import BaselineStats           # fallback baseline 생성용
 
 # GRUModule: PyTorch 없는 환경에서도 동작하도록 try/except
 try:
@@ -43,10 +39,6 @@ class Detector:
         self.switch = CameraSwitchDetector(cfg)                     # 카메라 전환 감지기
         self.vis = Visualizer(cfg, self.state, self.flow)           # 시각화 모듈
         self.logger = CSVLogger(cfg.log_dir) if cfg.log_dir else None  # CSV 로거 (log_dir 없으면 None)
-        # ── 메인 PassageTracker (학습 시 on_entry/on_exit 전담) ────────
-        self.passage_tracker = PassageTracker(cfg, self.state)      # 차량 진입·퇴장 기록 관리
-
-
         # ── 방향별 GRU/TrafficAnalyzer/Predictor (run()에서 초기화) ──
         # frame 크기(fw, fh)와 fps는 run()에서 영상을 열어야 확정되므로
         # __init__ 시점에서는 None으로 두고 run() 진입 직후 초기화한다.
@@ -66,16 +58,12 @@ class Detector:
         self._valid_cells_b: int = 1                                # B방향 유효 셀 수
 
         # ── flow_map 로드 (탐지 전용이라면 필수) ────────────────────
-        self._saved_baseline = None                                 # 파일에서 불러온 baseline (없으면 None)
-
         if cfg.flow_map_path:                                       # flow_map 경로가 설정되어 있으면
             if not cfg.detect_only:                                 # 학습 모드이면 기존 파일 무시하고 재학습
                 self.state.is_learning = True                       # 학습 모드로 전환
                 print("detect_only=False → 기존 flow_map 무시, 처음부터 학습 시작")
             else:                                                   # 탐지 전용이면 기존 파일 로드
-                loaded, self._saved_baseline = self.flow.load(     # 튜플 언패킹: (성공여부, baseline)
-                    cfg.flow_map_path
-                )
+                loaded = self.flow.load(cfg.flow_map_path)          # bool 반환
                 if not loaded:                                      # 탐지 전용인데 로드 실패
                     raise FileNotFoundError(                        # 즉시 예외 → 잘못된 실험 방지
                         f"detect_only=True 인데 flow_map이 없습니다: {cfg.flow_map_path}"
@@ -215,6 +203,14 @@ class Detector:
         if _GRU_AVAILABLE:                                          # PyTorch·gru_module 사용 가능이면
             self.gru_module_a = GRUModule(cfg)                      # A방향 GRU 예측 모듈
             self.gru_module_b = GRUModule(cfg)                      # B방향 GRU 예측 모듈
+            # ── 저장된 weights 로드 (flow_map 같은 폴더) ──────────────
+            if cfg.flow_map_path:
+                _gru_a_path = cfg.flow_map_path.parent / "gru_a.pt"
+                _gru_b_path = cfg.flow_map_path.parent / "gru_b.pt"
+                if _gru_a_path.exists() and self.gru_module_a.load(_gru_a_path):
+                    print(f"🧠 GRU-A weights 로드 완료: {_gru_a_path}")
+                if _gru_b_path.exists() and self.gru_module_b.load(_gru_b_path):
+                    print(f"🧠 GRU-B weights 로드 완료: {_gru_b_path}")
             print("🧠 GRUModule ×2 초기화 완료 (방향별 Phase 2 모드)")
         else:                                                       # 없으면 Phase 1 모드로 동작
             print("ℹ️  GRUModule 없음 → Phase 1 모드로 동작")
@@ -238,27 +234,13 @@ class Detector:
         self.predictor_a = CongestionPredictor(cfg, fps=fps)        # A방향 정체 예측
         self.predictor_b = CongestionPredictor(cfg, fps=fps)        # B방향 정체 예측
 
-        # ── 정체 탐지 baseline 설정 — 항상 fallback 모드 (density + stop + dwell 기반) ──
-        # norm_speed_ref 등 카메라 종속 값 불필요. LCS=default_lcs로 임계값만 보정.
-        # flow_map은 역주행 탐지 전용으로만 사용하며 정체 판정 기준으로 쓰지 않는다.
-        _fb = BaselineStats(                                        # fallback baseline 생성
-            free_flow_dwell=90.0,                                  # dwell_ratio 계산 기준 (원활 차량 기준 체류: 3초×30fps=90f)
-            typical_dwell=180.0,                                   # 미사용 (참조용)
-            norm_speed_ref=0.15,                                   # 미사용
-            count_ref=8.0,                                         # fallback 방향당 기준 차량 수 (실탐지 최대 대수 기준, 15→8)
-            bbox_slope=0.0,                                        # 미사용
-            bbox_intercept=50.0,                                   # 미사용
-            lcs=cfg.default_lcs,                                   # 한강 측정값 0.36 — 임계값 보정에만 사용
-            quality_warning=False,
-            passage_count=0,
-            is_fallback=True,                                      # fallback → stop_ratio + density 기반 jam 계산
-        )
-        self.traffic_analyzer_a.set_baseline(_fb)                  # A방향 baseline 설정
-        self.traffic_analyzer_b.set_baseline(copy(_fb))            # B방향 baseline 설정
+        # ── 정체 탐지 활성화 ──────────────────────────────────────────────
+        self.traffic_analyzer_a.set_baseline()                     # A방향 FE+CJ 활성화
+        self.traffic_analyzer_b.set_baseline()                     # B방향 FE+CJ 활성화
         if not st.is_learning:                                     # 탐지 전용이면 flow_map 로드됨 → 기준 방향 계산
             self._compute_ref_direction()
             self._compute_direction_cell_counts()                  # 방향별 셀 수 계산 → TA 주입
-        print(f"✅ 정체 탐지 baseline 설정 완료 (fallback 모드, LCS={cfg.default_lcs})")
+        print("✅ 정체 탐지 활성화 완료")
 
         save_path = self._get_next_filename()                       # 결과 저장 파일명
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")                    # mp4 인코더 설정
@@ -276,9 +258,8 @@ class Detector:
         self._gru_feature_history_b = []                             # B방향 GRU pretrain용 feature 누적
 
         # ── 학습 연장 상한 계산 ──────────────────────────────────────
-        # learning_frames 도달 후에도 min_passages_required 미달이면 최대 학습 연장
         max_learning_frames = int(                                  # 최대 학습 프레임 수
-            cfg.learning_frames * cfg.max_learning_extension        # 기본 × 1.5 = 750프레임
+            cfg.learning_frames * cfg.max_learning_extension        # 기본 × 1.5
         )
 
         # ── 개선 2: 중간 평활화 플래그 (80%/95% 시점 정확히 1회씩) ─────
@@ -317,12 +298,6 @@ class Detector:
             for t in tracks:                                        # 각 트랙 순회
                 if t["id"] not in st.first_seen_frame:              # 처음 보는 ID이면
                     st.first_seen_frame[t["id"]] = st.frame_num     # 등장 프레임 기록
-                    # footpoint: bbox 중앙 (x 중심, y 중심)
-                    entry_fx = (t["x1"] + t["x2"]) / 2             # 진입 footpoint x (bbox 중심)
-                    entry_fy = (t["y1"] + t["y2"]) / 2             # 진입 footpoint y (bbox 중심)
-                    self.passage_tracker.on_entry(                  # 진입 기록
-                        t["id"], entry_fx, entry_fy, st.frame_num
-                    )
 
             # 현재 프레임 시간(초) = frame / fps
             time_sec = st.frame_num / st.video_fps                  # 영상 타임라인 시간
@@ -375,7 +350,6 @@ class Detector:
                 if self.switch.check(frame, st.frame_num, st.cooldown_until):  # 전환 감지되면
                     st.reset_for_relearn()                          # 상태 초기화
                     self.flow.reset()                               # flow_map 초기화
-                    self.passage_tracker.reset()                    # 메인 PT 초기화 (재학습 시작)
                     self.traffic_analyzer_a.congestion_judge.reset()  # A방향 EMA·히스테리시스 초기화
                     self.traffic_analyzer_b.congestion_judge.reset()  # B방향 EMA·히스테리시스 초기화
                     if self.gru_module_a is not None:               # A방향 GRU 있으면
@@ -418,13 +392,9 @@ class Detector:
                 relearn_max = int(                                  # 재학습 최대 프레임
                     cfg.relearn_frames * cfg.max_learning_extension
                 )
-                enough_passages = (                                 # passage 조건
-                    self.passage_tracker.get_completed_count()
-                    >= cfg.min_passages_required
-                )
                 relearn_done = (
-                    (elapsed >= cfg.relearn_frames and enough_passages)
-                    or elapsed >= relearn_max                       # 강제 종료
+                    elapsed >= cfg.relearn_frames                  # 프레임 수 기반 종료
+                    or elapsed >= relearn_max                      # 강제 종료
                 )
                 if relearn_done:                                    # 재학습 완료이면
                     self.flow.apply_spatial_smoothing(verbose=True) # 공간 보정 (상세 진단)
@@ -488,9 +458,16 @@ class Detector:
                     self.idm.check_reappear(tid, cx, cy)            # 재매칭 시도
 
                 # 궤적에 현재 위치 추가 — 첫 등장 3프레임은 YOLO 초기 bbox가 불안정하므로 건너뜀
+                # EMA 스무딩 적용: bbox jitter가 velocity 벡터에 미치는 영향 완화
+                # alpha=0.4: 현재 40% + 직전 60% → 갑작스러운 위치 튐을 흡수
                 _age = st.frame_num - st.first_seen_frame.get(tid, st.frame_num)  # 트랙 경과 프레임
                 if _age >= 3:                                        # 3프레임 이상 된 트랙만 궤적 추가
-                    st.trajectories[tid].append((fx, fy))           # footpoint(중심점) 기준 궤적 추가
+                    _traj_cur = st.trajectories[tid]
+                    if _traj_cur:                                    # 이전 점이 있으면 EMA 스무딩
+                        _px, _py = _traj_cur[-1]
+                        fx = 0.4 * fx + 0.6 * _px                  # x EMA (현재 40% + 직전 60%)
+                        fy = 0.4 * fy + 0.6 * _py                  # y EMA
+                    st.trajectories[tid].append((fx, fy))           # 스무딩된 footpoint 추가
                 if len(st.trajectories[tid]) > cfg.trail_length:    # 최대 길이 초과 시
                     st.trajectories[tid].pop(0)                     # 오래된 궤적 제거
 
@@ -555,16 +532,6 @@ class Detector:
                             is_wrong, _, debug_info = self.judge.check(
                                 tid, traj, ndx, ndy, mag, cy, _bbox_h
                             )
-
-                            # 역주행 의심이 전혀 없으면 정상 흐름으로 온라인 학습
-                            if (cfg.enable_online_flow_update and
-                                    (not is_wrong) and
-                                    (st.wrong_way_count[tid] == 0)):
-                                self.flow.learn_step(               # 흐름장 업데이트 (footpoint 기준)
-                                    traj[-cfg.velocity_window][0],
-                                    traj[-cfg.velocity_window][1],
-                                    fx, fy, _learn_min_mag          # nm 기반 min_move (학습과 동일 기준)
-                                )
 
                             # 역주행 확정 시 라벨 부여
                             if is_wrong and tid in st.wrong_way_ids:
@@ -666,7 +633,6 @@ class Detector:
 
             # ── 이번 프레임에서 사라진 차량 처리 (on_exit) ──────────────
             gone_ids = prev_active_ids - active_ids                 # 이전 프레임에 있었지만 지금 없는 ID
-            exit_count = len(gone_ids)                              # 퇴장 차량 수 (전체)
             exit_count_a = 0                                        # A방향 퇴장 수
             exit_count_b = 0                                        # B방향 퇴장 수
 
@@ -678,18 +644,9 @@ class Detector:
                 else:                                               # B방향이면
                     exit_count_b += 1                               # B 퇴장 수 증가
 
-                fp = last_footpoints.pop(gone_id, None)             # 마지막 footpoint 꺼냄
-                if fp is not None:                                  # footpoint 기록 있으면
-                    self.passage_tracker.on_exit(                   # 정상 퇴장 기록 (메인 PT)
-                        gone_id, fp[0], fp[1], st.frame_num, is_complete=True
-                    )
-                else:                                               # 기록 없으면 entry_positions 활용
-                    ep = st.entry_positions.get(gone_id, (0.0, 0.0))  # 진입 위치 fallback
-                    self.passage_tracker.on_exit(                   # 비정상 퇴장 기록 (메인 PT)
-                        gone_id, ep[0], ep[1], st.frame_num, is_complete=False
-                    )
+                last_footpoints.pop(gone_id, None)                  # footpoint 기록 정리
 
-            # ── PassageTracker 프레임별 통계 수집 (방향별 분리) ──────────
+            # ── 방향별 차량 분리 (정체 탐지용) ──────────────────────────
             norm_mags_all = []                                      # 전체 normalized_mag (학습용)
             cy_vals_all = []                                        # 전체 cy (학습용)
             bbox_h_vals_all = []                                    # 전체 bbox_h (학습용)
@@ -719,22 +676,16 @@ class Detector:
                     cy_vals_a.append(cy_val)
                     bbox_h_vals_a.append(bh)
                     tracks_a.append(t)                              # A방향 차량 목록
-                    if mag_val is not None:                         # 신규 제외 — feature_extractor가 None=신규로 구분
+                    if mag_val is not None:                         # 속도 있으면
                         speeds_a[tid_val] = mag_val                 # A방향 속도 딕셔너리
                 else:                                               # B방향이면
                     norm_mags_b.append(nm)                          # B방향 통계 추가
                     cy_vals_b.append(cy_val)
                     bbox_h_vals_b.append(bh)
                     tracks_b.append(t)                              # B방향 차량 목록
-                    if mag_val is not None:                         # 신규 제외
+                    if mag_val is not None:                         # 속도 있으면
                         speeds_b[tid_val] = mag_val                 # B방향 속도 딕셔너리
 
-            if st.is_learning or st.relearning:                     # 학습/재학습 모드
-                self.passage_tracker.record_frame_stats(            # 메인 PT에 전체 통계
-                    active_count=len(tracks), exit_count=exit_count,
-                    norm_mags=norm_mags_all, cy_vals=cy_vals_all,
-                    bbox_h_vals=bbox_h_vals_all
-                )
             # ── 이전 프레임 활성 ID 갱신 ─────────────────────────────────
             prev_active_ids = active_ids.copy()                     # 다음 프레임 비교용으로 저장
 
@@ -769,6 +720,10 @@ class Detector:
                         print(f"🧠 GRU-A pretrain 완료: loss {losses_a[0]:.4f}→{losses_a[-1]:.4f}")
                     self._gru_pretrain_pending_a = False
                     self._gru_feature_history_a = []
+                    if cfg.flow_map_path:                           # weights 저장
+                        _save_a = cfg.flow_map_path.parent / "gru_a.pt"
+                        if self.gru_module_a.save(_save_a):
+                            print(f"💾 GRU-A weights 저장: {_save_a}")
 
                 # ── GRU pretrain 실행 (B방향) ────────────────────────────
                 if (self._gru_pretrain_pending_b
@@ -779,6 +734,10 @@ class Detector:
                         print(f"🧠 GRU-B pretrain 완료: loss {losses_b[0]:.4f}→{losses_b[-1]:.4f}")
                     self._gru_pretrain_pending_b = False
                     self._gru_feature_history_b = []
+                    if cfg.flow_map_path:                           # weights 저장
+                        _save_b = cfg.flow_map_path.parent / "gru_b.pt"
+                        if self.gru_module_b.save(_save_b):
+                            print(f"💾 GRU-B weights 저장: {_save_b}")
 
                 # ── GRU online_step: 각 방향 SMOOTH일 때 학습 ────────────
                 if self.gru_module_a is not None:                   # A방향 GRU 있으면
@@ -807,8 +766,7 @@ class Detector:
             # 학습 중이면 화면 상단에 학습 진행률 표시
             if st.is_learning:                                      # 초기 학습 모드이면
                 progress = min(100, st.frame_num / max(cfg.learning_frames, 1) * 100)  # 진행률 (%)
-                passages = self.passage_tracker.get_completed_count()  # 완성 passage 수
-                cv2.putText(frame, f"LEARNING FLOW MAP: {progress:.0f}%  (passage={passages})",
+                cv2.putText(frame, f"LEARNING FLOW MAP: {progress:.0f}%",
                             (fw // 2 - 240, 40),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 200, 100), 2, cv2.LINE_AA)
 
