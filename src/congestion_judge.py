@@ -64,14 +64,21 @@ def compute_jam_score_fallback(x_t: dict) -> float:
     bbox_contribution = math.sqrt(raw_bbox)
 
     # ── 가중 합산 ─────────────────────────────────────────────────────
-    # slow_density(1.20): 속도×밀도 결합 주 신호 — 차 없을 때 자동 0
+    # slow_density(1.30): 속도×밀도 결합 주 신호 — 차 없을 때 자동 0
     # stop(0.90):         완전 정지 — 심각한 정체 신호
-    # nm_variance(0.40):  속도 분산 — 정체 보조 신호
-    # bbox(0.60):         도로 밀도 — 속도 신호 약할 때 보완
-    jam = (1.20 * slow_density                          # 속도×밀도 주 신호
+    # nm_variance(0.25):  속도 분산 보조 — 원활 구간 noise 억제로 0.40→0.25
+    # bbox(0.30):         도로 밀도 보조 — 원활(bbox≈0.15)에서 0.12 기여로 제한
+    #
+    # 원활 검증 (slow_d=0.01, stop=0, var=0.05, bbox=0.15):
+    #   jam = 1.30×0.01 + 0 + 0.25×0.05 + 0.30×√0.15 = 0.013+0.012+0.116 = 0.14 → SMOOTH
+    # 서행 검증 (slow_d=0.30, stop=0, var=0.25, bbox=0.18):
+    #   jam = 1.30×0.30 + 0 + 0.25×0.25 + 0.30×√0.18 = 0.390+0.063+0.127 = 0.58 → SLOW
+    # 정체 검증 (slow_d=0.19, stop=0.30, var=0.40, bbox=0.22):
+    #   jam = 1.30×0.19 + 0.90×0.30 + 0.25×0.40 + 0.30×√0.22 = 0.247+0.270+0.100+0.141 = 0.76 → CONGESTED
+    jam = (1.30 * slow_density                          # 속도×밀도 주 신호
            + 0.90 * stop_contribution                   # 완전 정지
-           + 0.40 * var_contribution                    # 속도 분산
-           + 0.60 * bbox_contribution)                  # 셀 점유율
+           + 0.25 * var_contribution                    # 속도 분산 보조
+           + 0.30 * bbox_contribution)                  # 셀 점유율 보조
 
     return _clip(jam, 0.0, 1.0)                         # [0, 1] 범위 클램프
 
