@@ -52,17 +52,12 @@ def compute_jam_score_fallback(x_t: dict) -> float:
     Returns:
         jam_score (0.0~1.0).
     """
-    # ── 주 신호: velocity_deficit 또는 slow_ratio fallback ───────────
-    # vdr_ready=True (warmup 150프레임 완료) + vdr>=0 일 때만 vdr 사용
-    # 조건 미충족이면 slow_ratio fallback — 오염된 speed_ref 차단
-    _vdr = x_t.get("velocity_deficit_ratio", -1.0)
-    _vdr_ready = x_t.get("vdr_ready", False)
-    if _vdr_ready and _vdr >= 0.0:                      # warmup 완료 + 학습된 셀 존재
-        main_contribution = _clip(_vdr, 0.0, 1.0)      # 위치별 속도 부족률
-    else:                                               # warmup 중 또는 미학습 → fallback
-        main_contribution = _clip(
-            x_t.get("slow_ratio", 0.0), 0.0, 1.0
-        )
+    # ── 주 신호: slow_ratio ───────────────────────────────────────────
+    # velocity_deficit(vdr)은 SMOOTH 구간에서 speed_ref를 먼저 학습해야 동작하는데
+    # 서행/정체 영상에서는 SMOOTH 오분류로 서행 속도가 speed_ref에 오염돼
+    # vdr ≈ 0 → jam ≈ 0 악순환 발생 → slow_ratio를 주 신호로 고정
+    # (vdr 인프라는 유지 — 향후 원활 선행학습 시나리오에서 활용 가능)
+    main_contribution = _clip(x_t.get("slow_ratio", 0.0), 0.0, 1.0)
 
     # ── 정지 비율 기여 (주 신호와 독립) ──────────────────────────────
     stop_contribution = _clip(x_t.get("stop_ratio", 0.0), 0.0, 1.0)
