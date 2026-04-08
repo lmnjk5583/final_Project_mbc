@@ -54,6 +54,12 @@ class FeatureExtractor:
         self._NM_WIN: int = 5                          # 윈도우 크기 (프레임)
         self._nm_history: dict = {}                    # {tid: deque([nm, ...], maxlen=5)}
 
+        # ── velocity_deficit 세션 warmup 카운터 ──────────────────────
+        # speed_ref는 세션 시작 시 리셋되므로 충분한 SMOOTH 데이터가 쌓일 때까지
+        # vdr를 신뢰하지 않고 slow_ratio fallback 사용
+        self._speed_ref_warmed_frames: int = 0         # vdr 유효 프레임 누적 수
+        self._SPEED_REF_WARMUP: int = 150              # 이 값 이상이면 vdr 신뢰 (약 5초@30fps)
+
     # ── 준비 신호 (학습 완료 후 호출) ────────────────────────────────
     def set_ready(self):
         """학습 완료 신호. 이후 compute()가 feature 벡터를 반환한다."""
@@ -219,14 +225,16 @@ class FeatureExtractor:
         ))
 
         # ── velocity_deficit_ratio 집계 ──────────────────────────────
-        # speed_ref가 학습된 셀에 있는 차량들만 대상
-        # deficit_ratio = 평균 velocity_deficit (0=전원 정상, 1=전원 완전정지)
-        # speed_ref 미학습 구간(warmup 초기) → deficit_count=0 → fallback으로 slow_ratio 사용
         _deficit_vals = list(speed_known_tids_deficit.values())
         deficit_count = len(_deficit_vals)             # speed_ref 유효 차량 수
-        velocity_deficit_ratio = (                     # 평균 deficit (0~1)
+        velocity_deficit_ratio = (
             float(np.mean(_deficit_vals)) if deficit_count > 0 else -1.0
-        )                                              # -1 = speed_ref 미학습 (fallback 신호)
+        )                                              # -1 = speed_ref 미학습
+
+        # 세션 warmup: deficit_count > 0인 프레임을 누적, 임계값 이상이면 vdr 신뢰
+        if deficit_count > 0:
+            self._speed_ref_warmed_frames += 1
+        _vdr_ready = self._speed_ref_warmed_frames >= self._SPEED_REF_WARMUP
 
         # ── nm_history 만료 처리: 이번 프레임에 없는 tid 제거 ────────
         for old_tid in list(self._nm_history.keys()):
@@ -247,6 +255,15 @@ class FeatureExtractor:
             stop_ratio = 0.0                               # slow/stop 기여 차단
             slow_ratio = 0.0                               # bbox만 반영됨
 
+        # ── 디버그 출력 (30프레임마다) ───────────────────────────────
+        if frame_num % 30 == 0:
+            _vdr_str = f"{velocity_deficit_ratio:.3f}" if velocity_deficit_ratio >= 0 else "N/A"
+            _src = "vdr" if (_vdr_ready and velocity_deficit_ratio >= 0) else "slow_r(fallback)"
+            print(f"[FE] f={frame_num} known={speed_known_count} "
+                  f"slow_r={slow_ratio:.3f} stop_r={stop_ratio:.3f} "
+                  f"bbox={bbox_coverage:.3f} vdr={_vdr_str}(rdy={_vdr_ready}) "
+                  f"src={_src} warm={self._speed_ref_warmed_frames}/{self._SPEED_REF_WARMUP}")
+
         # ── feature 딕셔너리 조립 ────────────────────────────────────
         return {                                       # feature 벡터
             "norm_speed_ratio":      norm_speed_ratio,       # [0] 속도 비율 (자기보정 baseline 기준)
@@ -257,5 +274,6 @@ class FeatureExtractor:
             "bbox_coverage":         bbox_coverage,          # [2] 도로 면적 대비 셀 점유율 (궤적확인 차량만)
             "velocity_deficit_ratio": velocity_deficit_ratio, # [2.5] 평균 속도 부족률 (-1=미학습)
             "deficit_count":         deficit_count,          # speed_ref 유효 차량 수
+            "vdr_ready":             _vdr_ready,             # warmup 완료 여부 (False→slow_ratio fallback)
             "rule_jam_score":        0.0,                    # [3] jam_score (CJ 채움)
         }

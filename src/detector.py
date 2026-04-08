@@ -68,6 +68,7 @@ class Detector:
                     raise FileNotFoundError(                        # 즉시 예외 → 잘못된 실험 방지
                         f"detect_only=True 인데 flow_map이 없습니다: {cfg.flow_map_path}"
                     )
+                self.flow.speed_ref[:] = 0                          # 이전 세션 오염 방지 — 항상 리셋
                 self.state.is_learning = False                      # 로드 성공 → 학습 모드 해제
         else:                                                       # flow_map_path가 None
             if cfg.detect_only:                                     # 탐지 전용인데 경로 자체가 없음

@@ -53,11 +53,14 @@ def compute_jam_score_fallback(x_t: dict) -> float:
         jam_score (0.0~1.0).
     """
     # ── 주 신호: velocity_deficit 또는 slow_ratio fallback ───────────
-    _vdr = x_t.get("velocity_deficit_ratio", -1.0)     # -1=미학습
-    if _vdr >= 0.0:                                     # speed_ref 학습된 셀 존재
-        main_contribution = _clip(_vdr, 0.0, 1.0)      # 위치별 속도 부족률 (0=정상, 1=완전정지)
-    else:                                               # speed_ref 미학습 → fallback
-        main_contribution = _clip(                      # slow_ratio 기반 fallback
+    # vdr_ready=True (warmup 150프레임 완료) + vdr>=0 일 때만 vdr 사용
+    # 조건 미충족이면 slow_ratio fallback — 오염된 speed_ref 차단
+    _vdr = x_t.get("velocity_deficit_ratio", -1.0)
+    _vdr_ready = x_t.get("vdr_ready", False)
+    if _vdr_ready and _vdr >= 0.0:                      # warmup 완료 + 학습된 셀 존재
+        main_contribution = _clip(_vdr, 0.0, 1.0)      # 위치별 속도 부족률
+    else:                                               # warmup 중 또는 미학습 → fallback
+        main_contribution = _clip(
             x_t.get("slow_ratio", 0.0), 0.0, 1.0
         )
 
