@@ -1,7 +1,8 @@
 # 파일 경로: C:\final_pj\src\feature_extractor.py
 # 역할: 매 프레임 tracks+speeds를 받아 feature 벡터를 산출한다.
-# 의존성: numpy(서드파티)
+# 의존성: numpy(서드파티), collections(표준)
 
+import collections                                     # deque — tid별 nm 슬라이딩 윈도우
 import numpy as np                                     # clip, mean 등 수치 연산
 
 
@@ -13,15 +14,15 @@ class FeatureExtractor:
     """매 프레임 tracks·speeds를 받아 정체 판정용 feature 벡터를 산출한다.
 
     feature 벡터:
-    ┌─────┬───────────────────┬──────────────────────────────────────────────┐
-    │ idx │ 이름              │ 계산식                                       │
-    ├─────┼───────────────────┼──────────────────────────────────────────────┤
-    │  0  │ norm_speed_ratio  │ median(upper_50%_nm) / self-calibrating ref │
-    │  1  │ stop_ratio        │ (nm<0.06 차량) / speed_known_count          │
-    │ 1.5 │ slow_ratio        │ (0.06≤nm<0.50 차량) / speed_known_count     │
-    │  2  │ density_score     │ occupied_cells / valid_cell_count            │
-    │  3  │ rule_jam_score    │ 0.0 (congestion_judge가 채워넣음)            │
-    └─────┴───────────────────┴──────────────────────────────────────────────┘
+    ┌─────┬───────────────────┬──────────────────────────────────────────────────────┐
+    │ idx │ 이름              │ 계산식                                               │
+    ├─────┼───────────────────┼──────────────────────────────────────────────────────┤
+    │  0  │ norm_speed_ratio  │ median(upper_50%_nm_median) / self-calibrating ref  │
+    │  1  │ stop_ratio        │ (nm_median<0.06 차량) / speed_known × reliability²  │
+    │ 1.5 │ slow_ratio        │ (0.06≤nm_median<0.70, 정지 제외) / speed_known × r² │
+    │  2  │ bbox_coverage     │ occupied_cells(궤적확인 차량만) / valid_cell_count   │
+    │  3  │ rule_jam_score    │ 0.0 (congestion_judge가 채워넣음)                   │
+    └─────┴───────────────────┴──────────────────────────────────────────────────────┘
 
     Parameters
     ----------
@@ -46,6 +47,12 @@ class FeatureExtractor:
         # ── 방향별 자기보정 nm baseline (비대칭 EMA) ─────────────────
         self._nm_baseline: float = 0.0                 # 방향 고유 정상속도 기준 (자동 보정)
         self._nm_baseline_count: int = 0               # 누적 업데이트 횟수 (warmup 판단용)
+
+        # ── tid별 nm 슬라이딩 윈도우 ─────────────────────────────────
+        # 순간 nm은 bbox jitter·차량 출입으로 튀기 때문에
+        # 최근 _NM_WIN 프레임 nm의 중앙값으로 slow/stop 판정해 안정화
+        self._NM_WIN: int = 5                          # 윈도우 크기 (프레임)
+        self._nm_history: dict = {}                    # {tid: deque([nm, ...], maxlen=5)}
 
     # ── 준비 신호 (학습 완료 후 호출) ────────────────────────────────
     def set_ready(self):
@@ -93,6 +100,7 @@ class FeatureExtractor:
             self.cfg, "min_bbox_h", 30.0
         )
         speed_known_count = 0                          # 궤적 확인된 차량 수 (신규 제외)
+        speed_known_tids = set()                       # speeds 확인된 tid 집합 (bbox_coverage 필터용)
         for t in tracks:                               # 각 차량 순회
             raw_bbox_h = t["y2"] - t["y1"]            # 바운딩박스 높이 (픽셀)
             bbox_h = max(raw_bbox_h, min_bbox_h)       # 최솟값 클램프 — 원거리 소형 박스 과대평가 방지
@@ -101,21 +109,39 @@ class FeatureExtractor:
                 continue
             mag = speeds[tid]                          # 속도 조회
             speed_known_count += 1                     # 궤적 확인 차량 수 증가
+            speed_known_tids.add(tid)                  # bbox_coverage 필터 목록에 추가
+
             if mag <= 0:                               # speeds=0: 실제 정지 확정
-                stopped_count += 1                     # 정지 카운트 (nm 계산 없이)
-                slow_count += 1                        # 정지는 서행의 부분집합 — 서행에도 포함
+                # nm 슬라이딩 윈도우: 정지는 nm=0으로 기록
+                if tid not in self._nm_history:
+                    self._nm_history[tid] = collections.deque(maxlen=self._NM_WIN)
+                self._nm_history[tid].append(0.0)
+                # 슬라이딩 중앙값으로 판정
+                _med = float(np.median(self._nm_history[tid]))
+                if _med < norm_stop_thr:               # 중앙값 기준 정지
+                    stopped_count += 1
+                slow_count += 1                        # 정지는 서행의 부분집합 (중앙값 무관)
                 continue
+
             nm = mag / bbox_h                          # normalized_mag (원근 보정)
             if nm_cy_k > 0:                            # cy 보정 활성화 시
                 cy_ratio = t["cy"] / max(self.state.frame_h, 1)  # 0(상단/원거리)~1(하단/근거리)
                 denom = 1.0 + nm_cy_k * (2.0 * cy_ratio - 1.0)  # 대칭 보정
                 nm = nm / max(denom, 0.1)              # nm 보정
-            norm_mags.append(nm)                       # 속도 목록에 추가
-            if nm < norm_stop_thr:                     # nm < 0.06 → 저속 정지
-                stopped_count += 1                     # 정지 카운트
-                slow_count += 1                        # 정지는 서행의 부분집합 — 서행에도 포함
-            elif nm < slow_upper_nm:                   # 0.06 ≤ nm < 0.50 → 서행 구간
-                slow_count += 1                        # 서행 카운트
+
+            # ── nm 슬라이딩 윈도우 업데이트 ──────────────────────────
+            if tid not in self._nm_history:
+                self._nm_history[tid] = collections.deque(maxlen=self._NM_WIN)
+            self._nm_history[tid].append(nm)           # 현재 nm 기록
+
+            # 슬라이딩 중앙값으로 slow/stop 판정 (순간 noise 흡수)
+            _med_nm = float(np.median(self._nm_history[tid]))
+            norm_mags.append(_med_nm)                  # 속도 목록에 중앙값 추가
+            if _med_nm < norm_stop_thr:                # 중앙값 nm < 0.06 → 정지
+                stopped_count += 1
+                slow_count += 1                        # 정지 ⊂ 서행
+            elif _med_nm < slow_upper_nm:              # 0.06 ≤ 중앙값 nm < 0.70 → 서행
+                slow_count += 1
 
         # ── bbox_coverage: 셀 점유율 (cell occupancy) 방식 ──────────────
         cell_w = self.state.frame_w / self.cfg.grid_size   # 셀 너비 (픽셀)
@@ -129,11 +155,12 @@ class FeatureExtractor:
         else:
             valid_cell_count = self.cfg.grid_size * self.cfg.grid_size  # fallback: 전체
 
-        # 차량 footpoint가 위치한 고유 셀 집합
+        # 차량 footpoint가 위치한 고유 셀 집합 — 신규 차량(speed 미확인) 제외
+        # 신규 차량 포함 시: tracks에 등장만 해도 bbox_coverage 상승 → 차 없어도 jam 튐
         occupied_cells = len(set(
             (int(np.clip(t["cy"] / cell_h, 0, self.cfg.grid_size - 1)),   # 행 인덱스
              int(np.clip(t["cx"] / cell_w, 0, self.cfg.grid_size - 1)))   # 열 인덱스
-            for t in tracks
+            for t in tracks if t["id"] in speed_known_tids                # 궤적 확인된 차량만
         ))
         bbox_coverage = float(np.clip(                     # 셀 점유율 (0~1)
             occupied_cells / max(valid_cell_count, 1), 0.0, 1.0
@@ -172,24 +199,28 @@ class FeatureExtractor:
             rep_norm_mag / _speed_ref, 0.0, 1.0
         ))
 
-        # ── stop_ratio: 궤적 확인된 차량 중 정지 비율 ─────────────────
-        # 소표본 신뢰도 보정: 차량 5대 미만이면 stop/slow 기여를 제곱 감쇠로 축소
-        # 제곱 감쇠 이유: 선형 보정(÷5)은 2대만 있어도 jam≈0.5 → SLOW 오탐 발생
-        #   1대: (1/5)²=0.04, 2대: (2/5)²=0.16, 3대: 0.36, 4대: 0.64, 5대: 1.0
-        _MIN_RELIABLE = 5                                  # 신뢰 가능 최소 차량 수 (3→5 강화)
-        _raw_stop = stopped_count / max(speed_known_count, 1)  # 원시 stop_ratio
-        if speed_known_count < _MIN_RELIABLE:              # 차량 수 부족 → 신뢰도 가중치 적용
-            _reliability = (speed_known_count / _MIN_RELIABLE) ** 2  # 제곱 감쇠 (0.04~0.96)
-            stop_ratio = _raw_stop * _reliability          # 소표본 기여 제한
-        else:                                              # 차량 수 충분 → 그대로 사용
-            stop_ratio = _raw_stop                         # 신뢰도 보정 불필요
+        # ── nm_history 만료 처리: 이번 프레임에 없는 tid 제거 ────────
+        for old_tid in list(self._nm_history.keys()):
+            if old_tid not in speed_known_tids:            # 이번 프레임에 없는 차량
+                del self._nm_history[old_tid]              # 윈도우 삭제 (메모리 누수 방지)
 
-        # ── slow_ratio: 궤적 확인된 차량 중 서행 비율 ─────────────────
-        _raw_slow = slow_count / max(speed_known_count, 1) # 원시 slow_ratio
-        if speed_known_count < _MIN_RELIABLE:              # 차량 수 부족 → 신뢰도 가중치 적용
-            slow_ratio = _raw_slow * _reliability          # _reliability는 stop_ratio에서 이미 계산됨
-        else:                                              # 차량 수 충분 → 그대로 사용
-            slow_ratio = _raw_slow                         # 신뢰도 보정 불필요
+        # ── 소표본 신뢰도 보정 ────────────────────────────────────────
+        # 차량 5대 미만이면 제곱 감쇠: 1대→0.04, 2대→0.16, 3대→0.36, 4대→0.64, 5대→1.0
+        _MIN_RELIABLE = 5                                  # 신뢰 가능 최소 차량 수
+        if speed_known_count < _MIN_RELIABLE:
+            _reliability = (speed_known_count / _MIN_RELIABLE) ** 2  # 제곱 감쇠
+        else:
+            _reliability = 1.0                             # 충분한 차량 수 → 보정 없음
+
+        # ── stop_ratio: 정지 차량(nm_median < norm_stop_thr) 비율 ─────
+        # stop은 slow에서 분리 — 이중 증폭 방지
+        # (정지 차량은 slow_count에 포함하지 않음 → 공식에서 독립 기여)
+        pure_slow_count = slow_count - stopped_count       # 서행만 (정지 제외)
+        _raw_stop = stopped_count / max(speed_known_count, 1)
+        _raw_slow = pure_slow_count / max(speed_known_count, 1)  # 순수 서행 비율
+
+        stop_ratio = _raw_stop * _reliability              # 소표본 감쇠 적용
+        slow_ratio = _raw_slow * _reliability              # 소표본 감쇠 적용
 
         # ── feature 딕셔너리 조립 ────────────────────────────────────
         return {                                       # feature 벡터

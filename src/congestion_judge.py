@@ -29,14 +29,16 @@ def _clip(value: float, lo: float, hi: float) -> float:
 
 
 def compute_jam_score_fallback(x_t: dict) -> float:
-    """서행비율·정지비율·밀도·차량수로 jam_score를 계산한다.
+    """서행비율·정지비율·셀점유율로 jam_score를 계산한다.
 
-    핵심 지표: slow_ratio (norm_stop_threshold ≤ nm < slow_upper_nm 차량 비율).
+    slow_ratio: 순수 서행 (정지 제외, 0.06 ≤ nm_median < 0.70)
+    stop_ratio: 완전 정지 (nm_median < 0.06) — slow와 독립 기여
+    bbox_coverage: 궤적 확인 차량의 셀 점유율 (신규 차량 제외)
 
-    설계 목표:
-      - 원활  (slow=0,    stop=0,    bbox=0.04, count=0.2): jam ≈ 0.09 → SMOOTH
-      - 서행  (slow=0.60, stop=0.05, bbox=0.08, count=0.5): jam ≈ 0.55 → SLOW
-      - 정체  (slow=1.0,  stop=0.50, bbox=0.15, count=0.8): jam ≈ 1.39 → clip 1.0 → CONGESTED
+    설계 목표 (stop 분리 후):
+      - 원활  (slow=0,    stop=0,    bbox=0.04): jam ≈ 0.09 → SMOOTH
+      - 서행  (slow=0.55, stop=0.05, bbox=0.10): jam ≈ 0.46 → SLOW
+      - 정체  (slow=0.40, stop=0.50, bbox=0.20): jam ≈ 0.87 → CONGESTED
 
     Args:
         x_t: feature 벡터 dict.
@@ -44,11 +46,11 @@ def compute_jam_score_fallback(x_t: dict) -> float:
     Returns:
         jam_score (0.0~1.0).
     """
-    # ── 서행 비율 기여 ────────────────────────────────────────────────
+    # ── 서행 비율 기여 (순수 서행 = 정지 제외) ───────────────────────
     slow_contribution = _clip(x_t.get("slow_ratio", 0.0), 0.0, 1.0)
 
-    # ── 정지 비율 기여 (nm < norm_stop_threshold 차량 비율) ───────────
-    stop_contribution = _clip(x_t["stop_ratio"], 0.0, 1.0)
+    # ── 정지 비율 기여 (slow와 독립 — 이중 증폭 방지) ────────────────
+    stop_contribution = _clip(x_t.get("stop_ratio", 0.0), 0.0, 1.0)
 
     # ── bbox 점유율 기여 — sqrt 비선형 변환 ──────────────────────────
     raw_bbox = _clip(
@@ -57,11 +59,12 @@ def compute_jam_score_fallback(x_t: dict) -> float:
     bbox_contribution = math.sqrt(raw_bbox)
 
     # ── 가중 합산 ──────────────────────────────────────────────────────
-    # count_contribution 제거: 차량 대수는 4차선 등 도로 폭에 따라 달라져 오판 유발
-    # bbox_coverage(셀 점유율)가 밀도를 더 공정하게 반영 → 비중 0.35→0.45로 증가
-    jam = (0.80 * slow_contribution                     # 서행 비율 80%
-           + 0.70 * stop_contribution                   # 정지 비율 70%
-           + 0.45 * bbox_contribution)                  # 셀 점유율 45% (count 흡수)
+    # slow(0.70): 정지 제외 순수 서행 — 주 신호
+    # stop(0.90): 완전 정지는 심각한 정체 신호 — slow보다 높은 가중치
+    # bbox(0.35): 밀도 보조 신호 (sqrt 비선형으로 희소 구간 민감도 확보)
+    jam = (0.70 * slow_contribution                     # 순수 서행 비율
+           + 0.90 * stop_contribution                   # 완전 정지 비율 (강한 정체 신호)
+           + 0.35 * bbox_contribution)                  # 셀 점유율
 
     return _clip(jam, 0.0, 1.0)                         # [0, 1] 범위 클램프
 
