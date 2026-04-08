@@ -55,10 +55,16 @@ class FeatureExtractor:
         self._nm_history: dict = {}                    # {tid: deque([nm, ...], maxlen=5)}
 
         # ── velocity_deficit 세션 warmup 카운터 ──────────────────────
-        # speed_ref는 세션 시작 시 리셋되므로 충분한 SMOOTH 데이터가 쌓일 때까지
-        # vdr를 신뢰하지 않고 slow_ratio fallback 사용
         self._speed_ref_warmed_frames: int = 0         # vdr 유효 프레임 누적 수
-        self._SPEED_REF_WARMUP: int = 150              # 이 값 이상이면 vdr 신뢰 (약 5초@30fps)
+        self._SPEED_REF_WARMUP: int = 150              # 이 값 이상이면 vdr 신뢰
+
+        # ── slow_ratio / stop_ratio EMA (프레임 간 비율 튐 흡수) ─────
+        # 차량 출입으로 speed_known_count가 바뀌면 slow_ratio가 프레임마다 크게 달라짐
+        # EMA로 스무딩해서 jam 계산에 안정된 값 전달
+        self._slow_ema: float = 0.0                    # slow_ratio EMA 누적값
+        self._stop_ema: float = 0.0                    # stop_ratio EMA 누적값
+        self._ratio_ema_alpha: float = 0.20            # EMA 속도 (5프레임 평균 수준)
+        self._ratio_initialized: bool = False          # 첫 프레임 초기화 여부
 
     # ── 준비 신호 (학습 완료 후 호출) ────────────────────────────────
     def set_ready(self):
@@ -241,19 +247,28 @@ class FeatureExtractor:
             if old_tid not in speed_known_tids:            # 이번 프레임에 없는 차량
                 del self._nm_history[old_tid]              # 윈도우 삭제 (메모리 누수 방지)
 
-        # ── stop_ratio / slow_ratio 계산 ─────────────────────────────
-        # 소표본 감쇠 제거: bbox_coverage를 신규차량 제외로 이미 안정화했으므로
-        # ratio에 추가 감쇠를 걸면 서행 구간(2~3대)에서 jam이 0.1대로 깎히는 역효과
-        # 대신: speed_known_count < 2이면 slow/stop 신호 자체를 0으로 처리 (최소 guard)
-        #   → 차 1대만 있으면 신뢰도 부족 → slow/stop 기여 없음 (bbox만 반영)
-        #   → 차 2대 이상이면 비율 그대로 사용
+        # ── stop_ratio / slow_ratio 계산 + EMA 스무딩 ───────────────────
         pure_slow_count = slow_count - stopped_count       # 순수 서행 (정지 제외)
         if speed_known_count >= 2:                         # 차량 2대 이상 → 신뢰도 충분
-            stop_ratio = stopped_count / speed_known_count
-            slow_ratio = pure_slow_count / speed_known_count
+            _raw_stop = stopped_count / speed_known_count
+            _raw_slow = pure_slow_count / speed_known_count
         else:                                              # 차량 0~1대 → 신호 불충분
-            stop_ratio = 0.0                               # slow/stop 기여 차단
-            slow_ratio = 0.0                               # bbox만 반영됨
+            _raw_stop = 0.0
+            _raw_slow = 0.0
+
+        # EMA 스무딩: 차량 출입으로 비율이 프레임마다 크게 달라지는 현상 흡수
+        # alpha=0.20 → 약 5프레임 평균 수준의 안정화
+        if not self._ratio_initialized:                    # 첫 프레임 → 바로 설정
+            self._slow_ema = _raw_slow
+            self._stop_ema = _raw_stop
+            self._ratio_initialized = True
+        else:
+            a = self._ratio_ema_alpha
+            self._slow_ema = a * _raw_slow + (1 - a) * self._slow_ema
+            self._stop_ema = a * _raw_stop + (1 - a) * self._stop_ema
+
+        slow_ratio = self._slow_ema
+        stop_ratio = self._stop_ema
 
         # ── 디버그 출력 (30프레임마다) ───────────────────────────────
         if frame_num % 30 == 0:
