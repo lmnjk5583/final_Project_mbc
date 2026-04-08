@@ -109,7 +109,7 @@ class DetectorConfig:
     display_height: int = 720              # 화면 출력 창 높이 (픽셀). 0이면 원본 해상도 그대로
 
     # ==================== 정체 탐지 slow_ratio 파라미터 ====================
-    slow_upper_nm: float = 0.50            # 서행 판정 상한 nm (nm < 이 값 → 서행)
+    slow_upper_nm: float = 0.70            # 서행 판정 상한 nm (nm < 이 값 → 서행) — 0.50→0.70: EMA smoothing 도입 후 원거리 정상차량 nm 0.5~0.7 범위 오판 방지
     norm_speed_ref_override: float = 0.0  # norm_speed_ref 고정값 (0이면 자기보정 baseline 사용)
     nm_cy_correction_k: float = 0.6        # nm cy 보정 계수 — 원근 대칭 보정
 

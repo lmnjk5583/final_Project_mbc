@@ -173,12 +173,14 @@ class FeatureExtractor:
         ))
 
         # ── stop_ratio: 궤적 확인된 차량 중 정지 비율 ─────────────────
-        # 소표본 신뢰도 보정: 차량 3대 미만이면 stop_ratio 최대 기여 제한
-        _MIN_RELIABLE = 3                                  # 신뢰 가능 최소 차량 수
+        # 소표본 신뢰도 보정: 차량 5대 미만이면 stop/slow 기여를 제곱 감쇠로 축소
+        # 제곱 감쇠 이유: 선형 보정(÷5)은 2대만 있어도 jam≈0.5 → SLOW 오탐 발생
+        #   1대: (1/5)²=0.04, 2대: (2/5)²=0.16, 3대: 0.36, 4대: 0.64, 5대: 1.0
+        _MIN_RELIABLE = 5                                  # 신뢰 가능 최소 차량 수 (3→5 강화)
         _raw_stop = stopped_count / max(speed_known_count, 1)  # 원시 stop_ratio
         if speed_known_count < _MIN_RELIABLE:              # 차량 수 부족 → 신뢰도 가중치 적용
-            _reliability = speed_known_count / _MIN_RELIABLE  # 0 ~ 1 신뢰도 (차량수/3)
-            stop_ratio = _raw_stop * _reliability          # 최대 기여 (1/3, 2/3, 1) 제한
+            _reliability = (speed_known_count / _MIN_RELIABLE) ** 2  # 제곱 감쇠 (0.04~0.96)
+            stop_ratio = _raw_stop * _reliability          # 소표본 기여 제한
         else:                                              # 차량 수 충분 → 그대로 사용
             stop_ratio = _raw_stop                         # 신뢰도 보정 불필요
 
