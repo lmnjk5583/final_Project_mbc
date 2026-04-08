@@ -234,8 +234,9 @@ class FeatureExtractor:
                 del self._nm_history[old_tid]              # 윈도우 삭제 (메모리 누수 방지)
 
         # ── 소표본 신뢰도 보정 ────────────────────────────────────────
-        # 차량 5대 미만이면 제곱 감쇠: 1대→0.04, 2대→0.16, 3대→0.36, 4대→0.64, 5대→1.0
-        _MIN_RELIABLE = 5                                  # 신뢰 가능 최소 차량 수
+        # 차량 3대 미만이면 제곱 감쇠: 1대→0.11, 2대→0.44, 3대→1.0
+        # 5대 기준은 너무 강해 서행 구간(2~3대)에서 jam이 0.1대로 깎임
+        _MIN_RELIABLE = 3                                  # 신뢰 가능 최소 차량 수 (5→3)
         if speed_known_count < _MIN_RELIABLE:
             _reliability = (speed_known_count / _MIN_RELIABLE) ** 2  # 제곱 감쇠
         else:
