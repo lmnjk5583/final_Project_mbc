@@ -4,6 +4,44 @@
 
 ---
 
+## 2026-04-08 (79차 — 모델 고정·conf 버그·학습중 jam 차단·전체CCTV 자동시작) [수빈]
+
+### 오늘 한 작업
+
+**모델 경로 통일 (항상 yolo11n_v1 사용)**
+- `reverse_detector.py`: GPU/CPU 분기 제거 → `C:\final_pj\runs\yolo11n_v1\weights\best.pt` 고정
+
+**conf=0 적용 안되는 버그 수정**
+- `reverse_detector.py`: `os.getenv(...) or conf or 0.35` → Python falsy로 0.0이 0.35로 치환됨
+- 수정: `if _env_conf / elif conf / else 0.35` 명시적 분기로 교체
+
+**학습 중 jam_score 계산 차단**
+- `reverse_detector.py`: congestion 블록에 `not st.is_learning and not st.relearning` 가드 추가
+- 이유: 학습 중엔 _ref_direction·cell_count 미설정 → bbox_coverage 오산 → jam 오염
+
+**전체 CCTV 자동 시작 (서버 부팅 시)**
+- `its.py`: `_fetch_gyeongbu_cctvs(all_cameras=True)` 파라미터 추가 — 20개 랜덤 제한 제거
+- `app.py`: `_auto_start_all_detectors()` 백그라운드 스레드 추가
+  - 서버 시작 8초 후 전체 경부선 CCTV detector 자동 생성
+  - 3분마다 ITS URL 갱신 (TTL=4분 만료 전 토큰 갱신)
+  - URL 변경 감지 시 해당 detector만 재시작
+
+### 수정 파일
+`C:\finalPj_웹` —
+- `backend_flask/app.py`
+- `backend_flask/modules/traffic/its.py`
+- `backend_flask/modules/traffic/detectors/reverse_detector.py`
+
+### 발생 오류 / 확인 사항
+- conf `or` 체인 falsy 버그: Python에서 0.0 or 0.35 = 0.35 → 항상 0.35로 overwrite
+- 학습 중 _valid_cells_up=1(기본값) → bbox_coverage = n/1 → 최대 1.0 → jam 오염
+
+### 작업 재개 위치
+- 플라스크 재시작 → 자동시작 로그 확인 ("🚀 [Auto-start] 전체 경부선 CCTV 자동 탐지 시작...")
+- 내가 클릭 안 한 CCTV도 학습 진행 여부 확인
+
+---
+
 ## 2026-04-08 (78차 — 대원 81~90차 pull 반영: 웹 config·feature 동기화) [수빈]
 
 ### 오늘 한 작업
