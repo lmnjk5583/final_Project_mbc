@@ -59,10 +59,10 @@ def compute_jam_score_fallback(x_t: dict) -> float:
     bbox_contribution = math.sqrt(raw_bbox)
 
     # ── 가중 합산 ──────────────────────────────────────────────────────
-    # slow(0.70): 정지 제외 순수 서행 — 주 신호
+    # slow(0.85): 정지 제외 순수 서행 — 주 신호 (0.70→0.85: reliability 제곱감쇠로 깎인 만큼 보정)
     # stop(0.90): 완전 정지는 심각한 정체 신호 — slow보다 높은 가중치
     # bbox(0.35): 밀도 보조 신호 (sqrt 비선형으로 희소 구간 민감도 확보)
-    jam = (0.70 * slow_contribution                     # 순수 서행 비율
+    jam = (0.85 * slow_contribution                     # 순수 서행 비율
            + 0.90 * stop_contribution                   # 완전 정지 비율 (강한 정체 신호)
            + 0.35 * bbox_contribution)                  # 셀 점유율
 
