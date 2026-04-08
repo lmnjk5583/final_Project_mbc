@@ -63,7 +63,7 @@ class FeatureExtractor:
         # EMA로 스무딩해서 jam 계산에 안정된 값 전달
         self._slow_ema: float = 0.0                    # slow_ratio EMA 누적값
         self._stop_ema: float = 0.0                    # stop_ratio EMA 누적값
-        self._ratio_ema_alpha: float = 0.20            # EMA 속도 (5프레임 평균 수준)
+        self._ratio_ema_alpha: float = 0.10            # EMA 속도 (0.20→0.10: 10프레임 평균 수준)
         self._ratio_initialized: bool = False          # 첫 프레임 초기화 여부
 
     # ── 준비 신호 (학습 완료 후 호출) ────────────────────────────────
@@ -272,12 +272,9 @@ class FeatureExtractor:
 
         # ── 디버그 출력 (30프레임마다) ───────────────────────────────
         if frame_num % 30 == 0:
-            _vdr_str = f"{velocity_deficit_ratio:.3f}" if velocity_deficit_ratio >= 0 else "N/A"
-            _src = "vdr" if (_vdr_ready and velocity_deficit_ratio >= 0) else "slow_r(fallback)"
             print(f"[FE] f={frame_num} known={speed_known_count} "
                   f"slow_r={slow_ratio:.3f} stop_r={stop_ratio:.3f} "
-                  f"bbox={bbox_coverage:.3f} vdr={_vdr_str}(rdy={_vdr_ready}) "
-                  f"src={_src} warm={self._speed_ref_warmed_frames}/{self._SPEED_REF_WARMUP}")
+                  f"bbox={bbox_coverage:.3f}")
 
         # ── feature 딕셔너리 조립 ────────────────────────────────────
         return {                                       # feature 벡터
