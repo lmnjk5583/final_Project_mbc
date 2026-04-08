@@ -4,15 +4,97 @@
 
 ---
 
+## 2026-04-08 (78차 — 대원 81~90차 pull 반영: 웹 config·feature 동기화) [수빈]
+
+### 오늘 한 작업
+
+**대원 81~90차 변경사항 웹 동기화**
+- `reverse_modules/config.py`: `velocity_window` 20→10, `wrong_count_threshold` 12→15 (src 동기화)
+- `reverse_modules/config.py`: `min_wrongway_track_age: int = 30` 추가 (역주행 판정 최소 추적 프레임)
+- `reverse_modules/config.py`: `smooth_jam_threshold` 0.30→0.25 (src 동기화)
+- `reverse_modules/config.py`: `slow_upper_nm` 2.5→0.70 (src 동기화: EMA smoothing 후 원거리 정상차량 오판 방지)
+- `reverse_detector.py`: `_make_x_t()` 소표본 보정 _MIN_RELIABLE 3→5, 선형→제곱 감쇠 (src/feature_extractor.py 동기화)
+- `congestion_judge.py`(src/ 직접 import): 가중치 0.29/0.25/0.20/0.08 → 0.80/0.70/0.45, count 제거 자동 반영
+
+**work_log 충돌 해결**
+- HEAD(수빈 75차) + remote(대원 81~90차) 충돌 → 두 항목 모두 유지
+
+### 수정 파일
+`C:\finalPj_웹` —
+- `backend_flask/modules/traffic/detectors/reverse_detector.py`
+- `backend_flask/modules/traffic/detectors/reverse_modules/config.py`
+
+### 작업 재개 위치
+- 플라스크 재시작 → jam_score 정상 범위 확인
+
+---
+
+## 2026-04-08 (77차 — jam_score 0.4 false positive + 경부선 fallback 좌표 수정) [수빈]
+
+### 오늘 한 작업
+
+**jam_score 0.4 false positive 수정 (서버 재시작 후 원활 도로)**
+- `reverse_detector.py`: `cong_judge.set_baseline()` → `reset()`으로 교체 (load_flow_map, 초기학습완료, 재학습완료 3곳)
+- 원인: `set_baseline()`은 EMA=0.5로 초기화 → alpha_down=0.04 감소율로 30-40초간 false SLOW
+- 수정: `reset()`으로 EMA=0 시작 → 실제 도로 상태로 빠르게 수렴 (원활이면 5-10초내 0.1대)
+
+**경부선 fallback 좌표 수정**
+- `its.py`: GYEONGBU_FALLBACK 좌표 전면 교체 — 마지막 점 경도 오류(126.9→128.98 직선 점프)로 이상한 직선 표시됐던 것 수정
+- 수정: 서울TG→수원→오산→천안→대전→옥천→황간→김천→구미→칠곡→대구→경산→언양→부산TG 실제 경로 좌표
+
+### 수정 파일
+`C:\finalPj_웹` —
+- `backend_flask/modules/traffic/detectors/reverse_detector.py`
+- `backend_flask/modules/traffic/its.py`
+
+### 발생 오류 / 확인 사항
+- fallback 좌표 마지막 점 [35.1775, **128.9835**] — 앞 점들이 경도 126.9대인데 갑자기 128.98 → 직선 jump
+- EMA 0.5 시작 + alpha_down=0.04: 원활도로에서도 40초간 SLOW 오분류
+
+### 작업 재개 위치
+- 플라스크 재시작 → CCTV 탐지 → jam_score 원활도로 0.1대 확인 + 경부선 경로 정상 확인
+
+---
+
+## 2026-04-08 (76차 — bbox_coverage·count_ratio 분모 버그 수정) [수빈]
+
+### 오늘 한 작업
+
+**bbox_coverage 분모 수정 (src/detector.py 동기화)**
+- `reverse_detector.py`: bbox_coverage 분모를 전체 그리드(225셀) → 방향별 유효 셀 수로 변경
+- `reverse_detector.py`: `_compute_direction_cell_counts()` 메서드 추가 (flow_map 유효 셀을 up/down으로 분류)
+- `reverse_detector.py`: `_valid_cells_up`, `_valid_cells_down` 필드 추가 (기본값 1)
+- `reverse_detector.py`: `_compute_ref_direction()` 호출 3곳에 `_compute_direction_cell_counts()` 추가 (load_flow_map, 초기학습완료, 재학습완료)
+
+**count_ratio 분모 수정 (src/feature_extractor.py 동기화)**
+- 기존: `n_known`(궤적≥20프레임 차량만) → 신규차량 무시로 count_ratio 과소평가
+- 수정: `n_total`(전체 활성 차량) — src/feature_extractor.py 동일 방식
+- `_make_x_t()` 시그니처 `(n_known, n_total, stop_c, slow_c, bcov)`로 변경
+
+### 수정 파일
+`C:\finalPj_웹` —
+- `backend_flask/modules/traffic/detectors/reverse_detector.py`
+
+### 발생 오류 / 확인 사항
+- bbox_coverage 원근 편향: 전체 225셀 분모 → up/down 실제 유효 셀 수(flow_map count>0) 기준으로 정규화
+- count_ratio 저평가: 신규 진입 차량(traj<20f)이 많을 때 count 기여 0 → 전체 차량 수 반영
+
+### 작업 재개 위치
+- 플라스크 재시작 후 CCTV 탐지 → jam_score 정상 범위 확인
+
+---
+
 ## 2026-04-08 (75차 — jam_score 과도 상승 원인 수정 + 파일 정리) [수빈]
 
 ### 오늘 한 작업
 
-**jam_score 근본 수정**
+**jam_score 근본 수정 — src/ 동기화**
 - `reverse_detector.py`: `src/congestion_judge.py` 직접 import (웹 복사본 제거) → 대원 수정사항 자동 반영
 - `reverse_detector.py`: `n==0` 시 세 CongestionJudge 모두 `reset()` 호출 → 차량 0대 시 즉시 0.00
-- `reverse_modules/config.py`: `src/config.py` 와 jam_score 관련 파라미터 전체 동기화 (slow_upper_nm 등)
-- `reverse_detector.py`: nm 계산을 velocity_window 기반으로 수정 (traj[-3] → traj[-1×velocity_window])
+- `reverse_modules/config.py`: `slow_upper_nm` 0.50→2.5, `nm_cy_correction_k` 추가 0.0 (src/config.py 동기화)
+- `reverse_detector.py`: nm 계산을 `velocity_window`(20프레임) 기반으로 수정 — 2프레임 gap → 고속 차량 slow 오분류 해소
+- `reverse_detector.py`: `bbox_coverage` → cell occupancy 방식으로 교체 (src/feature_extractor.py 동기화) — 원근 편향 제거
+- `reverse_detector.py`: 방향별 bbox_coverage_up/down 분리 계산
 
 **경부선 초록선 복구**
 - `its.py` `highway_line()`: Overpass 실패 시 정적 fallback 좌표 반환 → 서버 재시작 후에도 선 표시
