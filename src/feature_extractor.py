@@ -99,6 +99,10 @@ class FeatureExtractor:
         min_bbox_h = getattr(                          # min_bbox_h 없으면 구버전 호환 (30px)
             self.cfg, "min_bbox_h", 30.0
         )
+        # ── 셀 크기 사전 계산 (루프 내 cell_r/c 계산 + bbox_coverage 공용) ──
+        cell_w = self.state.frame_w / self.cfg.grid_size   # 셀 너비 (픽셀)
+        cell_h = self.state.frame_h / self.cfg.grid_size   # 셀 높이 (픽셀)
+
         speed_known_count = 0                          # 궤적 확인된 차량 수 (신규 제외)
         speed_known_tids = set()                       # speeds 확인된 tid 집합 (bbox_coverage 필터용)
         speed_known_tids_deficit = {}                  # {tid: velocity_deficit} — speed_ref 학습된 셀만
@@ -160,8 +164,7 @@ class FeatureExtractor:
                 speed_known_tids_deficit[tid] = _deficit  # tid별 deficit 저장
 
         # ── bbox_coverage: 셀 점유율 (cell occupancy) 방식 ──────────────
-        cell_w = self.state.frame_w / self.cfg.grid_size   # 셀 너비 (픽셀)
-        cell_h = self.state.frame_h / self.cfg.grid_size   # 셀 높이 (픽셀)
+        # cell_w / cell_h 는 루프 전에 이미 계산됨
 
         # 유효 셀 수: 방향별 override > flow_map 실측 > 전체 그리드 순서로 사용
         if self._valid_cell_count_override is not None:    # 방향별 셀 수 주입됨
