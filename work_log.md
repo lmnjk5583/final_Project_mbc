@@ -61,6 +61,51 @@
 
 ---
 
+## 2026-04-07 (81~90차 — 대규모 리팩토링: 데드코드 제거 + 역주행 오탐 개선) [대원]
+
+### 오늘 한 작업
+
+**데드코드 완전 제거**
+- `src/baseline_stats.py`, `src/passage_tracker.py`, `src/bbox_stabilizer.py` 삭제
+- `detector.py`: PassageTracker/BaselineStats import 제거, flow.load() bool만 반환, on_entry/on_exit/reset/enough_passages 블록 제거
+- `id_manager.py`: passage_tracker 파라미터 제거
+- `traffic_analyzer.py`: set_baseline() 인자 없는 버전으로 단순화
+- `feature_extractor.py`: BaselineStats import 제거, set_ready() 메서드 추가, count_ratio 반환 제거
+- `flow_map.py`: save/load에서 baseline_stats 직렬화 제거, 버전 3으로 bump
+- `state.py`: entry_positions 필드 제거
+
+**역주행 오탐 개선**
+- `judge.py`: `min_wrongway_track_age=30` — 신규 등장 30프레임 이내 판정 차단
+- `judge.py`: `direction_change_cos_threshold=0.3` — 72°+ 방향 급변 시 guard 트리거 (기존 90°+)
+- `detector.py`: footpoint EMA smoothing(alpha=0.4) — bbox jitter가 trajectory에 전파되기 전 흡수
+- `config.py`: `wrong_count_threshold=15`, `velocity_window=10`
+
+**jam_score 수식 재보정 (count 제거)**
+- `congestion_judge.py`: count_contribution 제거, `0.80×slow + 0.70×stop + 0.45×sqrt(bbox)`
+- `config.py`: `smooth_jam_threshold=0.25`, `slow_jam_threshold=0.60`
+- 4차선 도로 차량 대수 과다→CONGESTED 오판 방지
+
+**config.py 정리**
+- CongestionPredictor용 `free_flow_speed=100.0`, `prediction_history_window=30` 복구
+- `enable_online_flow_update`, `pixels_per_meter`, `default_lcs`, `min_passage_dist` 등 불필요 파라미터 제거
+
+### 수정 파일
+`src/config.py`, `src/congestion_judge.py`, `src/detector.py`, `src/feature_extractor.py`,
+`src/traffic_analyzer.py`, `src/flow_map.py`, `src/state.py`, `src/id_manager.py`,
+`src/judge.py`, `run_test.py`, `run_wrongway.py`
+삭제: `src/baseline_stats.py`, `src/passage_tracker.py`, `src/bbox_stabilizer.py`
+
+### 발생 오류 / 확인 사항
+- `enable_online_flow_update` unexpected keyword → run_test.py에서 제거
+- `prediction_history_window` AttributeError → config.py CongestionPredictor 섹션에 재추가
+- GRU의 count_ratio: `.get(k, 0.0)` fallback으로 안전하게 처리됨
+
+### 작업 재개 위치
+- run_test.py 재실행으로 정상 기동 확인
+- 경부선 CCTV 영상으로 역주행 오탐 감소 실측 확인
+
+---
+
 ## 2026-04-07 (77~80차 — 상행선 서행 탐지 공정성 개선) [대원]
 
 ### 오늘 한 작업

@@ -47,8 +47,6 @@ class DetectorState:
         self.direction_change_frame = {} # {track_id: frame_num} stable_velocity 대비 급변 감지된 시점
         self.direction_was_stable = {}   # {track_id: bool} 직전 프레임 방향 안정 여부 (edge 감지용)
 
-        # ==================== Phase 1 정체 탐지용 ====================
-        self.entry_positions = {}   # {track_id: (fx, fy)} footpoint 진입 위치 — PassageTracker가 관리
 
     def reset_for_relearn(self):
         """카메라 전환 감지 후 추적/역주행 관련 상태 초기화, 재학습 모드 진입"""

@@ -29,9 +29,7 @@ class TrafficAnalyzer:
     fps : float
         영상 FPS.
     flow_map : FlowMap or None
-        FlowMap 객체 — Phase 2 확장용. Phase 1에서는 feature_extractor에 전달만 함.
-    passage_tracker : PassageTracker or None
-        FeatureExtractor가 dwell·exit 조회에 사용.
+        FlowMap 객체 — bbox_coverage 셀 수 fallback용.
     congestion_judge : CongestionJudge or None
         외부에서 생성된 CongestionJudge. None이면 내부 생성.
     """
@@ -73,6 +71,10 @@ class TrafficAnalyzer:
         self._last_affected_count = 0                 # 마지막 저속(정지) 차량 수
         self._last_rule_jam: float = 0.0              # 마지막 rule 기반 jam_score (로그용)
         self._last_gru_score: float | None = None     # 마지막 GRU 예측값 (없으면 None)
+        self._last_future_pred: list | None = None    # 마지막 predict_future() 결과
+        self._future_pred_interval: int = max(        # predict_future 호출 주기 (프레임)
+            cfg.gru_seq_len, 30                       # 최소 30프레임 — 자기회귀 연산 비용
+        )
 
     # ── DetectorState 설정 (detector.py에서 호출) ──────────────────
     def set_state(self, state):
@@ -88,16 +90,12 @@ class TrafficAnalyzer:
             state                                     # 런타임 상태
         )
 
-    # ── 기준선 전달 (학습 완료 후 detector.py에서 호출) ─────────────
-    def set_baseline(self, baseline):
-        """학습 완료 후 BaselineStats를 FeatureExtractor와 CongestionJudge에 전달한다.
-
-        Args:
-            baseline: BaselineStats 객체.
-        """
+    # ── 준비 완료 신호 (학습 완료 후 detector.py에서 호출) ──────────
+    def set_baseline(self):
+        """학습 완료 신호. FeatureExtractor와 CongestionJudge를 활성화한다."""
         if self.feature_extractor is not None:        # FE가 초기화된 경우
-            self.feature_extractor.set_baseline(baseline)  # FE에 기준선 설정
-        self.congestion_judge.set_baseline(baseline)  # CJ에 기준선 설정
+            self.feature_extractor.set_ready()         # FE 활성화
+        self.congestion_judge.set_baseline()           # CJ EMA 초기화
 
     # ── 방향별 유효 셀 수 전달 (학습 완료 후 detector.py에서 호출) ──
     def set_valid_cell_count(self, n: int):
@@ -186,10 +184,10 @@ class TrafficAnalyzer:
             self._gru_module.push(x_t)                # feature 벡터 버퍼에 추가
             gru_score = self._gru_module.predict()    # gru_score (버퍼 부족 시 None)
 
-        if gru_score is not None:                     # GRU 예측 가능하면
+        if gru_score is not None:                     # GRU 예측 가능하면 (pretrain 완료)
             blend = self.cfg.gru_blend_ratio          # 블렌딩 비율 (기본 0.40)
             final_jam = (1.0 - blend) * rule_jam + blend * gru_score  # 가중 평균
-        else:                                         # GRU 예측 불가 → Phase 1 모드
+        else:                                         # GRU 미훈련·버퍼 부족 → Phase 1 모드
             final_jam = rule_jam                      # rule_jam 그대로 사용
 
         self._last_rule_jam = rule_jam                # rule_jam 저장 (로그용)
@@ -197,6 +195,13 @@ class TrafficAnalyzer:
 
         # ── 5) 레벨 판정 (히스테리시스 포함, final_jam 기준) ─────────
         level, jam = self.congestion_judge.apply_level(final_jam, frame_num)
+
+        # ── 6) 미래 예측 (predict_future — 매 _future_pred_interval 프레임) ──
+        if (self._gru_module is not None
+                and frame_num % self._future_pred_interval == 0):
+            pred = self._gru_module.predict_future()  # N스텝 자기회귀 롤아웃
+            if pred is not None:                      # 버퍼 부족·warmup이면 None
+                self._last_future_pred = pred         # 결과 저장
 
         # ── feature 저장 (detector.py에서 GRU online_step용 레벨 확인에 사용) ─
         self._last_feature = x_t                      # 마지막 feature 벡터 저장
@@ -240,6 +245,16 @@ class TrafficAnalyzer:
     def get_gru_score(self) -> float | None:
         """마지막 GRU 예측값을 반환한다. GRU 미사용 또는 warmup 중이면 None."""
         return self._last_gru_score                    # gru_score (로그·진단용)
+
+    def get_future_prediction(self) -> list | None:
+        """마지막 predict_future() 결과를 반환한다.
+
+        Returns:
+            [{"step": int, "p_smooth": float, "p_slow": float,
+              "p_congested": float, "gru_score": float}, ...]
+            GRU 미훈련·버퍼 부족이면 None.
+        """
+        return self._last_future_pred                  # 미래 예측 결과 (웹 API용)
 
     def get_volume(self) -> float:
         """교통량(대/시)을 추정한다.

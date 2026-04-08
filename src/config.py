@@ -18,18 +18,17 @@ class DetectorConfig:
     learning_frames: int = 1800        # 초기 학습에 사용할 프레임 수 — 원래 500, 충분한 셀 커버리지 확보
     alpha: float = 0.1                # EMA 학습 속도 (새 데이터 반영 비율 10%)
     min_samples: int = 5              # 셀당 최소 학습 샘플 수 (이하이면 공간 보정에 사용)
-    enable_online_flow_update: bool = False # 정상 흐름 학습에 사용(True)
-
     # ==================== 역주행 탐지 관련 설정 ====================
-    velocity_window: int = 20         # 속도/방향 계산 시 사용하는 프레임 간격 (이전 위치~현재 위치 거리) — 15→20 (bbox jitter의 방향 벡터 영향 완화)
+    velocity_window: int = 10         # 속도/방향 계산 프레임 간격 — 원거리 상행 차량 ID 수명 짧아 10으로 설정
     base_speed_threshold: float = 7.0 # 기본 속도 임계값 (원근에 따라 가중을 곱해 사용)
     cos_threshold: float = -0.75      # 코사인 유사도 임계값 (원본값 복원 — smoothing 오염 방지로 오탐 차단)
-    wrong_count_threshold: int = 12   # 역주행 확정까지 필요한 연속 의심 횟수 — 8→12 (오탐 감소)
+    wrong_count_threshold: int = 15   # 역주행 확정까지 필요한 연속 의심 횟수 — 8→12→15 (오탐 감소)
+    min_wrongway_track_age: int = 30  # 역주행 판정 시작까지 최소 추적 프레임 수 — 합류·ID 리셋 직후 오탐 차단
     vote_threshold: float = 0.7       # 투표 시 역방향 비율 임계값 (원본값 복원 — 60% 이상이면 역주행 의심)
     min_move_distance: float = 10.0    # 최소 누적 이동 거리 (이하면 정지로 판단) — 원래 20.0, 원거리 CCTV 대응 완화
     min_move_per_frame: float = 0.4   # 프레임당 평균 이동거리 (이하면 정지) — 원래 1.5, 원거리 CCTV 대응 완화
     direction_change_guard_frames: int = 120 # 방향 급변 이후 가드 기간 (프레임 수) — 급변 감지 시점부터 이 프레임 동안 의심 카운트 차단
-    direction_change_cos_threshold: float = 0.0  # 급변 감지 임계값 (cos 기준, 0.0=90°+, 0.5=60°+) — stable 방향 대비 이 이상 벗어나면 급변으로 기록
+    direction_change_cos_threshold: float = 0.3  # 급변 감지 임계값 (cos 기준) — 0.0(90°)→0.3(72°): bbox jitter 45~60° 편차도 가드 트리거
 
     # ==================== ID 매핑 관련 ====================
     id_match_distance: int = 120      # ID 재매칭 허용 거리 (픽셀 단위, 이전 ID와 새 ID 위치 비교)
@@ -53,18 +52,16 @@ class DetectorConfig:
     log_dir: Path | None = None         # 로그 저장 폴더
     log_interval_frames: int = 5        # 트랙/프레임 로그를 N프레임마다 기록
 
-    # ==================== 정체 탐지 파라미터 (OLD — CongestionPredictor 호환용) ====================
-    free_flow_speed: float = 100.0        # 자유 흐름 속도 기준 (km/h) — 고속도로 기본값
-    pixels_per_meter: float = 8.0         # 1미터 = 몇 픽셀 (카메라·해상도 따라 보정 필요)
-    congestion_hysteresis_sec: float = 3.0   # 정체 레벨 전환 유지 시간 (초) — 5→3으로 단축 (서행 반응속도 향상)
-    prediction_history_window: int = 30   # CongestionPredictor 속도 히스토리 창 (프레임 수)
-    prediction_horizon: int = 5           # 정체 예측 시간 범위 (분)
+    # ==================== 정체 탐지 히스테리시스 ====================
+    congestion_hysteresis_sec: float = 3.0   # 정체 레벨 전환 유지 시간 (초)
+
+    # ==================== CongestionPredictor 파라미터 ====================
+    free_flow_speed: float = 100.0           # 자유 흐름 속도 기준 (km/h) — 회복 예측용
+    prediction_history_window: int = 30      # 속도 히스토리 창 (프레임 수)
 
     # ==================== Phase 1 정체 탐지 파라미터 ====================
-    min_active_for_baseline: int   = 2      # 온라인 학습 baseline 갱신에 필요한 최소 활성 차량 수
-    min_passage_dist:        float = 100.0  # 유효 passage 최소 진입-퇴장 픽셀 거리
-    min_passages_required:   int   = 5      # 학습 종료에 필요한 최소 완성 passage 수
-    stop_mag_threshold:      float = 3.0    # (구버전 호환용, 미사용) 절대 픽셀 정지 임계값
+    count_ref: float = 8.0                  # 방향당 기준 차량 수 (count_ratio 계산용)
+    stop_mag_threshold:      float = 3.0    # 절대 픽셀 정지 임계값 (affected_vehicles 판정용)
     norm_stop_threshold:     float = 0.06   # bbox_h 대비 정지 임계값 (mag/bbox_h < 이 값 → 정지)
                                             # 0.10→0.06: 원거리 차량 bbox_h 클램프(30px) 시 nm≈0.07~0.10 오판 방지
                                             # 완전 정지는 nm≈0~0.03, 서행은 nm≈0.07+로 충분히 구분 가능
@@ -83,10 +80,9 @@ class DetectorConfig:
     grace_period_sec:        float = 60.0   # 카메라 전환 후 판정 유예 시간 (초)
 
     # ==================== jam_score 임계값 ====================
-    smooth_jam_threshold:    float = 0.30   # jam_score 이 값 미만 → SMOOTH — 0.25→0.30 (원활 차량 dwell/density 기여 흡수)
+    smooth_jam_threshold:    float = 0.25   # jam_score 이 값 미만 → SMOOTH
     slow_jam_threshold:      float = 0.60   # jam_score 이 값 미만 → SLOW, 이상 → CONGESTED
-    density_max_vehicles:   float = 40.0   # density 정규화 기준 차량 수 — 이 값 이상이면 density=1.0 (포화) — 20→40 (10대 원활 시 density 50%→25% 보정)
-    default_lcs:             float = 0.36   # 한강대교 베이스라인 학습 결과 — 모든 카메라 임계값 보정에 사용
+    density_max_vehicles:   float = 40.0   # density 정규화 기준 차량 수 — 이 값 이상이면 density=1.0 (포화)
 
     # ==================== jam_score EMA 스무딩 ====================
     # 비대칭 EMA: 악화(올라갈 때)는 빠르게, 호전(내려갈 때)은 느리게
@@ -113,15 +109,14 @@ class DetectorConfig:
     display_height: int = 720              # 화면 출력 창 높이 (픽셀). 0이면 원본 해상도 그대로
 
     # ==================== 정체 탐지 slow_ratio 파라미터 ====================
-    slow_upper_nm: float = 2.5             # 서행 판정 상한 nm (nm < 이 값 → 서행)
-                                           # 실측 기반 조정 (0.50→1.0→2.5):
-                                           #   서행(20~40 km/h) → nm ≈ 0.8~2.0 → 전부 포착
-                                           #   중속(40~60 km/h) → nm ≈ 2.5~4.0 → NORMAL 분류
-                                           #   고속(80+ km/h)   → nm ≈ 5.0+   → NORMAL 분류
-    nm_cy_correction_k: float = 0.0        # nm cy 보정 계수 — 비활성화 (0.6→0.0)
-                                           # 이유: nm=mag/bbox_h이 이미 원근 보정 중
-                                           #      cy 이중보정 시 서행 nm을 과증폭 → slow_upper_nm 초과 오분류
-                                           # 예) 서행 nm=0.43 → 보정 후 0.52 → NORMAL 오분류 방지
+    slow_upper_nm: float = 0.70            # 서행 판정 상한 nm (nm < 이 값 → 서행) — 0.50→0.70: EMA smoothing 도입 후 원거리 정상차량 nm 0.5~0.7 범위 오판 방지
+    norm_speed_ref_override: float = 0.0  # norm_speed_ref 고정값 (0이면 자기보정 baseline 사용)
+    nm_cy_correction_k: float = 0.0        # nm cy 보정 계수 — 0=비활성 (bbox_h 정규화로 충분, cy 이중보정 시 상행/하행 nm 비대칭 오탐)
+
+    # ==================== 방향별 자기보정 nm baseline ====================
+    nm_baseline_ema_up:   float = 0.05    # baseline 상승 EMA (원활 복귀 시 빠르게 반응)
+    nm_baseline_ema_down: float = 0.005   # baseline 하락 EMA (정체 지속 시 천천히 하락 — 약 10분 메모리)
+    nm_baseline_warmup:   int   = 300     # baseline 유효 최소 누적 프레임 (10초@30fps)
 
     # ==================== 방향별 차선 분리 파라미터 ====================
     lane_cos_threshold: float = 0.0        # 방향 분류 코사인 임계값 (≥ 이면 A방향, < 이면 B방향)

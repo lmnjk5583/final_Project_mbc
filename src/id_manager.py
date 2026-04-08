@@ -5,11 +5,10 @@ import numpy as np
 
 
 class IDManager:
-    def __init__(self, cfg, flow_map, state, passage_tracker=None):
+    def __init__(self, cfg, flow_map, state):
         self.cfg = cfg
         self.flow = flow_map
         self.st = state
-        self.passage_tracker = passage_tracker  # Phase 1 정체 탐지용 — None이면 기존 동작 유지
 
     # ==================== 라벨 조회 ====================
     def get_display_label(self, track_id):
@@ -140,22 +139,6 @@ class IDManager:
                         # (x, y, 사라진 프레임 번호)
                         st.wrong_way_last_pos[tid] = (
                             traj[-1][0], traj[-1][1], st.frame_num
-                        )
-
-                # Phase 1 정체 탐지 — 처음 사라지는 시점에 passage 퇴장 기록
-                if st._stale_counter[tid] == 1 and self.passage_tracker:
-                    traj = st.trajectories.get(tid, [])  # 해당 차량의 궤적 조회
-                    if traj:                              # 궤적이 있을 때만 처리
-                        last_fx = traj[-1][0]            # 마지막 footpoint x (trajectories에 fx 저장 시 자동반영)
-                        last_fy = traj[-1][1]            # 마지막 footpoint y (fy=y2로 변경 시 자동반영)
-                        self.passage_tracker.on_exit(    # PassageTracker에 퇴장 기록
-                            tid,                         # 차량 ID
-                            last_fx,                     # 퇴장 footpoint x
-                            last_fy,                     # 퇴장 footpoint y
-                            st.frame_num,                # 퇴장 프레임 번호
-                            is_complete=(                # 정상 퇴장 여부
-                                st._stale_counter[tid] < self.cfg.stale_threshold
-                            )
                         )
 
                 # N프레임 이상 계속 안 보이면 그 ID 관련 정보는 메모리에서 완전히 제거

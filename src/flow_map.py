@@ -534,43 +534,36 @@ class FlowMap:
               f"(flow_size={self.grid_size}x{self.grid_size})")
 
     # ==================== 저장/로드 ====================
-    def save(self, path: Path, baseline_stats=None):
-        """학습된 flow_map, count, speed_ref, smoothed_mask, baseline_stats를 .npy 파일로 저장.
+    def save(self, path: Path):
+        """학습된 flow_map, count, speed_ref, smoothed_mask를 .npy 파일로 저장.
 
         Args:
             path: 저장 파일 경로 (.npy).
-            baseline_stats: BaselineStats 객체 (없으면 None).
         """
         path.parent.mkdir(parents=True, exist_ok=True)    # 저장 폴더 생성
         data = {                                           # 저장할 데이터 딕셔너리
-            "version":       2,                           # 포맷 버전 (1=기존, 2=baseline 포함)
+            "version":       3,                           # 포맷 버전 (3=baseline 제거)
             "flow":          self.flow,                   # 흐름 벡터 배열
             "count":         self.count,                  # 셀별 샘플 수 배열
             "speed_ref":     self.speed_ref,              # 셀별 정상 속도 배열
-            "smoothed_mask": self.smoothed_mask,          # 보간 채움 셀 마스크 (개선 1)
+            "smoothed_mask": self.smoothed_mask,          # 보간 채움 셀 마스크
         }
-        if baseline_stats is not None:                    # baseline_stats가 있으면 함께 저장
-            import dataclasses                            # dataclass → dict 변환용
-            data["baseline_stats"] = dataclasses.asdict(baseline_stats)  # dict 직렬화
         np.save(path, data)                               # .npy 파일로 저장
         print(f"✅ flow_map 저장: {path}")
 
-    def load(self, path: Path):
+    def load(self, path: Path) -> bool:
         """기존에 저장된 flow_map 파일이 있으면 불러와서 사용.
 
         Returns:
-            (성공여부: bool, BaselineStats or None)
-            - 버전 1(기존): (True, None)
-            - 버전 2: (True, BaselineStats) 또는 (True, None)
-            - 파일 없음/불일치: (False, None)
+            bool: 로드 성공 여부.
         """
         if not path.exists():                             # 파일 없으면
-            return False, None                            # 로드 실패
+            return False                                  # 로드 실패
         data = np.load(path, allow_pickle=True).item()    # .npy 로드 (dict)
         loaded = data["flow"]                             # flow 배열 추출
         if loaded.shape[0] != self.grid_size:             # grid_size 불일치이면
             print("⚠️ grid 불일치, 초기화")
-            return False, None                            # 로드 실패
+            return False                                  # 로드 실패
         self.flow  = loaded                               # flow_map 로드
         self.count = data["count"]                        # count 로드
 
@@ -578,12 +571,7 @@ class FlowMap:
         if version >= 2 and "speed_ref" in data:          # 버전 2+ & speed_ref 있으면
             self.speed_ref = data["speed_ref"]            # 셀별 속도 기준 로드
         if "smoothed_mask" in data:                       # smoothed_mask가 저장되어 있으면
-            self.smoothed_mask = data["smoothed_mask"]    # 보간 마스크 로드 (개선 1)
-
-        baseline = None                                   # baseline 초기값 None
-        if version >= 2 and "baseline_stats" in data:     # 버전 2+ & baseline 있으면
-            from baseline_stats import BaselineStats      # 임포트 (순환 방지용 지연)
-            baseline = BaselineStats(**data["baseline_stats"])  # dict → 객체 복원
+            self.smoothed_mask = data["smoothed_mask"]    # 보간 마스크 로드
         print(f"✅ flow_map 로드 ({self.count.sum()} 샘플, ver={version}, "
               f"smoothed={int(np.sum(self.smoothed_mask))}셀)")
-        return True, baseline                             # (성공, baseline) 반환
+        return True                                       # 로드 성공

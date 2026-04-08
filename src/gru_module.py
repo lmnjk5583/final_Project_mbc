@@ -125,6 +125,8 @@ class GRUModule:
         # ── 온라인 학습 step 카운터 ──────────────────────────────────────
         self._step_count = 0                           # push() 호출 횟수
 
+        self._is_pretrained = False                        # pretrain/load 완료 여부 — False면 blend 비활성
+
         if not self._torch_ok:                         # PyTorch 없으면 여기서 종료
             self._net = None                           # 신경망 None
             self._optimizer = None                     # 옵티마이저 None
@@ -184,6 +186,9 @@ class GRUModule:
             return None
 
         if self._net is None:                          # 신경망 미초기화
+            return None
+
+        if not self._is_pretrained:                    # pretrain/load 미완료 → 랜덤 weights로 blend 금지
             return None
 
         if len(self._feature_buffer) < self.cfg.gru_seq_len:  # 버퍼 부족
@@ -332,7 +337,49 @@ class GRUModule:
             epoch_losses.append(float(loss.item()))    # loss 기록
 
         self._net.eval()                               # 학습 후 eval 모드 복원
+        self._is_pretrained = True                     # pretrain 완료 → blend 활성화
         return epoch_losses                            # epoch별 loss 리스트 반환
+
+    # ── save: GRU weights 저장 ───────────────────────────────────────────
+    def save(self, path) -> bool:
+        """학습된 GRU weights를 디스크에 저장한다.
+
+        Args:
+            path: 저장 경로 (Path 또는 str, .pt 확장자 권장).
+
+        Returns:
+            True(성공) / False(실패).
+        """
+        if not self._torch_ok or self._net is None:    # PyTorch 없거나 신경망 미초기화
+            return False
+        if not self._is_pretrained:                    # pretrain 미완료 — 저장 의미 없음
+            return False
+        try:
+            torch.save(self._net.state_dict(), path)   # state_dict만 저장 (경량)
+            return True
+        except Exception:
+            return False
+
+    # ── load: GRU weights 로드 ───────────────────────────────────────────
+    def load(self, path) -> bool:
+        """저장된 GRU weights를 로드한다.
+
+        Args:
+            path: 로드 경로 (Path 또는 str).
+
+        Returns:
+            True(성공) / False(실패 또는 PyTorch 없음).
+        """
+        if not self._torch_ok or self._net is None:    # PyTorch 없거나 신경망 미초기화
+            return False
+        try:
+            state = torch.load(path, map_location="cpu")  # CPU로 로드 (CUDA 없어도 동작)
+            self._net.load_state_dict(state)           # weights 적용
+            self._net.eval()                           # eval 모드 복원
+            self._is_pretrained = True                 # 로드 성공 → blend 활성화
+            return True
+        except Exception:
+            return False
 
     # ── online_step: SMOOTH 구간 온라인 학습 ─────────────────────────────
     def online_step(self, label: int):

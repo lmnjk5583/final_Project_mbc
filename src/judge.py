@@ -89,6 +89,14 @@ class WrongWayJudge:
         if track_id in st.wrong_way_ids:
             return True, 1.0, {"status": "CONFIRMED", "cos_values": []}
 
+        # ── 최소 추적 나이 체크 — 합류·ID 리셋 직후 오탐 차단 ──────────
+        # 새로 등장한 차량은 flow_map과 방향이 일시 불일치할 수 있음 (합류로·진입로)
+        # min_wrongway_track_age 프레임 미만이면 판정 건너뜀
+        _min_age = getattr(cfg, "min_wrongway_track_age", 30)
+        _track_age = st.frame_num - st.first_seen_frame.get(track_id, st.frame_num)
+        if _track_age < _min_age:
+            return False, 0, {"status": "too_young", "cos_values": []}
+
         # ── nm 기반 속도 게이트 (원근 정규화) ───────────────────────────
         # 기존 cy 기반 임계값(1~2 단위 변화)은 실제 속도 차이(10:1)를 보정 불가.
         # nm = speed / max(bbox_h, min_bbox_h) → feature_extractor의 정지 판정과 동일 기준.

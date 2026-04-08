@@ -19,14 +19,15 @@ from src.tracker import YoloTracker                                # YOLO+ByteTr
 
 # ── 설정 ─────────────────────────────────────────────────────────────
 MODEL_PATH  = PROJECT_ROOT / "runs" / "yolo11n_v1" / "weights" / "best.pt"
-VIDEO_PATH  = Path(r"N:\개인\대원&수빈\최종 프로젝트\임시\2026-03-31_10-44-07\videos") / "record_2026-03-31_10-44-07.mp4"
+# VIDEO_PATH  = Path(r"N:\개인\대원&수빈\최종 프로젝트\임시") / "정체_완화_테스트.mp4"
+VIDEO_PATH  = Path(r"N:\개인\대원&수빈\최종 프로젝트\임시") / "서행_테스트.mp4"
 CONF        = 0.45          # YOLO 신뢰도 임계값
 
-VELOCITY_WINDOW    = 20        # nm 계산 프레임 간격 (detector.py와 동일)
-MIN_BBOX_H         = 30.0      # bbox_h 최솟값 클램프
-NORM_STOP_THR      = 0.06      # nm < 이 값 → stop
-SLOW_UPPER_NM      = 2.5       # nm < 이 값 → slow, 이상 → normal  ← config.py 동기화 (0.50→2.5)
-NM_CY_CORRECTION_K = 0.0       # cy 보정 계수 ← config.py 동기화 (0.4→0.0, cy 이중보정 비활성화)
+VELOCITY_WINDOW    = 10   # nm 계산 프레임 간격 — 10으로 낮춰 원거리 차량 커버
+MIN_BBOX_H         = 30.0 # bbox_h 최솟값 클램프
+NORM_STOP_THR      = 0.06 # nm < 이 값 → stop
+SLOW_UPPER_NM      = 0.70 # nm < 이 값 → slow, 이상 → normal
+NM_CY_CORRECTION_K = 0.4  # cy 보정 계수
 
 # ── 색상 ─────────────────────────────────────────────────────────────
 COLOR = {
@@ -47,10 +48,10 @@ def classify_nm(nm: float) -> str:
 
 def main():
     # ── 초기화 ───────────────────────────────────────────────────────
-    tracker     = YoloTracker(MODEL_PATH, CONF)
-    cap         = cv2.VideoCapture(str(VIDEO_PATH))
+    tracker      = YoloTracker(MODEL_PATH, CONF)
+    cap          = cv2.VideoCapture(str(VIDEO_PATH))
     trajectories = defaultdict(list)    # {tid: [(cx, cy), ...]} 궤적
-    frame_num   = 0
+    frame_num    = 0
 
     if not cap.isOpened():
         print(f"[ERROR] 영상을 열 수 없습니다: {VIDEO_PATH}")
@@ -94,45 +95,50 @@ def main():
             # nm 계산 — velocity_window 이상 궤적이 있을 때만
             traj = trajectories[tid]
             if len(traj) >= VELOCITY_WINDOW:
-                ox, oy  = traj[-VELOCITY_WINDOW]         # VELOCITY_WINDOW 전 위치
-                mag     = np.sqrt((cx - ox)**2 + (cy - oy)**2)  # 이동량 (픽셀)
-                bbox_h  = max(y2 - y1, MIN_BBOX_H)       # bbox 높이 클램프
-                nm_raw  = mag / bbox_h                   # normalized_mag (보정 전)
-                if NM_CY_CORRECTION_K > 0:               # cy 보정 적용
-                    cy_ratio = cy / max(fh, 1)            # 0(상단/원거리)~1(하단/근거리)
-                    denom = 1.0 + NM_CY_CORRECTION_K * (2.0 * cy_ratio - 1.0)  # 대칭 보정
-                    nm = nm_raw / max(denom, 0.1)         # 원거리 부스트·근거리 감소
+                ox, oy = traj[-VELOCITY_WINDOW]          # VELOCITY_WINDOW 전 위치
+                dx     = cx - ox                         # x 이동량 (부호 있음)
+                dy     = cy - oy                         # y 이동량 (부호 있음)
+                mag    = np.sqrt(dx**2 + dy**2)          # 이동량 (픽셀)
+                bbox_h = max(y2 - y1, MIN_BBOX_H)        # 최솟값 클램프
+                nm_raw = mag / bbox_h                    # normalized_mag (보정 전)
+                nm = nm_raw
+                if NM_CY_CORRECTION_K > 0:               # cy 보정 (대칭)
+                    cy_ratio = cy / max(fh, 1)
+                    denom = 1.0 + NM_CY_CORRECTION_K * (2.0 * cy_ratio - 1.0)
+                    nm = nm / max(denom, 0.1)
+
+                # 방향 판별 — dx > 0: 오른쪽(→) 상행, dx < 0: 왼쪽(←) 하행
+                if mag > 2.0:                            # 정지에 가까우면 방향 불명
+                    direction = "상행" if dx > 0 else "하행"
                 else:
-                    nm = nm_raw
-                label   = classify_nm(nm)
-                color   = COLOR[label]
+                    direction = "정지"
+
+                label = classify_nm(nm)
+                color = COLOR[label]
 
                 # bbox 그리기
                 cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
 
-                # nm 값 + 분류 표시 (bbox 상단) — raw→보정 후 함께 표시
-                text = f"nm={nm:.2f}(raw={nm_raw:.2f}) [{label}]"
+                # 모든 차량에 nm + 방향 표시
+                if label != "normal":
+                    text = f"{direction} nm={nm:.2f} [{label}]"
+                    font_scale = 0.45
+                else:
+                    text = f"{direction} {nm:.2f}"       # normal은 간결하게
+                    font_scale = 0.38
                 (tw, th), _ = cv2.getTextSize(
-                    text, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1
+                    text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, 1
                 )
                 cv2.rectangle(frame,                                 # 텍스트 배경
                               (x1, y1 - th - 6), (x1 + tw + 4, y1),
                               (0, 0, 0), -1)
                 cv2.putText(frame, text, (x1 + 2, y1 - 4),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
+                            cv2.FONT_HERSHEY_SIMPLEX, font_scale, color, 1, cv2.LINE_AA)
 
-                # mag(픽셀) + bbox_h 표시 (bbox 하단)
-                sub_text = f"mag={mag:.0f}px h={bbox_h:.0f}px"
-                cv2.putText(frame, sub_text, (x1 + 2, y2 + 14),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.38, (200, 200, 200), 1, cv2.LINE_AA)
-
-                nm_log.append((tid, nm, label, mag, bbox_h, nm_raw))
+                nm_log.append((tid, nm, label, mag, bbox_h, nm_raw, direction))
             else:
-                # 궤적 부족 — 회색 박스만
-                cv2.rectangle(frame, (x1, y1), (x2, y2), (128, 128, 128), 1)
-                cv2.putText(frame, f"ID:{tid} (warming)",
-                            (x1 + 2, y1 - 4),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.38, (128, 128, 128), 1)
+                # 궤적 부족 — 회색 박스만 (텍스트 없음)
+                cv2.rectangle(frame, (x1, y1), (x2, y2), (80, 80, 80), 1)
 
         # ── 이 프레임 nm 분포 요약 (화면 좌상단) ─────────────────────
         if nm_log:
@@ -171,14 +177,18 @@ def main():
             print(f"{'[일시정지]' if paused else '[재개]'}")
         elif key == ord("s"):
             print(f"\n=== Frame {frame_num} nm 상세 ===")
-            for tid, nm, label, mag, bbox_h, nm_raw in sorted(nm_log, key=lambda x: x[1]):
-                print(f"  ID:{tid:4d}  nm={nm:.3f}(raw={nm_raw:.3f})  [{label:6s}]  "
+            for tid, nm, label, mag, bbox_h, nm_raw, direction in sorted(nm_log, key=lambda x: x[1]):
+                print(f"  [{direction:2s}] ID:{tid:4d}  nm={nm:.3f}(raw={nm_raw:.3f})  [{label:6s}]  "
                       f"mag={mag:5.1f}px  bbox_h={bbox_h:5.1f}px")
             if nm_log:
                 nms = [r[1] for r in nm_log]
-                print(f"  → avg={np.mean(nms):.3f}  "
-                      f"stop_ratio={stops/total:.2f}  "
-                      f"slow_ratio={(stops+slows)/total:.2f}")
+                up_nms   = [r[1] for r in nm_log if r[6] == "상행"]
+                down_nms = [r[1] for r in nm_log if r[6] == "하행"]
+                print(f"  → 전체 avg={np.mean(nms):.3f}  stop={stops/total:.2f}  slow={(stops+slows)/total:.2f}")
+                if up_nms:
+                    print(f"  → 상행 avg={np.mean(up_nms):.3f}  min={min(up_nms):.3f}  max={max(up_nms):.3f}  n={len(up_nms)}")
+                if down_nms:
+                    print(f"  → 하행 avg={np.mean(down_nms):.3f}  min={min(down_nms):.3f}  max={max(down_nms):.3f}  n={len(down_nms)}")
 
     cap.release()
     cv2.destroyAllWindows()
