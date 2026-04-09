@@ -263,45 +263,55 @@ class FeatureExtractor:
                 elif _nm_h < slow_upper_nm:                # 서행
                     _hist_slow += 1
 
-        if _hist_total >= 2:                               # 최소 2관측 이상
-            _pure_slow_hist = _hist_slow - _hist_stop      # 순수 서행 관측 수
+        # ── slow_cell_density / stop_cell_density ────────────────────
+        # 핵심 설계 변경: 비율(ratio) 대신 절대 밀도(count / road_capacity) 사용
+        #
+        # 문제: slow_ratio = slow_count / detected_count
+        #   → 1대만 있어도 slow_ratio=1.0 → slow_density=0.22 → jam=0.29
+        #
+        # 해결: road_capacity = valid_cell_count × NM_WIN (도로 최대 수용량)
+        #   → slow_cell_density = _hist_slow / road_capacity
+        #   → 1대 slow / (20셀×5프레임) = 5/100 = 0.05 → jam ≈ 0.13 ✓
+        #   → 10대 slow / (20셀×5프레임) = 50/100 = 0.50 → jam ≈ 0.80 ✓
+        _road_capacity = valid_cell_count * self._NM_WIN   # 도로 최대 수용 관측 수
+        _pure_slow_hist = _hist_slow - _hist_stop          # 순수 서행 관측 수 (정지 제외)
+        slow_cell_density = _pure_slow_hist / max(_road_capacity, 1)   # 서행 밀도
+        stop_cell_density = _hist_stop / max(_road_capacity, 1)        # 정지 밀도
+
+        # ── nm_variance: 속도 분산 (정체 징후 보조 신호) ─────────────
+        # 정체: 정지+서행 혼재 → 분산 높음 / 원활: 모두 비슷 → 분산 낮음
+        if len(_all_nm_vals) >= 4:
+            _nm_std = float(np.std(_all_nm_vals))
+            nm_variance_score = float(np.clip(_nm_std / slow_upper_nm, 0.0, 1.0))
+        else:
+            nm_variance_score = 0.0
+
+        # ── 하위 호환용 slow_ratio / stop_ratio (GRU feature용) ───────
+        if _hist_total >= 2:
             slow_ratio = _pure_slow_hist / _hist_total
             stop_ratio = _hist_stop / _hist_total
-        else:                                              # 관측 없음
+        else:
             slow_ratio = 0.0
             stop_ratio = 0.0
 
-        # ── nm_variance: 속도 분산 (정체 징후 보조 신호) ─────────────
-        # 정체: 정지 차량 + 서행 차량 혼재 → nm 분산 높음
-        # 원활: 모든 차량 비슷한 속도 → nm 분산 낮음
-        # 정규화: slow_upper_nm 기준으로 [0, 1] 스케일
-        if len(_all_nm_vals) >= 4:                         # 최소 4관측 이상일 때만 신뢰
-            _nm_std = float(np.std(_all_nm_vals))          # nm 표준편차
-            nm_variance_score = float(np.clip(             # slow_upper_nm 기준 정규화
-                _nm_std / slow_upper_nm, 0.0, 1.0
-            ))
-        else:
-            nm_variance_score = 0.0                        # 관측 부족 → 0
-
-        # ── slow_density: 속도×밀도 결합 신호 ───────────────────────────
-        # slow_ratio만 쓰면 차가 없어져도 비율이 올라 jam 상승하는 역효과
-        # bbox_coverage(밀도)를 곱해 "얼마나 많은 차량이 느린가"를 단일 값으로
-        slow_density = slow_ratio * float(np.sqrt(bbox_coverage))  # 속도×밀도 결합
+        slow_density = slow_cell_density                   # congestion_judge 전달용 별칭
 
         # ── 디버그 출력 (30프레임마다) ───────────────────────────────
         if frame_num % 30 == 0:
             print(f"[FE] f={frame_num} known={speed_known_count} "
-                  f"slow_r={slow_ratio:.3f} stop_r={stop_ratio:.3f} "
-                  f"bbox={bbox_coverage:.3f} slow_d={slow_density:.3f} "
-                  f"nm_var={nm_variance_score:.3f}")
+                  f"scd={slow_cell_density:.3f} stcd={stop_cell_density:.3f} "
+                  f"bbox={bbox_coverage:.3f} nm_var={nm_variance_score:.3f} "
+                  f"cap={_road_capacity}")
 
         # ── feature 딕셔너리 조립 ────────────────────────────────────
         return {                                       # feature 벡터
             "norm_speed_ratio":      norm_speed_ratio,       # [0] 속도 비율 (자기보정 baseline 기준)
             "nm_baseline_valid":     _nm_baseline_valid,     # baseline 준비 여부
-            "stop_ratio":            stop_ratio,             # [1] 정지 비율 (nm_median < 0.06)
-            "slow_ratio":            slow_ratio,             # [1.5] 순수 서행 비율 (정지 제외)
-            "slow_density":          slow_density,           # [1.6] 속도×밀도 결합 (차없을때 jam 상승 방지)
+            "stop_ratio":            stop_ratio,             # [1] 정지 비율 (GRU용)
+            "slow_ratio":            slow_ratio,             # [1.5] 서행 비율 (GRU용)
+            "slow_density":          slow_density,           # [1.6] = slow_cell_density (congestion_judge용)
+            "slow_cell_density":     slow_cell_density,      # 서행 차량수 / road_capacity
+            "stop_cell_density":     stop_cell_density,      # 정지 차량수 / road_capacity
             "nm_variance_score":     nm_variance_score,      # [1.7] nm 분산 (정체 징후 보조)
             "density_score":         density_score,          # [2] bbox_coverage 별칭 (하위 호환)
             "bbox_coverage":         bbox_coverage,          # [2] 도로 면적 대비 셀 점유율 (궤적확인 차량만)

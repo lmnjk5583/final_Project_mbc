@@ -29,18 +29,18 @@ def _clip(value: float, lo: float, hi: float) -> float:
 
 
 def compute_jam_score_fallback(x_t: dict) -> float:
-    """slow_density·stop_ratio·nm_variance·bbox_coverage로 jam_score를 계산한다.
+    """slow_cell_density·stop_cell_density·nm_variance·bbox로 jam_score를 계산한다.
 
-    slow_density  = slow_ratio × √bbox_coverage
-                    차가 없어지면 0으로 수렴 — 밀도 없이 비율만 높은 오탐 방지
-    stop_ratio    = 완전 정지 비율 — 심각한 정체 신호
-    nm_variance   = nm 표준편차/slow_upper_nm — 속도 분산 (정체 시 혼재 패턴)
-    bbox_coverage = 셀 점유율 — 도로 밀도 신호
+    slow_cell_density = 서행 관측수 / (valid_cell_count × NM_WIN)
+                        절대 대수 반영 — 1대면 0.05, 7대면 0.35
+    stop_cell_density = 정지 관측수 / road_capacity — 심각한 정체 신호
+    nm_variance       = nm 표준편차 / slow_upper_nm — 속도 혼재 패턴
+    bbox_coverage     = 셀 점유율 보조
 
     설계 목표:
-      - 원활 (slow_d=0.01, stop=0,    var=0.05, bbox=0.05): jam ≈ 0.05 → SMOOTH
-      - 서행 (slow_d=0.30, stop=0,    var=0.25, bbox=0.18): jam ≈ 0.72 → SLOW
-      - 정체 (slow_d=0.19, stop=0.30, var=0.40, bbox=0.22): jam ≈ 0.94 → CONGESTED
+      - 원활 (1대 slow, 20셀):       scd=0.05 → jam ≈ 0.18 → SMOOTH
+      - 서행 (7대 slow, 20셀):       scd=0.35 → jam ≈ 0.89 → SLOW
+      - 정체 (4stop+4slow, 20셀):    scd=0.20, stcd=0.20 → jam = 1.0 → CONGESTED
 
     Args:
         x_t: feature 벡터 dict.
@@ -48,11 +48,15 @@ def compute_jam_score_fallback(x_t: dict) -> float:
     Returns:
         jam_score (0.0~1.0).
     """
-    # ── slow_density: 속도×밀도 결합 주 신호 ─────────────────────────
-    slow_density = _clip(x_t.get("slow_density", 0.0), 0.0, 1.0)
+    # ── 주 신호: slow_cell_density (서행 차량수 / road_capacity) ────
+    # road_capacity = valid_cell_count × NM_WIN
+    # 1대/20셀 → 0.05,  7대/20셀 → 0.35,  10대/20셀 → 0.50
+    slow_density = _clip(x_t.get("slow_cell_density",
+                                  x_t.get("slow_density", 0.0)), 0.0, 1.0)
 
-    # ── 정지 비율 (독립 기여) ─────────────────────────────────────────
-    stop_contribution = _clip(x_t.get("stop_ratio", 0.0), 0.0, 1.0)
+    # ── 정지 밀도 (stop_cell_density) ────────────────────────────────
+    stop_density = _clip(x_t.get("stop_cell_density",
+                                  x_t.get("stop_ratio", 0.0)), 0.0, 1.0)
 
     # ── nm 분산 (정체 징후 보조) ──────────────────────────────────────
     var_contribution = _clip(x_t.get("nm_variance_score", 0.0), 0.0, 1.0)
@@ -64,19 +68,19 @@ def compute_jam_score_fallback(x_t: dict) -> float:
     bbox_contribution = math.sqrt(raw_bbox)
 
     # ── 가중 합산 ─────────────────────────────────────────────────────
-    # slow_density(1.30): 속도×밀도 결합 주 신호 — 차 없을 때 자동 0
-    # stop(0.90):         완전 정지 — 심각한 정체 신호
-    # nm_variance(0.25):  속도 분산 보조 — 원활 구간 noise 억제로 0.40→0.25
-    # bbox(0.30):         도로 밀도 보조 — 원활(bbox≈0.15)에서 0.12 기여로 제한
+    # slow_density(2.00): 서행 밀도 주 신호 (1대→0.05→기여0.10, 7대→0.35→기여0.70)
+    # stop_density(2.50): 정지 밀도 — slow보다 심각
+    # nm_variance(0.25):  속도 혼재 보조
+    # bbox(0.30):         밀도 보조
     #
-    # 원활 검증 (slow_d=0.01, stop=0, var=0.05, bbox=0.15):
-    #   jam = 1.30×0.01 + 0 + 0.25×0.05 + 0.30×√0.15 = 0.013+0.012+0.116 = 0.14 → SMOOTH
-    # 서행 검증 (slow_d=0.30, stop=0, var=0.25, bbox=0.18):
-    #   jam = 1.30×0.30 + 0 + 0.25×0.25 + 0.30×√0.18 = 0.390+0.063+0.127 = 0.58 → SLOW
-    # 정체 검증 (slow_d=0.19, stop=0.30, var=0.40, bbox=0.22):
-    #   jam = 1.30×0.19 + 0.90×0.30 + 0.25×0.40 + 0.30×√0.22 = 0.247+0.270+0.100+0.141 = 0.76 → CONGESTED
-    jam = (1.30 * slow_density                          # 속도×밀도 주 신호
-           + 0.90 * stop_contribution                   # 완전 정지
+    # 원활 (1대 slow, 20셀): scd=0.05, stcd=0, var=0.05, bbox=0.05
+    #   jam = 2.00×0.05 + 0 + 0.25×0.05 + 0.30×√0.05 = 0.10+0.01+0.07 = 0.18 → SMOOTH
+    # 서행 (7대 slow, 20셀): scd=0.35, stcd=0, var=0.25, bbox=0.18
+    #   jam = 2.00×0.35 + 0 + 0.25×0.25 + 0.30×√0.18 = 0.70+0.06+0.13 = 0.89 → SLOW
+    # 정체 (4stop+4slow, 20셀): scd=0.20, stcd=0.20, var=0.40, bbox=0.22
+    #   jam = 2.00×0.20 + 2.50×0.20 + 0.25×0.40 + 0.30×√0.22 = 0.40+0.50+0.10+0.14 = 1.0
+    jam = (2.00 * slow_density                          # 서행 밀도 주 신호
+           + 2.50 * stop_density                        # 정지 밀도
            + 0.25 * var_contribution                    # 속도 분산 보조
            + 0.30 * bbox_contribution)                  # 셀 점유율 보조
 
