@@ -68,6 +68,7 @@ class Detector:
                     raise FileNotFoundError(                        # 즉시 예외 → 잘못된 실험 방지
                         f"detect_only=True 인데 flow_map이 없습니다: {cfg.flow_map_path}"
                     )
+                self.flow.speed_ref[:] = 0                          # 이전 세션 오염 방지 — 항상 리셋
                 self.state.is_learning = False                      # 로드 성공 → 학습 모드 해제
         else:                                                       # flow_map_path가 None
             if cfg.detect_only:                                     # 탐지 전용인데 경로 자체가 없음
@@ -746,6 +747,26 @@ class Detector:
                 if self.gru_module_b is not None:                   # B방향 GRU 있으면
                     if self.traffic_analyzer_b.get_congestion_level() == "SMOOTH":
                         self.gru_module_b.online_step(label=0)      # SMOOTH=0 레이블
+
+                # ── flow_map speed_ref 온라인 학습 (SMOOTH 구간만) ────────
+                # SMOOTH 구간의 nm을 셀별로 EMA 축적 → 위치별 정상속도 기준 확보
+                # 이후 feature_extractor에서 velocity_deficit = 1 - nm/speed_ref 계산에 사용
+                for t in tracks:                                    # 활성 차량 순회
+                    _tid = t["id"]
+                    _mag = speeds.get(_tid)                         # 속도 (없으면 None=신규)
+                    if _mag is None or _mag <= 0:                   # 신규·정지 차량 제외
+                        continue
+                    _bh_ref = max(t["y2"] - t["y1"], cfg.min_bbox_h)  # bbox_h 클램프
+                    _nm_ref = _mag / _bh_ref                        # normalized_mag
+                    _dir_ref = self._track_direction.get(_tid, 'a') # 차량 방향
+                    # 방향별 SMOOTH 레벨일 때만 학습
+                    _lvl = (self.traffic_analyzer_a.get_congestion_level()
+                            if _dir_ref == 'a'
+                            else self.traffic_analyzer_b.get_congestion_level())
+                    if _lvl == "SMOOTH":                            # SMOOTH 구간만 학습
+                        _fx = t.get("fx", t["cx"])                  # footpoint x
+                        _fy = t.get("fy", t["y2"])                  # footpoint y
+                        self.flow.learn_baseline(_fx, _fy, _nm_ref) # 셀별 정상 속도 EMA 갱신
 
             # ── 트랙 정리 ──
             if st.frame_num % 30 == 0:                              # 30프레임마다
