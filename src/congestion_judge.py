@@ -2,13 +2,12 @@
 # 역할: jam_score 계산(fallback) + 레벨 판정(SMOOTH/SLOW/CONGESTED) + 히스테리시스
 # 의존성: math (표준 라이브러리 — sqrt)
 
-import math                                            # sqrt — bbox_coverage 비선형 변환
-
 
 # ======================================================================
 # 모듈 수준 함수 — jam_score 계산
 # ======================================================================
-
+import os
+print(f"[DEBUG] 실제 로드된 파일: {os.path.abspath(__file__)}")
 def _clip(value: float, lo: float, hi: float) -> float:
     """value를 [lo, hi] 범위로 클램프한다.
 
@@ -29,18 +28,21 @@ def _clip(value: float, lo: float, hi: float) -> float:
 
 
 def compute_jam_score_fallback(x_t: dict) -> float:
-    """slow_cell_density·stop_cell_density·nm_variance·bbox로 jam_score를 계산한다.
+    """flow map 기반 — Cell Dwell EMA 누적값(cell_dwell_score)으로 jam_score를 계산한다.
 
-    slow_cell_density = 서행 관측수 / (valid_cell_count × NM_WIN)
-                        절대 대수 반영 — 1대면 0.05, 7대면 0.35
-    stop_cell_density = 정지 관측수 / road_capacity — 심각한 정체 신호
-    nm_variance       = nm 표준편차 / slow_upper_nm — 속도 혼재 패턴
-    bbox_coverage     = 셀 점유율 보조
+    cell_dwell_score: 각 셀의 누적 점유 EMA 합 / valid_cell_count
+      점유 중인 셀: ema += 0.05 × (1 - ema) — 서서히 1 수렴
+      빈 셀:       ema *= 0.98              — 서서히 0 수렴
+      30프레임 연속 점유 시 ema ≈ 0.78
 
-    설계 목표:
-      - 원활 (1대 slow, 20셀):       scd=0.05 → jam ≈ 0.18 → SMOOTH
-      - 서행 (7대 slow, 20셀):       scd=0.35 → jam ≈ 0.89 → SLOW
-      - 정체 (4stop+4slow, 20셀):    scd=0.20, stcd=0.20 → jam = 1.0 → CONGESTED
+    ID 변경 무관 — 셀 점유 여부만 봄
+    정상 차량(빠른 통과): ema 낮게 유지 → cds 낮음
+    정체 차량(같은 셀 오래 머묾): ema 서서히 누적 → cds 높음
+
+    설계 목표 (smooth<0.25, slow<0.55, congested≥0.55):
+      - 원활 (cds=0.05, occ=0.05): jam=0.045+0.015=0.060 → SMOOTH
+      - 서행 (cds=0.20, occ=0.15): jam=0.180+0.045=0.225 → SLOW
+      - 정체 (cds=0.60, occ=0.25): jam=0.540+0.075=0.615 → CONGESTED
 
     Args:
         x_t: feature 벡터 dict.
@@ -48,43 +50,37 @@ def compute_jam_score_fallback(x_t: dict) -> float:
     Returns:
         jam_score (0.0~1.0).
     """
-    # ── 주 신호: slow_cell_density (서행 차량수 / road_capacity) ────
-    # road_capacity = valid_cell_count × NM_WIN
-    # 1대/20셀 → 0.05,  7대/20셀 → 0.35,  10대/20셀 → 0.50
-    slow_density = _clip(x_t.get("slow_cell_density",
-                                  x_t.get("slow_density", 0.0)), 0.0, 1.0)
+    import math
 
-    # ── 정지 밀도 (stop_cell_density) ────────────────────────────────
-    stop_density = _clip(x_t.get("stop_cell_density",
-                                  x_t.get("stop_ratio", 0.0)), 0.0, 1.0)
+    cds      = _clip(x_t.get("cell_dwell_score", 0.0), 0.0, 1.0)
+    flow_occ = _clip(x_t.get("flow_occupancy",   0.0), 0.0, 1.0)
+    persist  = _clip(x_t.get("cell_persistence", 0.0), 0.0, 1.0)
+    dwell    = _clip(x_t.get("dwell_cell_ratio", 0.0), 0.0, 1.0)
 
-    # ── nm 분산 (정체 징후 보조) ──────────────────────────────────────
-    var_contribution = _clip(x_t.get("nm_variance_score", 0.0), 0.0, 1.0)
+    known_cnt    = int(x_t.get("known_vehicle_count", 0))
+    occupied_cnt = int(x_t.get("occupied_cell_count", 0))
 
-    # ── bbox 점유율 — sqrt 비선형 변환 ───────────────────────────────
-    raw_bbox = _clip(
-        x_t.get("bbox_coverage", x_t.get("density_score", 0.0)), 0.0, 1.0
+    # ── 1) 저규모 상황은 정체로 보지 않음 ─────────────────────
+    # 차량 1~2대 / 점유셀 1~2개는 "개별 차량 체류"일 가능성이 높음
+    # → cds, persist를 거의 무시
+    if known_cnt <= 2 or occupied_cnt <= 2 or flow_occ < 0.06:
+        return _clip(0.08 * math.sqrt(flow_occ), 0.0, 0.10)
+
+    # ── 2) 규모 게이트: 차량 수와 점유율이 충분할수록 체류 신호를 신뢰 ──
+    count_gate = _clip((known_cnt - 2) / 8.0, 0.0, 1.0)      # 2대 이하는 0, 10대면 1
+    occ_gate   = _clip((flow_occ - 0.06) / 0.20, 0.0, 1.0)   # 점유율 낮으면 억제
+    scale_gate = count_gate * occ_gate
+
+    # ── 3) 핵심 jam 계산 ─────────────────────────────────────
+    core = (
+        1.10 * cds
+        + 0.25 * persist
+        + 0.10 * math.sqrt(dwell)
     )
-    bbox_contribution = math.sqrt(raw_bbox)
 
-    # ── 가중 합산 ─────────────────────────────────────────────────────
-    # slow_density(2.00): 서행 밀도 주 신호 (1대→0.05→기여0.10, 7대→0.35→기여0.70)
-    # stop_density(2.50): 정지 밀도 — slow보다 심각
-    # nm_variance(0.25):  속도 혼재 보조
-    # bbox(0.30):         밀도 보조
-    #
-    # 원활 (1대 slow, 20셀): scd=0.05, stcd=0, var=0.05, bbox=0.05
-    #   jam = 2.00×0.05 + 0 + 0.25×0.05 + 0.30×√0.05 = 0.10+0.01+0.07 = 0.18 → SMOOTH
-    # 서행 (7대 slow, 20셀): scd=0.35, stcd=0, var=0.25, bbox=0.18
-    #   jam = 2.00×0.35 + 0 + 0.25×0.25 + 0.30×√0.18 = 0.70+0.06+0.13 = 0.89 → SLOW
-    # 정체 (4stop+4slow, 20셀): scd=0.20, stcd=0.20, var=0.40, bbox=0.22
-    #   jam = 2.00×0.20 + 2.50×0.20 + 0.25×0.40 + 0.30×√0.22 = 0.40+0.50+0.10+0.14 = 1.0
-    jam = (2.00 * slow_density                          # 서행 밀도 주 신호
-           + 2.50 * stop_density                        # 정지 밀도
-           + 0.25 * var_contribution                    # 속도 분산 보조
-           + 0.30 * bbox_contribution)                  # 셀 점유율 보조
+    jam = core * scale_gate + 0.12 * math.sqrt(flow_occ)
 
-    return _clip(jam, 0.0, 1.0)                         # [0, 1] 범위 클램프
+    return _clip(jam, 0.0, 1.0)
 
 
 # ======================================================================
@@ -162,7 +158,9 @@ class CongestionJudge:
           - 학습 직후 "중립 → 실제 상태" 방향으로 빠르게 수렴
         """
         self._baseline_set = True                      # 학습 완료 표시
-        self._ema_jam = 0.5                            # EMA 중립값으로 초기화 (학습 직후 빠른 수렴)
+        self._ema_jam = 0.0                            # EMA 중립값으로 초기화 (학습 직후 빠른 수렴)
+        self._last_jam_score = 0.0 
+        print(f"[CJ] alpha_up={self._alpha_up:.3f} alpha_down={self._alpha_down:.3f}")  # 추가
 
     # ── 레벨 판정 ────────────────────────────────────────────────────
     def _classify(self, jam_score: float) -> str:
@@ -260,25 +258,26 @@ class CongestionJudge:
             (level: str, ema_jam: float) 튜플. ema_jam이 표시·판정에 사용됨.
         """
         # ── 비대칭 EMA 적용 ──────────────────────────────────────────
-        if jam >= self._ema_jam:                       # 악화 방향 (올라갈 때)
-            alpha = self._alpha_up                     # 빠른 반응 (0.10)
-        else:                                          # 호전 방향 (내려갈 때)
-            alpha = self._alpha_down                   # 느린 반응 (0.04)
-        self._ema_jam = alpha * jam + (1.0 - alpha) * self._ema_jam  # EMA 갱신
-        ema_jam = self._ema_jam                        # 스무딩된 jam_score
+        # 1. EMA 계산
+        if jam >= self._last_jam_score:  # rule_jam vs 마지막 ema_jam 비교
+            alpha = self._alpha_up
+        else:
+            alpha = self._alpha_down
+        self._last_jam_score = alpha * jam + (1.0 - alpha) * self._last_jam_score
+        self._ema_jam = self._last_jam_score  # 동기화
 
-        self._last_jam_score = ema_jam                 # EMA jam_score 저장 (표시용)
+        # 3. 레벨 판정
+        raw_level = self._classify(self._last_jam_score)
+        level = self._apply_hysteresis(raw_level)
 
-        raw_level = self._classify(ema_jam)            # EMA 기반 원시 레벨 판정
-        level = self._apply_hysteresis(raw_level)      # 히스테리시스 적용
+        # 4. 정체 지속 시간 추적
+        if level in ("SLOW", "CONGESTED"):
+            if self._congestion_start_frame is None:
+                self._congestion_start_frame = frame_num
+        else:
+            self._congestion_start_frame = None
 
-        if level in ("SLOW", "CONGESTED"):             # 정체 상태이면
-            if self._congestion_start_frame is None:   # 처음 진입
-                self._congestion_start_frame = frame_num  # 시작 프레임 기록
-        else:                                          # SMOOTH이면
-            self._congestion_start_frame = None        # 초기화
-
-        return level, ema_jam                          # (레벨, EMA jam) 반환
+        return level, self._last_jam_score
 
     # ── 메인 갱신 ────────────────────────────────────────────────────
     def update(self, x_t: dict, frame_num: int) -> tuple:

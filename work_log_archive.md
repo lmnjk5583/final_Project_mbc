@@ -912,3 +912,22 @@
 ### 수정 파일 [대원]
 `src/congestion_judge.py`, `src/flow_map.py`, `src/detector.py`
 
+
+---
+
+## 2026-04-07 (81~90차 — 대규모 리팩토링: 데드코드 제거 + 역주행 오탐 개선) [대원]
+
+**데드코드 완전 제거**: `baseline_stats.py`, `passage_tracker.py`, `bbox_stabilizer.py` 삭제
+**역주행 오탐 개선**: `min_wrongway_track_age=30`, footpoint EMA smoothing(alpha=0.4)
+**jam_score 재보정**: `0.80×slow + 0.70×stop + 0.45×sqrt(bbox)`, `slow_jam_threshold=0.60`
+수정: `src/config.py`, `congestion_judge.py`, `detector.py`, `feature_extractor.py`, `traffic_analyzer.py`, `flow_map.py`, `state.py`, `id_manager.py`, `judge.py`, `run_test.py`
+
+---
+
+## 2026-04-07 (77~80차 — 상행선 서행 탐지 공정성 개선) [대원]
+
+**bbox_coverage 원근 편향 제거**: cell occupancy 방식으로 교체, 방향별 유효 셀 수 분리
+**velocity 기반 방향 분류 조기 적용** (3프레임~)
+**jam_score 가중치 재보정**: `0.29×slow + 0.25×stop + 0.20×sqrt(bbox) + 0.08×count`
+**slow_upper_nm**: 0.50→2.5, `nm_cy_correction_k`: 0.6→0.0
+수정: `src/config.py`, `congestion_judge.py`, `detector.py`, `feature_extractor.py`, `traffic_analyzer.py`

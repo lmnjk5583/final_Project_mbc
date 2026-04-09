@@ -4,6 +4,53 @@
 
 ---
 
+## 2026-04-09 (91차 — Cell Dwell EMA 기반 jam_score 전면 재설계) [대원]
+
+### 오늘 한 작업
+
+**Cell Dwell EMA 도입 — jam_score 신호 전면 교체**
+- `feature_extractor.py`: `_cell_dwell_ema` (20×20 ndarray) 추가 — 셀 점유 지속 시간 EMA 누적
+  - 점유 중: `ema += 0.05×(1-ema)` / 빈 셀: `ema *= 0.98`
+  - 정상 차량(2~5프레임/셀): peak ema≈0.10~0.23 / 정체 차량(30f+): ema→0.78+
+- `feature_extractor.py`: `cell_dwell_score` 재설계 — 강도(점유셀 평균 ema) × 밀도(점유셀/차선셀) 조합
+- `feature_extractor.py`: `dwell_cell_ratio` 추가 — tid별 체류(같은 셀 15f+) 셀 비율
+- `feature_extractor.py`: `cell_persistence` 추가 — 2×2 코어스 그리드 Jaccard 유사도(30프레임 창) EMA
+- `feature_extractor.py`: `flow_occupancy` 추가 (`bbox_coverage` 별칭 통합)
+- `feature_extractor.py`: `occupied_cell_count` feature 추가 — 저규모(≤2) 차단용
+
+**congestion_judge.py 재설계**
+- 기존 `slow_cell_density + stop_cell_density + nm_variance + bbox` 수식 폐기
+- 신규: `cell_dwell_score × 0.90 + flow_occupancy × 0.30` 기반
+- 저규모 가드: `known_cnt≤2 or occupied_cnt≤2 or flow_occ<0.06` → 최대 0.10 반환
+
+**config.py 파라미터 조정**
+- `slow_jam_threshold`: 0.60 → 0.55
+- `jam_ema_alpha_up`: 0.15 → 0.70 (정체 진입 빠른 반응)
+- `gru_blend_ratio`: 0.40 → 0.0 (rule-only 모드, GRU 영향 제거)
+- 신규: `dwell_threshold_frames=15`, `cell_dwell_ema_up=0.05`, `cell_dwell_ema_down=0.02`
+
+**run_test.py 영상·모델 경로 갱신**
+- 모델: `yolo11n_v1` → `yolo11n_v5`
+- 영상: `임시/정체_완화_테스트.mp4` → `임시/2026-04-02_10-05-59/videos/record_2026-04-02_10-05-59.mp4`
+
+**신규 flow_map 파일 추가**
+- `flow_maps/flow_map-서행.npy`, `flow_maps/flow_map-정체.npy` (테스트용 케이스별 맵)
+- `flow_maps/gru_a.pt`, `flow_maps/gru_b.pt` (방향별 GRU 체크포인트)
+
+### 수정 파일
+`src/config.py`, `src/congestion_judge.py`, `src/feature_extractor.py`, `src/traffic_analyzer.py`, `run_test.py`
+추가: `flow_maps/flow_map-서행.npy`, `flow_maps/flow_map-정체.npy`, `flow_maps/gru_a.pt`, `flow_maps/gru_b.pt`
+
+### 발생 오류 / 확인 사항
+- GRU blend 0.40 시 rule 신호 희석 → blend 0.0으로 rule-only 확인 후 재조정 예정
+- DEBUG print 잔존 (`congestion_judge.py` 상단 `os.path.abspath`) — 프로덕션 전 제거 필요
+
+### 작업 재개 위치
+- `run_test.py` 실행 → cell_dwell_score / jam_score 범위 확인 (원활<0.25, 서행<0.55, 정체≥0.55)
+- DEBUG print 제거 후 웹 동기화 (`reverse_detector.py` + `congestion_judge.py` import 경로 확인)
+
+---
+
 ## 2026-04-08 (79차 — 모델 고정·conf 버그·학습중 jam 차단·전체CCTV 자동시작) [수빈]
 
 ### 오늘 한 작업
@@ -178,81 +225,5 @@
 
 ### 발생 오류 / 확인 사항
 - CCTV 팝업 열어도 방향별 jam 카드가 전부 0 → 키 불일치가 원인
-
----
-
-## 2026-04-07 (81~90차 — 대규모 리팩토링: 데드코드 제거 + 역주행 오탐 개선) [대원]
-
-### 오늘 한 작업
-
-**데드코드 완전 제거**
-- `src/baseline_stats.py`, `src/passage_tracker.py`, `src/bbox_stabilizer.py` 삭제
-- `detector.py`: PassageTracker/BaselineStats import 제거, flow.load() bool만 반환, on_entry/on_exit/reset/enough_passages 블록 제거
-- `id_manager.py`: passage_tracker 파라미터 제거
-- `traffic_analyzer.py`: set_baseline() 인자 없는 버전으로 단순화
-- `feature_extractor.py`: BaselineStats import 제거, set_ready() 메서드 추가, count_ratio 반환 제거
-- `flow_map.py`: save/load에서 baseline_stats 직렬화 제거, 버전 3으로 bump
-- `state.py`: entry_positions 필드 제거
-
-**역주행 오탐 개선**
-- `judge.py`: `min_wrongway_track_age=30` — 신규 등장 30프레임 이내 판정 차단
-- `judge.py`: `direction_change_cos_threshold=0.3` — 72°+ 방향 급변 시 guard 트리거 (기존 90°+)
-- `detector.py`: footpoint EMA smoothing(alpha=0.4) — bbox jitter가 trajectory에 전파되기 전 흡수
-- `config.py`: `wrong_count_threshold=15`, `velocity_window=10`
-
-**jam_score 수식 재보정 (count 제거)**
-- `congestion_judge.py`: count_contribution 제거, `0.80×slow + 0.70×stop + 0.45×sqrt(bbox)`
-- `config.py`: `smooth_jam_threshold=0.25`, `slow_jam_threshold=0.60`
-- 4차선 도로 차량 대수 과다→CONGESTED 오판 방지
-
-**config.py 정리**
-- CongestionPredictor용 `free_flow_speed=100.0`, `prediction_history_window=30` 복구
-- `enable_online_flow_update`, `pixels_per_meter`, `default_lcs`, `min_passage_dist` 등 불필요 파라미터 제거
-
-### 수정 파일
-`src/config.py`, `src/congestion_judge.py`, `src/detector.py`, `src/feature_extractor.py`,
-`src/traffic_analyzer.py`, `src/flow_map.py`, `src/state.py`, `src/id_manager.py`,
-`src/judge.py`, `run_test.py`, `run_wrongway.py`
-삭제: `src/baseline_stats.py`, `src/passage_tracker.py`, `src/bbox_stabilizer.py`
-
-### 발생 오류 / 확인 사항
-- `enable_online_flow_update` unexpected keyword → run_test.py에서 제거
-- `prediction_history_window` AttributeError → config.py CongestionPredictor 섹션에 재추가
-- GRU의 count_ratio: `.get(k, 0.0)` fallback으로 안전하게 처리됨
-
-### 작업 재개 위치
-- run_test.py 재실행으로 정상 기동 확인
-- 경부선 CCTV 영상으로 역주행 오탐 감소 실측 확인
-
----
-
-## 2026-04-07 (77~80차 — 상행선 서행 탐지 공정성 개선) [대원]
-
-### 오늘 한 작업
-
-**bbox_coverage 원근 편향 제거 — cell occupancy 방식으로 교체**
-- 기존: `Σbbox면적 / road_area` → 근거리 bbox가 4~5배 과대 계산
-- 신규: 차량 footpoint(cx, cy)가 점유한 셀 수 / 방향별 유효 셀 수 (원근 무관)
-- `feature_extractor.py`: `set_valid_cell_count(n)` 메서드 추가
-- `traffic_analyzer.py`: `set_valid_cell_count(n)` 포워딩 추가
-
-**방향별 유효 셀 수 분리 계산**
-- `detector.py`: `_valid_cells_a`, `_valid_cells_b` 필드 + `_compute_direction_cell_counts()` 추가
-- 학습 완료/재학습 완료/detect_only 로드 3곳에서 호출
-
-**velocity 기반 방향 분류 조기 적용 (3프레임~)**
-- 기존: flow_map 기반 → 상단 미학습 셀은 'a' fallback → 상행 차량 오분류
-- 신규: trajectory 3프레임 이상이면 속도 벡터 코사인으로 A/B 판정
-
-**jam_score 가중치 재보정 (slow_upper_nm=2.5 기준)**
-- 기존: `0.80×slow + 0.70×stop + 0.35×sqrt(bbox)` → slow_ratio≈1.0 시 CONGESTED 오판
-- 신규: `0.29×slow + 0.25×stop + 0.20×sqrt(bbox) + 0.08×count`
-
-**slow_upper_nm 임계값 상향 조정**
-- `config.py`: `slow_upper_nm` 0.50 → 2.5, `nm_cy_correction_k` 0.6 → 0.0
-
-### 수정 파일
-`src/config.py`, `src/congestion_judge.py`, `src/detector.py`,
-`src/feature_extractor.py`, `src/traffic_analyzer.py`, `test_nm_live.py`
 
 ---

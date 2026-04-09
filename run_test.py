@@ -15,13 +15,13 @@ sys.path.insert(0, str(PROJECT_ROOT))                   # from src import ... �
 from src import Detector, DetectorConfig                # src/__init__.py 경유
 
 # ── 경로 설정 ──────────────────────────────────────────────────────
-MODEL_PATH = PROJECT_ROOT / "runs" / "yolo11n_v1" / "weights" / "best.pt"  # YOLO 모델 가중치
+MODEL_PATH = PROJECT_ROOT / "runs" / "yolo11n_v5" / "weights" / "best.pt"  # YOLO 모델 가중치
 
 VIDEO_DIR = Path(                                       # 영상이 들어있는 폴더
     r"N:\개인\대원&수빈\최종 프로젝트"
-    r"\임시"
+    r"\임시\2026-04-02_10-05-59\videos"
 )
-VIDEO_FILE = "정체_완화_테스트.mp4"          # 실행할 영상 파일명
+VIDEO_FILE = "record_2026-04-02_10-05-59.mp4"          # 실행할 영상 파일명
 
 FLOW_MAP_PATH = PROJECT_ROOT / "flow_maps" / "flow_map.npy"  # 한강 학습 완료 flow_map
 # RESULT_DIR    = PROJECT_ROOT / "results"            # 결과 영상 저장 폴더

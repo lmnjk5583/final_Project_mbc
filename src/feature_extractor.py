@@ -58,6 +58,24 @@ class FeatureExtractor:
         self._speed_ref_warmed_frames: int = 0         # vdr 유효 프레임 누적 수
         self._SPEED_REF_WARMUP: int = 150              # 이 값 이상이면 vdr 신뢰
 
+        # ── tid별 체류 상태 (dwell_cell_ratio 계산용) ────────────────
+        # {tid: (cell_r, cell_c, first_frame_in_cell)}
+        self._dwell_state: dict = {}
+
+        # ── Cell Dwell EMA (핵심 정체 신호) ──────────────────────────
+        # cell_dwell_ema[r][c]: 해당 셀이 얼마나 오래 점유됐는지 EMA 누적값 (0~1)
+        #   점유 중 → ema 서서히 1 수렴 / 빈 셀 → ema 서서히 0 수렴
+        # ID 변경 무관 (셀 점유 여부만 봄)
+        # 정상 차량(2~5프레임/셀): peak ema ≈ 0.10~0.23 → 낮음
+        # 정체 차량(30프레임+/셀): ema → 0.78+ → 높음
+        self._cell_dwell_ema: np.ndarray | None = None  # 첫 compute()에서 초기화
+
+        # ── occupied_cells 히스토리 (cell_persistence 계산용) ────────
+        self._OCC_HIST_LEN: int = 31
+        self._occ_history: collections.deque = collections.deque(maxlen=self._OCC_HIST_LEN)
+        self._persist_ema: float = 0.0
+        self._PERSIST_EMA_ALPHA: float = 0.30
+
         # ── slow_ratio / stop_ratio EMA (프레임 간 비율 튐 흡수) ─────
         # 차량 출입으로 speed_known_count가 바뀌면 slow_ratio가 프레임마다 크게 달라짐
         # EMA로 스무딩해서 jam 계산에 안정된 값 전달
@@ -171,9 +189,36 @@ class FeatureExtractor:
                 _deficit = float(np.clip(1.0 - _med_nm / _ref_nm, 0.0, 1.0))
                 speed_known_tids_deficit[tid] = _deficit  # tid별 deficit 저장
 
-        # ── bbox_coverage: 셀 점유율 (cell occupancy) 방식 ──────────────
-        # cell_w / cell_h 는 루프 전에 이미 계산됨
+        # ── flow map 기반 체류(dwell) 계산 ──────────────────────────────
+        # 차량이 같은 그리드 셀에 dwell_threshold_frames 이상 머물면 체류 셀로 집계
+        # nm 임계값 불필요 — 셀 이동 여부로만 판단 (CCTV 각도·거리 무관)
+        _dwell_thr = getattr(self.cfg, "dwell_threshold_frames", 15)
+        _dwell_cells_set: set = set()                  # 체류 차량이 점유한 고유 셀 집합
+        for t in tracks:
+            _tid = t["id"]
+            if _tid not in speed_known_tids:           # 궤적 미확인 신규 차량 제외
+                continue
+            _cr = int(np.clip(t["cy"] / cell_h, 0, self.cfg.grid_size - 1))  # 현재 셀 행
+            _cc = int(np.clip(t["cx"] / cell_w, 0, self.cfg.grid_size - 1))  # 현재 셀 열
+            if _tid in self._dwell_state:
+                _prev_r, _prev_c, _first_f = self._dwell_state[_tid]
+                if _cr == _prev_r and _cc == _prev_c:  # 같은 셀에 머물고 있음
+                    if frame_num - _first_f >= _dwell_thr:  # 체류 임계값 초과
+                        _dwell_cells_set.add((_cr, _cc))    # 체류 셀로 등록
+                else:                                  # 셀이 바뀜 → 체류 리셋
+                    self._dwell_state[_tid] = (_cr, _cc, frame_num)
+            else:                                      # 첫 등장 → 체류 시작 기록
+                self._dwell_state[_tid] = (_cr, _cc, frame_num)
 
+        # 이번 프레임에 없는 tid 체류 기록 삭제 (메모리 누수 방지)
+        for _old in list(self._dwell_state.keys()):
+            if _old not in speed_known_tids:
+                del self._dwell_state[_old]
+
+        # ── bbox_coverage / flow_occupancy / dwell_cell_ratio ────────────
+        # 기준: valid_cell_count (flow_map이 실제 학습한 셀 수)
+        # 도로 크기(2차선/4차선)에 자동 적응 — density_max_vehicles 불필요
+        #
         # 유효 셀 수: 방향별 override > flow_map 실측 > 전체 그리드 순서로 사용
         if self._valid_cell_count_override is not None:    # 방향별 셀 수 주입됨
             valid_cell_count = self._valid_cell_count_override
@@ -183,16 +228,94 @@ class FeatureExtractor:
             valid_cell_count = self.cfg.grid_size * self.cfg.grid_size  # fallback: 전체
 
         # 차량 footpoint가 위치한 고유 셀 집합 — 신규 차량(speed 미확인) 제외
-        # 신규 차량 포함 시: tracks에 등장만 해도 bbox_coverage 상승 → 차 없어도 jam 튐
-        occupied_cells = len(set(
-            (int(np.clip(t["cy"] / cell_h, 0, self.cfg.grid_size - 1)),   # 행 인덱스
-             int(np.clip(t["cx"] / cell_w, 0, self.cfg.grid_size - 1)))   # 열 인덱스
-            for t in tracks if t["id"] in speed_known_tids                # 궤적 확인된 차량만
-        ))
-        bbox_coverage = float(np.clip(                     # 셀 점유율 (0~1)
+        occupied_cells_set = set(
+            (int(np.clip(t["cy"] / cell_h, 0, self.cfg.grid_size - 1)),
+             int(np.clip(t["cx"] / cell_w, 0, self.cfg.grid_size - 1)))
+            for t in tracks if t["id"] in speed_known_tids
+        )
+        occupied_cells = len(occupied_cells_set)
+
+        # flow_occupancy: 차량이 점유한 셀 / 유효 셀 전체
+        # 정체 시 유효 셀 대부분이 차로 채워지면 → 1에 수렴
+        flow_occupancy = float(np.clip(
             occupied_cells / max(valid_cell_count, 1), 0.0, 1.0
         ))
+
+        # dwell_cell_ratio: 체류 셀 / 유효 셀 전체
+        # 차량이 안 움직이는 셀 비율 — 차선 수 무관하게 도로 면적 기준으로 자동 정규화
+        dwell_cell_ratio = float(np.clip(
+            len(_dwell_cells_set) / max(valid_cell_count, 1), 0.0, 1.0
+        ))
+
+        bbox_coverage = flow_occupancy                     # 하위 호환 별칭 (= flow_occupancy)
         density_score = bbox_coverage                      # 하위 호환 별칭
+        dwelling_density = dwell_cell_ratio                # 하위 호환 별칭
+
+        # ── Cell Dwell EMA 업데이트 ──────────────────────────────────
+        # 각 셀이 점유된 상태가 얼마나 지속됐는지 EMA로 누적
+        # 정체: 같은 셀에 차량이 오래 머묾 → ema 높게 누적
+        # 원활: 차량이 빠르게 통과 → ema 낮게 유지
+        if self._cell_dwell_ema is None:
+            self._cell_dwell_ema = np.zeros(
+                (self.cfg.grid_size, self.cfg.grid_size), dtype=float
+            )
+        _cde_up   = getattr(self.cfg, "cell_dwell_ema_up",   0.05)
+        _cde_down = getattr(self.cfg, "cell_dwell_ema_down", 0.02)
+
+        for _r in range(self.cfg.grid_size):
+            for _c in range(self.cfg.grid_size):
+                if (_r, _c) in occupied_cells_set:
+                    self._cell_dwell_ema[_r, _c] += _cde_up * (1.0 - self._cell_dwell_ema[_r, _c])
+                else:
+                    self._cell_dwell_ema[_r, _c] *= (1.0 - _cde_down)
+
+        # ── cell_dwell_score 재설계 ──────────────────────────────────
+        # 기존: sum(ema) / valid_cell_count → 49로 나눠 항상 희석
+        # 수정: 점유 셀 평균 강도 × 점유 밀도 조합
+        #   강도(intensity): 실제 점유 중인 셀들의 ema 평균 (얼마나 오래 머물렀는가)
+        #   밀도(density)  : 점유 셀 수 / valid_cell_count        (얼마나 많이 막혔는가)
+        #   둘을 곱하면: 많이 막히고 + 오래 머물수록 높아짐
+
+        _ema_flat = self._cell_dwell_ema.flatten()
+        _occupied_emas = [
+            self._cell_dwell_ema[_r, _c]
+            for (_r, _c) in occupied_cells_set
+            if self._cell_dwell_ema[_r, _c] > 0.03   # 의미있는 점유만
+        ]
+
+        if _occupied_emas:
+            _cds_intensity = float(np.mean(_occupied_emas))           # 점유 셀 평균 강도 (0~1)
+            _lane_cell_count = max(valid_cell_count // 2, 1)   # 단방향 차선 셀 수 추정
+            _cds_density = min(1.0, len(_occupied_emas) / _lane_cell_count)
+            # 강도 × 밀도 보정: 밀도 낮아도 강도 높으면 어느 정도 반영
+            cell_dwell_score = float(np.clip(
+                _cds_intensity * (0.3 + 0.7 * _cds_density), 0.0, 1.0
+            ))
+        else:
+            _cds_intensity = 0.0
+            _cds_density   = 0.0
+            cell_dwell_score = 0.0
+        # ── cell_persistence: 30프레임 전 점유 셀과 현재의 Jaccard 유사도 ──
+        # 문제: 20×20 그리드 셀=64×36px → 정체 차량이 90px만 이동해도 셀 이탈 → persist 낮음
+        # 해결: 2×2 블록 코어스 그리드(10×10, 셀=128×72px)로 다운샘플링
+        #       정체에서 90px 이동해도 128px 셀 안에 머뭄 → persist 정확하게 높아짐
+        #       occ/dwell은 기존 20×20 유지 (세밀도 필요)
+        _coarse_occ = frozenset(
+            (int(np.clip(t["cy"] / cell_h, 0, self.cfg.grid_size - 1)) // 2,  # 2×2 블록
+             int(np.clip(t["cx"] / cell_w, 0, self.cfg.grid_size - 1)) // 2)
+            for t in tracks if t["id"] in speed_known_tids
+        )
+        self._occ_history.append(_coarse_occ)                    # 코어스 셀 집합 저장
+        if len(self._occ_history) >= self._OCC_HIST_LEN:         # 30프레임 이력 확보
+            _prev_occ = self._occ_history[0]                     # 30프레임 전 셀 집합
+            _inter = len(_coarse_occ & _prev_occ)                # 교집합 (유지된 코어스 셀)
+            _union = len(_coarse_occ | _prev_occ)                # 합집합
+            _raw_persist = _inter / _union if _union > 0 else 0.0  # 순간 Jaccard
+            self._persist_ema = (self._PERSIST_EMA_ALPHA * _raw_persist
+                                 + (1.0 - self._PERSIST_EMA_ALPHA) * self._persist_ema)
+        else:
+            pass                                                 # 이력 부족 → ema 유지(0)
+        cell_persistence = self._persist_ema                     # EMA 평활화된 값 사용
 
         # ── norm_speed_ratio 계산 ─────────────────────────────────────
         # 상위 50% 중앙값 사용: 정체 차량 소수가 nm을 낮춰도 정상 주행 차량의 속도를 반영
@@ -302,9 +425,8 @@ class FeatureExtractor:
         # ── 디버그 출력 (30프레임마다) ───────────────────────────────
         if frame_num % 30 == 0:
             print(f"[FE] f={frame_num} known={speed_known_count} "
-                  f"scd={slow_cell_density:.3f} stcd={stop_cell_density:.3f} "
-                  f"bbox={bbox_coverage:.3f} nm_var={nm_variance_score:.3f} "
-                  f"cap={_road_capacity}")
+                  f"occ={flow_occupancy:.3f} cds={cell_dwell_score:.3f} "
+                  f"dwell={dwell_cell_ratio:.3f} persist={cell_persistence:.3f} valid={valid_cell_count}")
 
         # ── feature 딕셔너리 조립 ────────────────────────────────────
         return {                                       # feature 벡터
@@ -312,14 +434,25 @@ class FeatureExtractor:
             "nm_baseline_valid":     _nm_baseline_valid,     # baseline 준비 여부
             "stop_ratio":            stop_ratio,             # [1] 정지 비율 (GRU용)
             "slow_ratio":            slow_ratio,             # [1.5] 서행 비율 (GRU용)
-            "slow_density":          slow_density,           # [1.6] = slow_cell_density (congestion_judge용)
-            "slow_cell_density":     slow_cell_density,      # 서행 차량수 / road_capacity
-            "stop_cell_density":     stop_cell_density,      # 정지 차량수 / road_capacity
-            "nm_variance_score":     nm_variance_score,      # [1.7] nm 분산 (정체 징후 보조)
-            "density_score":         density_score,          # [2] bbox_coverage 별칭 (하위 호환)
-            "bbox_coverage":         bbox_coverage,          # [2] 도로 면적 대비 셀 점유율 (궤적확인 차량만)
-            "velocity_deficit_ratio": velocity_deficit_ratio, # [2.5] 평균 속도 부족률 (-1=미학습)
+            "slow_density":          slow_density,           # 하위 호환 별칭
+            "slow_cell_density":     slow_cell_density,      # 서행 차량수 / road_capacity (GRU용)
+            "stop_cell_density":     stop_cell_density,      # 정지 차량수 / road_capacity (GRU용)
+            "nm_variance_score":     nm_variance_score,      # nm 분산 (GRU 보조)
+            "density_score":         density_score,          # bbox_coverage 별칭 (하위 호환)
+            "bbox_coverage":         bbox_coverage,          # 도로 면적 대비 셀 점유율
+            "flow_occupancy":        flow_occupancy,         # 차량 점유 셀 / 유효 셀 (valid_cell_count 기준)
+            "cell_dwell_score":      cell_dwell_score,       # 셀 누적 점유 EMA 합 / valid_cell_count (핵심)
+            "dwell_cell_ratio":      dwell_cell_ratio,       # 체류 셀 / 유효 셀 (valid_cell_count 기준)
+            "cell_persistence":      cell_persistence,       # 30프레임 전과 현재 점유셀 Jaccard 유사도
+            "dwelling_density":      dwelling_density,       # = dwell_cell_ratio (하위 호환)
+            "velocity_deficit_ratio": velocity_deficit_ratio, # 평균 속도 부족률 (-1=미학습)
             "deficit_count":         deficit_count,          # speed_ref 유효 차량 수
             "vdr_ready":             _vdr_ready,             # warmup 완료 여부
-            "rule_jam_score":        0.0,                    # [3] jam_score (CJ 채움)
+            
+                # 추가
+            "known_vehicle_count":   speed_known_count,
+            "occupied_cell_count":   occupied_cells,
+            "valid_cell_count":      valid_cell_count,
+
+            "rule_jam_score":        0.0,                    # jam_score (CJ 채움)
         }

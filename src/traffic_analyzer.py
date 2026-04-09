@@ -192,6 +192,8 @@ class TrafficAnalyzer:
 
         self._last_rule_jam = rule_jam                # rule_jam 저장 (로그용)
         self._last_gru_score = gru_score              # gru_score 저장 (로그용, None 허용)
+        if frame_num % 30 == 0:                       # 30프레임마다 raw_jam 디버그
+            print(f"[CJ] f={frame_num} rule={rule_jam:.3f} ema={self.congestion_judge._ema_jam:.3f}")
 
         # ── 5) 레벨 판정 (히스테리시스 포함, final_jam 기준) ─────────
         level, jam = self.congestion_judge.apply_level(final_jam, frame_num)

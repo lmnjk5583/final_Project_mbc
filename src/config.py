@@ -81,13 +81,13 @@ class DetectorConfig:
 
     # ==================== jam_score 임계값 ====================
     smooth_jam_threshold:    float = 0.25   # jam_score 이 값 미만 → SMOOTH
-    slow_jam_threshold:      float = 0.60   # jam_score 이 값 미만 → SLOW, 이상 → CONGESTED
+    slow_jam_threshold:      float = 0.55   # jam_score 이 값 미만 → SLOW, 이상 → CONGESTED
     density_max_vehicles:   float = 40.0   # density 정규화 기준 차량 수 — 이 값 이상이면 density=1.0 (포화)
 
     # ==================== jam_score EMA 스무딩 ====================
     # 비대칭 EMA: 악화(올라갈 때)는 빠르게, 호전(내려갈 때)은 느리게
     # 실제 교통 특성 반영 — 정체는 순식간에 쌓이지만 해소는 수분 이상 걸림
-    jam_ema_alpha_up:   float = 0.15  # 악화 방향 EMA 속도 — slow_ratio EMA 스무딩 도입으로 0.25→0.15 완화
+    jam_ema_alpha_up:   float = 0.70  # 악화 방향 EMA 속도 (0.15→0.25: 정체 진입 시 빠른 상승)
     jam_ema_alpha_down: float = 0.04  # 호전 방향 EMA 속도 (새 값 4% 반영)  — 약 25프레임에 걸쳐 반응
 
     # ==================== 학습 연장 ====================
@@ -97,7 +97,7 @@ class DetectorConfig:
     gru_hidden: int = 64                    # GRU hidden state 크기
     gru_layers: int = 2                     # GRU 레이어 수
     gru_seq_len: int = 30                   # 입력 시퀀스 길이 (프레임)
-    gru_blend_ratio: float = 0.40           # GRU 기여 비율 (1 - 이 값 = rule 비율)
+    gru_blend_ratio: float = 0.0           # GRU 기여 비율 (1 - 이 값 = rule 비율)
     gru_warmup_frames: int = 30             # camera_switch 후 GRU 사용 금지 프레임
     gru_replay_size: int = 200              # replay_buffer 최대 크기
     gru_online_interval: int = 10           # 온라인 학습 gradient step 주기 (프레임)
@@ -117,6 +117,11 @@ class DetectorConfig:
     nm_baseline_ema_up:   float = 0.05    # baseline 상승 EMA (원활 복귀 시 빠르게 반응)
     nm_baseline_ema_down: float = 0.005   # baseline 하락 EMA (정체 지속 시 천천히 하락 — 약 10분 메모리)
     nm_baseline_warmup:   int   = 300     # baseline 유효 최소 누적 프레임 (10초@30fps)
+
+    # ==================== flow map 기반 체류 탐지 ====================
+    dwell_threshold_frames: int = 15       # 차량이 같은 셀에 이 프레임 이상 머물면 체류로 판정
+    cell_dwell_ema_up:   float = 0.05      # 셀 점유 시 EMA 상승 속도 (30프레임 연속 → ema≈0.78)
+    cell_dwell_ema_down: float = 0.02      # 셀 이탈 시 EMA 하락 속도 (50프레임 후 ema≈0.36)
 
     # ==================== 방향별 차선 분리 파라미터 ====================
     lane_cos_threshold: float = 0.0        # 방향 분류 코사인 임계값 (≥ 이면 A방향, < 이면 B방향)
