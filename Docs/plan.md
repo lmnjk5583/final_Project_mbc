@@ -87,8 +87,6 @@ frontend_js/src/modules/carbon/
 
 **DB**: 역주행 + 정체 이벤트 모두 저장 (MySQL, 기존 DetectionResult 모델 활용 또는 신규 모델 추가)
 
-**인터페이스** (어떤 데이터를 넘길지): 개발하면서 결정
-
 ---
 
 ## 4. 차량 감지 모델 고도화 (추가학습)

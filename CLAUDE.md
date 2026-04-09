@@ -34,13 +34,11 @@
 
 ```
 IF 개발 작업 (src/)          → Docs/dev_guide.md + dev_guide_phase2.md 먼저 읽기
-IF 웹 개발 작업 (finalPj_웹) → C:\finalPj_웹\dev_guide_web.md 먼저 읽기
 IF 산출물 참고/수정          → Docs/산출물/ 해당 파일 직접 편집 (10개 파일 — FILE_INDEX.md 참조)
 IF 파일 미지정 요청          → FILE_INDEX.md 먼저 읽고 최소 파일만 선택
 IF 명시적 요청 파일          → 그 파일만 읽는다
 ```
 
-> **Good** ✅ 웹 작업 시 `dev_guide_web.md` 읽고 §3 현황표 확인 후 코드 수정
 > **Good** ✅ `dev_guide.md` + `dev_guide_phase2.md` 읽고 인터페이스 확인 후 코드 수정
 > **Bad** ❌ FILE_INDEX.md 없이 Glob 전체 탐색하거나 `.docx`를 직접 읽으려 시도
 
@@ -78,10 +76,6 @@ plan.md ↔ 기획서.md  (WBS·일정 동기화)
 | `dev_guide.md` | `plan.md`, `인터페이스명세서.md`, `프로그램설계서.md` |
 | `dev_guide_phase2.md` | `인터페이스명세서.md`, `프로그램설계서.md`, `화면설계서.md`, `plan.md` |
 | `src/*.py` (신규 메서드·클래스) | `프로그램설계서.md §3`, `인터페이스명세서.md` 해당 섹션 |
-| **`finalPj_웹` 코드 변경** | **`dev_guide_web.md` §3 현황표 + 해당 섹션** |
-| `finalPj_웹/shared/state.py` | `dev_guide_web.md §5` |
-| `finalPj_웹/carbon.py` API 추가 | `dev_guide_web.md §4-A` |
-| `finalPj_웹/its.py` API 추가 | `dev_guide_web.md §4-B` |
 
 > 이 표는 conventions.md의 요약본. 동기화 누락 시 산출물과 코드가 불일치 상태가 됨.
 
