@@ -273,7 +273,10 @@ class FeatureExtractor:
         #   → slow_cell_density = _hist_slow / road_capacity
         #   → 1대 slow / (20셀×5프레임) = 5/100 = 0.05 → jam ≈ 0.13 ✓
         #   → 10대 slow / (20셀×5프레임) = 50/100 = 0.50 → jam ≈ 0.80 ✓
-        _road_capacity = valid_cell_count * self._NM_WIN   # 도로 최대 수용 관측 수
+        # road_capacity: valid_cell_count 기준은 셀 수(49)가 실제 차량 수(10~15)보다
+        # 훨씬 커서 scd가 0.25 이상 못 올라감 → density_max_vehicles(방향당 최대 차량) 사용
+        _density_max = getattr(self.cfg, "density_max_vehicles", 40.0) / 2  # 방향당 절반
+        _road_capacity = int(_density_max) * self._NM_WIN  # 방향당 최대 관측 수
         _pure_slow_hist = _hist_slow - _hist_stop          # 순수 서행 관측 수 (정지 제외)
         slow_cell_density = _pure_slow_hist / max(_road_capacity, 1)   # 서행 밀도
         stop_cell_density = _hist_stop / max(_road_capacity, 1)        # 정지 밀도
