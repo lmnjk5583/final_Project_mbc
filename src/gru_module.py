@@ -8,6 +8,7 @@
 
 import collections                                     # deque — 고정 크기 버퍼
 import random                                          # replay_buffer 샘플링
+import pickle                                          # feature 로그 직렬화 (디스크 저장)
 
 # ── PyTorch graceful import ───────────────────────────────────────────────
 try:
@@ -20,14 +21,16 @@ except ImportError:
 
 
 # ── feature 딕셔너리 → Tensor 변환 키 순서 ──────────────────────────────
+# feature_extractor.py의 반환 딕셔너리와 반드시 일치해야 한다.
+# 순서가 바뀌면 학습·예측 불일치 발생 — 키 추가/변경 시 저장된 .pt 삭제 후 재학습 필요
 _FEATURE_KEYS = [                                      # 7차원 벡터 고정 순서
-    "norm_speed_ratio",                                # [0]
-    "count_ratio",                                     # [1]
-    "stop_ratio",                                      # [2]
-    "exit_rate_ratio",                                 # [3]
-    "dwell_ratio",                                     # [4]
-    "density_score",                                   # [5]
-    "rule_jam_score",                                  # [6]
+    "norm_speed_ratio",                                # [0] 속도 비율 (자기보정 baseline 기준)
+    "stop_ratio",                                      # [1] 정지 비율 (nm_history 전체 집계)
+    "slow_ratio",                                      # [2] 서행 비율 (nm_history 전체 집계)
+    "flow_occupancy",                                  # [3] 차량 점유 셀 / 유효 셀 (순간 밀도)
+    "cell_dwell_score",                                # [4] 셀 누적 점유 EMA (핵심 정체 신호)
+    "cell_persistence",                                # [5] 30프레임 전·현재 점유셀 Jaccard
+    "rule_jam_score",                                  # [6] rule 기반 jam_score (CJ 역주입)
 ]
 _FEATURE_DIM = len(_FEATURE_KEYS)                      # 7 — 고정 입력 차원
 
@@ -38,19 +41,23 @@ _FEATURE_DIM = len(_FEATURE_KEYS)                      # 7 — 고정 입력 차
 if _TORCH_AVAILABLE:                                   # PyTorch 있을 때만 정의
 
     class _GRUNet(nn.Module):
-        """GRU 2계층 + FC 헤드로 정체 레벨을 분류한다.
+        """GRU 2계층 + 현재 분류 헤드 + Direct 미래 예측 헤드.
 
         입력: (batch, seq_len=30, input_dim=7) — 프레임 시퀀스
-        출력: (batch, 3) — [p_smooth, p_slow, p_congested] softmax 확률
+        출력:
+          - forward(): (batch, 3) softmax 확률 — 현재 상태 분류
+          - direct_heads[i]: 각 예측 시점(1분·3분·5분)의 (batch, 3) 로짓
         """
 
-        def __init__(self, input_dim: int, hidden: int, layers: int):
+        def __init__(self, input_dim: int, hidden: int, layers: int,
+                     n_horizons: int = 3):
             """신경망 초기화.
 
             Args:
                 input_dim: 입력 feature 차원 (7).
                 hidden: GRU hidden state 크기 (64).
                 layers: GRU 레이어 수 (2).
+                n_horizons: direct 예측 시점 수 (기본 3 — 1·3·5분).
             """
             super().__init__()                         # nn.Module 초기화
             self.gru = nn.GRU(                         # GRU 레이어
@@ -62,12 +69,24 @@ if _TORCH_AVAILABLE:                                   # PyTorch 있을 때만 �
             )
             self.fc1 = nn.Linear(hidden, 32)           # FC: hidden(64) → 32
             self.relu = nn.ReLU()                      # 활성화 함수
-            self.fc2 = nn.Linear(32, 3)                # FC: 32 → 3클래스
+            self.fc2 = nn.Linear(32, 3)                # FC: 32 → 3클래스 (현재 상태)
             self.softmax = nn.Softmax(dim=-1)          # 확률 분포 정규화
-            self.pred_head = nn.Linear(hidden, input_dim)  # 미래 예측 헤드: hidden(64) → feature(7)
+            self.pred_head = nn.Linear(hidden, input_dim)  # 자기회귀 헤드: hidden → feature(7)
+
+            # ── Direct 미래 예측 헤드 (horizon별 독립 분류기) ────────────
+            # 각 헤드: hidden(64) → 32 → ReLU → 3클래스 (SMOOTH/SLOW/CONGESTED)
+            # 오차 누적 없이 현재 hidden state에서 N분 후를 직접 예측
+            self.direct_heads = nn.ModuleList([
+                nn.Sequential(
+                    nn.Linear(hidden, 32),             # hidden → 32
+                    nn.ReLU(),                         # 활성화
+                    nn.Linear(32, 3),                  # 32 → 3클래스
+                )
+                for _ in range(n_horizons)             # horizon 수만큼 독립 헤드 생성
+            ])
 
         def forward(self, x, h=None):
-            """순전파 계산.
+            """순전파 계산 (현재 상태 분류).
 
             Args:
                 x: (batch, seq_len, input_dim) 입력 텐서.
@@ -99,14 +118,33 @@ class GRUModule:
         gru_warmup_frames, gru_replay_size, gru_online_interval, gru_lr.
     """
 
-    def __init__(self, cfg):
+    def __init__(self, cfg, fps: float = 30.0):
         """GRUModule 초기화.
 
         PyTorch 없는 환경이면 fallback 모드로 동작한다.
         모든 메서드는 호출 가능하지만 학습/예측은 no-op이 된다.
+
+        Args:
+            cfg: DetectorConfig.
+            fps: 영상 FPS — horizon 초→프레임 변환, pretrain 최소 데이터 계산용.
         """
         self.cfg = cfg                                 # 설정 저장
+        self._fps = fps                                # FPS 저장
         self._torch_ok = _TORCH_AVAILABLE              # PyTorch 사용 가능 여부
+
+        # ── Direct 예측 horizon 계산 (초 → 프레임) ───────────────────
+        _horizons_sec = getattr(cfg, "gru_predict_horizons_sec", (60, 180, 300))
+        self._horizon_frames = [max(1, int(s * fps)) for s in _horizons_sec]  # 초→프레임
+        self._horizon_secs = list(_horizons_sec)       # 초 단위 저장 (결과 반환용)
+
+        # pretrain 최소 데이터: 최소 10분치 feature 쌓인 후 시작
+        _pretrain_min_sec = getattr(cfg, "gru_pretrain_min_sec", 600.0)
+        self._pretrain_min_frames = max(              # pretrain 트리거 최소 프레임 수
+            cfg.gru_seq_len + max(self._horizon_frames),  # 최소: seq_len + 최대 horizon
+            int(_pretrain_min_sec * fps)              # 설정값 (기본 10분)
+        )
+
+        self._is_direct_trained = False               # direct head 학습 완료 여부
 
         # ── 고정 크기 feature 시퀀스 버퍼 ──────────────────────────────
         self._feature_buffer = collections.deque(      # 최근 gru_seq_len개만 유지
@@ -138,6 +176,7 @@ class GRUModule:
             input_dim=_FEATURE_DIM,                    # 7
             hidden=cfg.gru_hidden,                     # 64
             layers=cfg.gru_layers,                     # 2
+            n_horizons=len(self._horizon_frames),       # direct 예측 헤드 수 (기본 3)
         )
         self._net.eval()                               # eval 모드 (dropout 비활성)
 
@@ -215,6 +254,55 @@ class GRUModule:
         gru_score = float(max(0.0, min(1.0, gru_score)))  # clip 0~1
 
         return gru_score                               # 예측값 반환
+
+    # ── predict_direct: N분 후 직접 예측 ────────────────────────────────
+    def predict_direct(self) -> list | None:
+        """현재 관측 윈도우에서 1·3·5분 후 정체 레벨을 직접 예측한다.
+
+        자기회귀 롤아웃과 달리 오차 누적이 없다.
+        GRU hidden state에서 각 horizon 헤드가 독립적으로 3클래스 확률을 출력한다.
+
+        Returns:
+            [{"horizon_sec": 60, "horizon_min": 1,
+              "p_smooth": 0.1, "p_slow": 0.6, "p_congested": 0.3,
+              "predicted_level": "SLOW"}, ...]
+            학습 미완료·버퍼 부족·PyTorch 없으면 None.
+        """
+        if not self._torch_ok or self._net is None:    # PyTorch 없음
+            return None
+        if not self._is_direct_trained:                # direct head 미학습
+            return None
+        if len(self._feature_buffer) < self.cfg.gru_seq_len:  # 버퍼 부족
+            return None
+        if self._warmup_remaining > 0:                 # warmup 기간 중
+            return None
+
+        seq = list(self._feature_buffer)               # 현재 시퀀스 복사
+        x = torch.tensor([seq], dtype=torch.float32)   # (1, seq_len, 7)
+
+        self._net.eval()
+        results = []
+        with torch.no_grad():
+            out, _ = self._net.gru(x)                  # GRU 순전파: (1, seq_len, hidden)
+            last = out[:, -1, :]                       # 마지막 타임스텝: (1, hidden)
+
+            for h_i, (horizon_f, horizon_s) in enumerate(
+                zip(self._horizon_frames, self._horizon_secs)
+            ):
+                logits = self._net.direct_heads[h_i](last)          # (1, 3) 로짓
+                probs = torch.softmax(logits, dim=-1)[0]             # (3,) 확률
+                pred_idx = int(probs.argmax())                       # 최대 확률 클래스
+                results.append({
+                    "horizon_sec":      horizon_s,                   # 예측 목표 (초)
+                    "horizon_min":      horizon_s // 60,             # 예측 목표 (분)
+                    "p_smooth":         float(probs[0]),             # SMOOTH 확률
+                    "p_slow":           float(probs[1]),             # SLOW 확률
+                    "p_congested":      float(probs[2]),             # CONGESTED 확률
+                    "predicted_level":  ["SMOOTH", "SLOW", "CONGESTED"][pred_idx],
+                    "confidence":       float(probs[pred_idx]),      # 최고 확률값
+                })
+
+        return results                                 # 전체 horizon 예측 결과 반환
 
     # ── predict_future: N스텝 자기회귀 롤아웃 ───────────────────────────
     def predict_future(self, steps: int | None = None) -> list | None:
@@ -336,9 +424,63 @@ class GRUModule:
             self._optimizer.step()                     # 파라미터 갱신
             epoch_losses.append(float(loss.item()))    # loss 기록
 
-        self._net.eval()                               # 학습 후 eval 모드 복원
+        self._net.eval()                               # 자기지도 학습 후 eval 모드 복원
         self._is_pretrained = True                     # pretrain 완료 → blend 활성화
-        return epoch_losses                            # epoch별 loss 리스트 반환
+
+        # ── Phase 2: Direct Prediction Head 학습 ──────────────────────
+        # 입력: feature_sequence[i:i+seq_len]  (현재 관측 윈도우)
+        # 타겟: feature_sequence[i+seq_len+horizon_f]의 rule_jam_score → 3클래스
+        # 각 horizon 헤드를 독립적으로 CrossEntropy 학습
+        smooth_thr = getattr(self.cfg, "smooth_jam_threshold", 0.25)  # SMOOTH 임계값
+        slow_thr   = getattr(self.cfg, "slow_jam_threshold",   0.55)  # SLOW 임계값
+        n_epochs   = getattr(self.cfg, "gru_direct_epochs",    10)    # 학습 epoch 수
+        criterion_ce = nn.CrossEntropyLoss()           # 분류 손실 함수
+
+        for h_i, horizon_f in enumerate(self._horizon_frames):  # 각 horizon 순회
+            # ── (입력, 타겟) 쌍 생성 ──────────────────────────────────
+            # i+seq_len+horizon_f 인덱스가 유효한 범위만 사용
+            inputs_d, targets_d = [], []
+            for i in range(len(vecs) - seq_len - horizon_f):
+                future_jam = float(                    # horizon_f 프레임 후 실제 jam_score
+                    feature_sequence[i + seq_len + horizon_f].get("rule_jam_score", 0.0)
+                )
+                # rule_jam_score → 3클래스 레이블 변환
+                if future_jam < smooth_thr:
+                    label = 0                          # SMOOTH
+                elif future_jam < slow_thr:
+                    label = 1                          # SLOW
+                else:
+                    label = 2                          # CONGESTED
+                inputs_d.append(vecs[i: i + seq_len])
+                targets_d.append(label)
+
+            if not inputs_d:                           # 데이터 부족 — 해당 horizon 스킵
+                continue
+
+            X_d = torch.tensor(inputs_d,  dtype=torch.float32)  # (N, seq_len, 7)
+            Y_d = torch.tensor(targets_d, dtype=torch.long)      # (N,) 클래스 레이블
+
+            # ── direct head만 학습 (GRU 가중치 함께 갱신) ───────────────
+            self._net.train()
+            direct_losses = []
+            for _ in range(n_epochs):                  # epoch 반복
+                self._optimizer.zero_grad()
+                out_d, _ = self._net.gru(X_d)          # GRU 출력: (N, seq_len, hidden)
+                last_d = out_d[:, -1, :]               # 마지막 타임스텝: (N, hidden)
+                logits_d = self._net.direct_heads[h_i](last_d)  # (N, 3) 로짓
+                loss_d = criterion_ce(logits_d, Y_d)   # CrossEntropy 손실
+                loss_d.backward()
+                self._optimizer.step()
+                direct_losses.append(float(loss_d.item()))
+
+            self._net.eval()
+            h_sec = self._horizon_secs[h_i]            # 초 단위 horizon
+            print(f"  └─ {h_sec//60}분 후 헤드: "
+                  f"loss {direct_losses[0]:.4f}→{direct_losses[-1]:.4f} "
+                  f"({len(inputs_d)}쌍)")              # 학습 결과 출력
+
+        self._is_direct_trained = True                 # direct head 학습 완료
+        return epoch_losses                            # 자기지도 phase loss 반환
 
     # ── save: GRU weights 저장 ───────────────────────────────────────────
     def save(self, path) -> bool:
@@ -425,6 +567,84 @@ class GRUModule:
         loss.backward()                                # 역전파
         self._optimizer.step()                         # 파라미터 갱신
         self._net.eval()                               # eval 모드 복원
+
+    # ── 누적 로그 저장 (세션 종료 시 호출) ──────────────────────────────
+    def append_feature_log(self, features: list, log_path) -> int:
+        """새 feature 목록을 디스크 로그에 추가하고 총 누적 개수를 반환한다.
+
+        기존 로그가 있으면 이어 붙이고, 없으면 새로 생성한다.
+        세션이 달라져도 누적이 유지되므로 며칠치 데이터가 쌓인다.
+
+        Args:
+            features: 이번 세션에서 수집한 feature dict 목록.
+            log_path: 로그 파일 경로 (.pkl).
+
+        Returns:
+            누적된 총 feature 개수.
+        """
+        log_path = str(log_path)
+        existing = []
+        try:
+            with open(log_path, "rb") as f:
+                existing = pickle.load(f)              # 기존 로그 로드
+        except (FileNotFoundError, Exception):
+            pass                                       # 없으면 빈 리스트로 시작
+
+        existing.extend(features)                      # 새 데이터 이어붙이기
+
+        try:
+            with open(log_path, "wb") as f:
+                pickle.dump(existing, f)               # 통합 로그 저장
+        except Exception as e:
+            print(f"[GRU] feature 로그 저장 실패: {e}")
+
+        return len(existing)                           # 총 누적 개수 반환
+
+    # ── 누적 로그 로드 ────────────────────────────────────────────────
+    def load_feature_log(self, log_path) -> list:
+        """디스크에서 누적 feature 로그를 로드한다.
+
+        Args:
+            log_path: 로그 파일 경로 (.pkl).
+
+        Returns:
+            feature dict 목록. 파일 없으면 빈 리스트.
+        """
+        try:
+            with open(str(log_path), "rb") as f:
+                data = pickle.load(f)
+            return data if isinstance(data, list) else []
+        except (FileNotFoundError, Exception):
+            return []                                  # 로그 없으면 빈 리스트
+
+    # ── 누적 로그 기반 재학습 ─────────────────────────────────────────
+    def retrain_from_log(self, log_path) -> bool:
+        """디스크 누적 로그 전체를 사용해 GRU를 재학습한다.
+
+        세션이 바뀌어도 로그가 쌓여있으면 점점 정확해진다.
+        데이터가 충분하면 (gru_pretrain_min_frames 이상) pretrain()을 호출한다.
+
+        Args:
+            log_path: 로그 파일 경로 (.pkl).
+
+        Returns:
+            True(재학습 완료) / False(데이터 부족·실패).
+        """
+        features = self.load_feature_log(log_path)    # 누적 로그 전체 로드
+        total = len(features)
+
+        if total < self._pretrain_min_frames:          # 데이터 부족
+            print(f"[GRU] 누적 데이터 부족: {total}/{self._pretrain_min_frames}프레임 "
+                  f"({total / max(self._fps, 1) / 60:.1f}분 / "
+                  f"{self._pretrain_min_frames / max(self._fps, 1) / 60:.1f}분 필요)")
+            return False
+
+        print(f"[GRU] 누적 {total}프레임 ({total / max(self._fps, 1) / 60:.1f}분) → 재학습 시작")
+        losses = self.pretrain(features)               # 전체 로그로 pretrain
+        if losses:
+            print(f"[GRU] 재학습 완료: loss {losses[0]:.4f}→{losses[-1]:.4f}")
+            return True
+        return False
 
     # ── reset: camera_switch 후 호출 ─────────────────────────────────────
     def reset(self):

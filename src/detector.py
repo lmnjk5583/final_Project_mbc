@@ -182,17 +182,29 @@ class Detector:
             idx += 1                                                # 존재하면 번호 증가
 
     # ==================== 메인 루프 ====================
-    def run(self, video_name):
-        """영상 파일을 열어 프레임 단위로 처리하며 역주행·정체를 감지/표시/저장"""
+    def run(self, video_name, max_seconds: float | None = None):
+        """영상 파일 또는 스트림 URL을 열어 프레임 단위로 처리한다.
+
+        Args:
+            video_name: 파일명(str) 또는 스트림 URL(http/rtsp로 시작).
+            max_seconds: 이 시간(초) 경과 후 루프 종료. None이면 영상 끝까지.
+                         ITS URL 갱신 주기로 사용 — 만료 전에 새 URL로 재시작.
+        """
         cfg = self.cfg                                              # 설정 단축 참조
         st = self.state                                             # 상태 단축 참조
 
-        video_path = cfg.data_dir / video_name                      # 입력 비디오 경로
-        if not video_path.exists():                                 # 파일 존재 확인
-            print(f"파일 없음: {video_path}")
-            return
+        # ── 입력 소스 판단: URL이면 직접 열고, 파일명이면 data_dir과 조합 ──
+        is_stream = str(video_name).startswith(("http", "rtsp"))    # URL 여부
+        if is_stream:
+            video_src = str(video_name)                             # URL 그대로 사용
+        else:
+            video_path = cfg.data_dir / video_name                  # 파일 경로 조합
+            if not video_path.exists():
+                print(f"파일 없음: {video_path}")
+                return
+            video_src = str(video_path)
 
-        cap = cv2.VideoCapture(str(video_path))                     # 비디오 캡처 객체 생성
+        cap = cv2.VideoCapture(video_src)                           # 비디오/스트림 캡처 객체 생성
         fw = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))                 # 프레임 너비
         fh = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))                # 프레임 높이
         fps = cap.get(cv2.CAP_PROP_FPS) or 30.0                     # 원본 FPS (없으면 30)
@@ -202,8 +214,8 @@ class Detector:
 
         # ── 방향별 GRUModule 초기화 (Phase 2 — PyTorch 없으면 None 유지) ──
         if _GRU_AVAILABLE:                                          # PyTorch·gru_module 사용 가능이면
-            self.gru_module_a = GRUModule(cfg)                      # A방향 GRU 예측 모듈
-            self.gru_module_b = GRUModule(cfg)                      # B방향 GRU 예측 모듈
+            self.gru_module_a = GRUModule(cfg, fps=fps)             # A방향 GRU — fps로 horizon 프레임 계산
+            self.gru_module_b = GRUModule(cfg, fps=fps)             # B방향 GRU
             # ── 저장된 weights 로드 (flow_map 같은 폴더) ──────────────
             if cfg.flow_map_path:
                 _gru_a_path = cfg.flow_map_path.parent / "gru_a.pt"
@@ -243,10 +255,13 @@ class Detector:
             self._compute_direction_cell_counts()                  # 방향별 셀 수 계산 → TA 주입
         print("✅ 정체 탐지 활성화 완료")
 
-        save_path = self._get_next_filename()                       # 결과 저장 파일명
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")                    # mp4 인코더 설정
-        writer = cv2.VideoWriter(str(save_path), fourcc, fps, (fw, fh))  # 영상 라이터 생성
-        print(f"📹 저장: {save_path}")
+        if self.cfg.result_dir:                                     # result_dir 없으면 녹화 안 함
+            save_path = self._get_next_filename()                   # 결과 저장 파일명
+            fourcc = cv2.VideoWriter_fourcc(*"mp4v")                # mp4 인코더 설정
+            writer = cv2.VideoWriter(str(save_path), fourcc, fps, (fw, fh))  # 영상 라이터 생성
+            print(f"📹 저장: {save_path}")
+        else:
+            writer = None                                           # 녹화 없음
 
         prev_time = time.time()                                     # FPS 계산 시작 시간
 
@@ -257,6 +272,31 @@ class Detector:
         self._gru_pretrain_pending_b = False                         # B방향 GRU pretrain 예약 플래그
         self._gru_feature_history_a = []                             # A방향 GRU pretrain용 feature 누적
         self._gru_feature_history_b = []                             # B방향 GRU pretrain용 feature 누적
+
+        # ── 누적 로그 경로 (flow_map과 같은 폴더) ─────────────────────
+        self._log_path_a = (cfg.flow_map_path.parent / "feature_log_a.pkl"
+                            if cfg.flow_map_path else None)          # A방향 누적 로그
+        self._log_path_b = (cfg.flow_map_path.parent / "feature_log_b.pkl"
+                            if cfg.flow_map_path else None)          # B방향 누적 로그
+        self._log_interval = getattr(cfg, "gru_log_interval", 3)     # 저장 주기 (프레임)
+
+        # ── 재학습 주기 추적 ──────────────────────────────────────────
+        _retrain_sec = getattr(cfg, "gru_retrain_interval_sec", 3600.0)
+        self._retrain_interval_frames = int(_retrain_sec * fps)      # 초→프레임
+        self._last_retrain_frame = 0                                 # 마지막 재학습 프레임
+
+        # ── detect_only 모드: 기존 로그로 즉시 재학습 시도 ────────────
+        if cfg.detect_only and _GRU_AVAILABLE:
+            for gru_m, log_p, tag in [
+                (self.gru_module_a, self._log_path_a, "A"),
+                (self.gru_module_b, self._log_path_b, "B"),
+            ]:
+                if gru_m is not None and log_p is not None and not gru_m._is_direct_trained:
+                    if gru_m.retrain_from_log(log_p):               # 로그에서 재학습
+                        if cfg.flow_map_path:                        # weights 저장
+                            _pt = cfg.flow_map_path.parent / f"gru_{tag.lower()}.pt"
+                            if gru_m.save(_pt):
+                                print(f"💾 GRU-{tag} 재학습 weights 저장: {_pt}")
 
         # ── 학습 연장 상한 계산 ──────────────────────────────────────
         max_learning_frames = int(                                  # 최대 학습 프레임 수
@@ -284,10 +324,21 @@ class Detector:
         if _disp_w > 0 and _disp_h > 0:                        # 0이 아닌 경우에만 크기 고정
             cv2.resizeWindow(_win_name, _disp_w, _disp_h)      # 창 크기 고정
 
+        _run_start_time = time.time()                               # 루프 시작 시각 (max_seconds 계산용)
+
         while cap.isOpened():                                       # 비디오 스트림이 열려 있는 동안
+            # ── max_seconds 초과 시 루프 종료 (ITS URL 갱신 타이밍) ──
+            if max_seconds is not None:
+                if time.time() - _run_start_time >= max_seconds:
+                    print(f"[run] {max_seconds:.0f}초 경과 → URL 갱신을 위해 루프 종료")
+                    break
+
             ret, frame = cap.read()                                 # 프레임 읽기
             if not ret:                                             # 더 이상 프레임 없으면
-                break                                               # 종료
+                if is_stream:                                       # 스트림이면 잠시 대기 후 재시도
+                    time.sleep(0.1)
+                    continue
+                break                                               # 파일이면 종료
 
             st.frame_num += 1                                       # 프레임 번호 증가
 
@@ -700,53 +751,97 @@ class Detector:
                 self.traffic_analyzer_b.update(tracks_b, speeds_b, st.frame_num)
                 self.predictor_b.update(self.traffic_analyzer_b.get_avg_speed())
 
-                # ── GRU pretrain용 feature 누적 (A방향) ──────────────────
-                if self._gru_pretrain_pending_a and self.gru_module_a is not None:
-                    feat_a = self.traffic_analyzer_a.get_last_feature()  # A방향 최신 feature
+                # ── feature 누적 (A방향) — pretrain·로그 공용 ─────────────
+                # pretrain_pending 여부와 무관하게 항상 수집
+                # → 세션이 달라져도 로그가 쌓여 점점 다양한 패턴 학습 가능
+                if self.gru_module_a is not None and st.frame_num % self._log_interval == 0:
+                    feat_a = self.traffic_analyzer_a.get_last_feature()
                     if feat_a is not None:
-                        self._gru_feature_history_a.append(feat_a)
+                        self._gru_feature_history_a.append(feat_a)  # pretrain용 메모리 누적
+                        # 로그 파일 실시간 append는 매 프레임 I/O 대신 세션 종료 시 일괄 저장
 
-                # ── GRU pretrain용 feature 누적 (B방향) ──────────────────
-                if self._gru_pretrain_pending_b and self.gru_module_b is not None:
-                    feat_b = self.traffic_analyzer_b.get_last_feature()  # B방향 최신 feature
+                # ── feature 누적 (B방향) ──────────────────────────────────
+                if self.gru_module_b is not None and st.frame_num % self._log_interval == 0:
+                    feat_b = self.traffic_analyzer_b.get_last_feature()
                     if feat_b is not None:
                         self._gru_feature_history_b.append(feat_b)
 
-                # ── GRU pretrain 실행 (A방향) ────────────────────────────
-                if (self._gru_pretrain_pending_a
-                        and self.gru_module_a is not None
-                        and len(self._gru_feature_history_a) >= cfg.gru_seq_len * 2):
-                    losses_a = self.gru_module_a.pretrain(self._gru_feature_history_a)
-                    if losses_a:
-                        print(f"🧠 GRU-A pretrain 완료: loss {losses_a[0]:.4f}→{losses_a[-1]:.4f}")
-                    self._gru_pretrain_pending_a = False
-                    self._gru_feature_history_a = []
-                    if cfg.flow_map_path:                           # weights 저장
-                        _save_a = cfg.flow_map_path.parent / "gru_a.pt"
-                        if self.gru_module_a.save(_save_a):
-                            print(f"💾 GRU-A weights 저장: {_save_a}")
+                # ── GRU pretrain / 재학습 (A방향) ────────────────────────
+                if self.gru_module_a is not None:
+                    _hist_len_a = len(self._gru_feature_history_a)
+                    _need_pretrain_a = (                             # 최초 pretrain 조건
+                        self._gru_pretrain_pending_a
+                        and _hist_len_a >= self.gru_module_a._pretrain_min_frames
+                    )
+                    _need_retrain_a = (                              # 주기적 재학습 조건
+                        self.gru_module_a._is_direct_trained         # 이미 한 번 학습됨
+                        and (st.frame_num - self._last_retrain_frame)
+                            >= self._retrain_interval_frames         # 재학습 주기 도달
+                        and self._log_path_a is not None
+                    )
+                    if _need_pretrain_a or _need_retrain_a:
+                        # 디스크 로그에 이번 세션 누적분 먼저 저장
+                        if self._log_path_a:
+                            total_a = self.gru_module_a.append_feature_log(
+                                self._gru_feature_history_a, self._log_path_a)
+                            print(f"[GRU-A] 로그 저장: 이번세션 {_hist_len_a}개 / 누적 {total_a}개 "
+                                  f"({total_a / max(fps, 1) / 60:.1f}분)")
+                            # 전체 누적 로그로 학습 (이번 세션 + 과거 세션)
+                            losses_a = self.gru_module_a.retrain_from_log(self._log_path_a)
+                        else:
+                            losses_a = self.gru_module_a.pretrain(self._gru_feature_history_a)
+                            if losses_a:
+                                print(f"🧠 GRU-A pretrain 완료: loss {losses_a[0]:.4f}→{losses_a[-1]:.4f}")
+                        self._gru_feature_history_a = []             # 메모리 비우기
+                        self._gru_pretrain_pending_a = False
+                        self._last_retrain_frame = st.frame_num      # 재학습 시각 갱신
+                        if cfg.flow_map_path:                        # weights 저장
+                            _save_a = cfg.flow_map_path.parent / "gru_a.pt"
+                            if self.gru_module_a.save(_save_a):
+                                print(f"💾 GRU-A weights 저장: {_save_a}")
 
-                # ── GRU pretrain 실행 (B방향) ────────────────────────────
-                if (self._gru_pretrain_pending_b
-                        and self.gru_module_b is not None
-                        and len(self._gru_feature_history_b) >= cfg.gru_seq_len * 2):
-                    losses_b = self.gru_module_b.pretrain(self._gru_feature_history_b)
-                    if losses_b:
-                        print(f"🧠 GRU-B pretrain 완료: loss {losses_b[0]:.4f}→{losses_b[-1]:.4f}")
-                    self._gru_pretrain_pending_b = False
-                    self._gru_feature_history_b = []
-                    if cfg.flow_map_path:                           # weights 저장
-                        _save_b = cfg.flow_map_path.parent / "gru_b.pt"
-                        if self.gru_module_b.save(_save_b):
-                            print(f"💾 GRU-B weights 저장: {_save_b}")
+                # ── GRU pretrain / 재학습 (B방향) ────────────────────────
+                if self.gru_module_b is not None:
+                    _hist_len_b = len(self._gru_feature_history_b)
+                    _need_pretrain_b = (
+                        self._gru_pretrain_pending_b
+                        and _hist_len_b >= self.gru_module_b._pretrain_min_frames
+                    )
+                    _need_retrain_b = (
+                        self.gru_module_b._is_direct_trained
+                        and (st.frame_num - self._last_retrain_frame)
+                            >= self._retrain_interval_frames
+                        and self._log_path_b is not None
+                    )
+                    if _need_pretrain_b or _need_retrain_b:
+                        if self._log_path_b:
+                            total_b = self.gru_module_b.append_feature_log(
+                                self._gru_feature_history_b, self._log_path_b)
+                            print(f"[GRU-B] 로그 저장: 이번세션 {_hist_len_b}개 / 누적 {total_b}개 "
+                                  f"({total_b / max(fps, 1) / 60:.1f}분)")
+                            losses_b = self.gru_module_b.retrain_from_log(self._log_path_b)
+                        else:
+                            losses_b = self.gru_module_b.pretrain(self._gru_feature_history_b)
+                            if losses_b:
+                                print(f"🧠 GRU-B pretrain 완료: loss {losses_b[0]:.4f}→{losses_b[-1]:.4f}")
+                        self._gru_feature_history_b = []
+                        self._gru_pretrain_pending_b = False
+                        if cfg.flow_map_path:
+                            _save_b = cfg.flow_map_path.parent / "gru_b.pt"
+                            if self.gru_module_b.save(_save_b):
+                                print(f"💾 GRU-B weights 저장: {_save_b}")
 
-                # ── GRU online_step: 각 방향 SMOOTH일 때 학습 ────────────
-                if self.gru_module_a is not None:                   # A방향 GRU 있으면
-                    if self.traffic_analyzer_a.get_congestion_level() == "SMOOTH":
-                        self.gru_module_a.online_step(label=0)      # SMOOTH=0 레이블
-                if self.gru_module_b is not None:                   # B방향 GRU 있으면
-                    if self.traffic_analyzer_b.get_congestion_level() == "SMOOTH":
-                        self.gru_module_b.online_step(label=0)      # SMOOTH=0 레이블
+                # ── GRU online_step: 매 프레임 현재 레벨로 실시간 학습 ──────
+                # SMOOTH만 학습하던 방식 → 전체 레벨 학습으로 확장
+                # 이유: 하루종일 실행 시 아침 러시(CONGESTED), 낮(SMOOTH), 저녁 러시(SLOW) 등
+                #       다양한 패턴을 실시간으로 반영해야 예측 정확도가 올라감
+                _level_map = {"SMOOTH": 0, "SLOW": 1, "CONGESTED": 2}
+                if self.gru_module_a is not None:
+                    _lv_a = self.traffic_analyzer_a.get_congestion_level()
+                    self.gru_module_a.online_step(label=_level_map[_lv_a])  # 전체 레벨 학습
+                if self.gru_module_b is not None:
+                    _lv_b = self.traffic_analyzer_b.get_congestion_level()
+                    self.gru_module_b.online_step(label=_level_map[_lv_b])  # 전체 레벨 학습
 
                 # ── flow_map speed_ref 온라인 학습 (SMOOTH 구간만) ────────
                 # SMOOTH 구간의 nm을 셀별로 EMA 축적 → 위치별 정상속도 기준 확보
@@ -826,7 +921,8 @@ class Detector:
             cv2.putText(frame, f"FPS: {show_fps:.1f}", (10, fps_y),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2, cv2.LINE_AA)
 
-            writer.write(frame)                                     # 결과 영상 파일에 프레임 기록
+            if writer:
+                writer.write(frame)                                 # 결과 영상 파일에 프레임 기록
             cv2.imshow(_win_name, frame)                            # 화면에 출력 (고정 창)
 
             key = cv2.waitKey(1) & 0xFF                             # 키 입력 대기
@@ -857,12 +953,26 @@ class Detector:
 
         # ── 루프 종료 후 정리 ──
         cap.release()                                               # 비디오 캡처 해제
-        writer.release()                                            # 비디오 라이터 해제
+        if writer:
+            writer.release()                                        # 비디오 라이터 해제
         cv2.destroyAllWindows()                                     # 모든 OpenCV 창 닫기
 
         # 학습이 완료되지 않은 채로 종료된 경우 마지막 flow_map 저장
         if not st.is_learning and cfg.flow_map_path:                # 학습 완료 상태이면
             self.flow.save(cfg.flow_map_path)                       # flow_map 저장 (baseline 없이)
+
+        # ── 세션 종료 시 미저장 feature 로그 flush ──────────────────
+        # 재학습 주기에 도달하지 않은 채 종료되더라도 이번 세션 데이터를 보존
+        for gru_m, hist, log_p, tag in [
+            (self.gru_module_a, self._gru_feature_history_a, self._log_path_a, "A"),
+            (self.gru_module_b, self._gru_feature_history_b, self._log_path_b, "B"),
+        ]:
+            if gru_m is not None and hist and log_p is not None:
+                total = gru_m.append_feature_log(hist, log_p)
+                print(f"[GRU-{tag}] 세션 종료 — "
+                      f"이번 {len(hist)}개 저장 / 누적 {total}개 "
+                      f"({total / max(fps, 1) / 60:.1f}분 / "
+                      f"{gru_m._pretrain_min_frames / max(fps, 1) / 60:.1f}분 필요)")
 
         self._print_final_stats(save_path)                          # 최종 통계 출력
 

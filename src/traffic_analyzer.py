@@ -71,7 +71,8 @@ class TrafficAnalyzer:
         self._last_affected_count = 0                 # 마지막 저속(정지) 차량 수
         self._last_rule_jam: float = 0.0              # 마지막 rule 기반 jam_score (로그용)
         self._last_gru_score: float | None = None     # 마지막 GRU 예측값 (없으면 None)
-        self._last_future_pred: list | None = None    # 마지막 predict_future() 결과
+        self._last_future_pred: list | None = None    # 마지막 predict_future() 결과 (자기회귀)
+        self._last_direct_pred: list | None = None    # 마지막 predict_direct() 결과 (1·3·5분 직접 예측)
         self._future_pred_interval: int = max(        # predict_future 호출 주기 (프레임)
             cfg.gru_seq_len, 30                       # 최소 30프레임 — 자기회귀 연산 비용
         )
@@ -87,7 +88,8 @@ class TrafficAnalyzer:
         """
         self.feature_extractor = FeatureExtractor(    # FeatureExtractor 생성
             self.cfg,                                 # 설정 객체
-            state                                     # 런타임 상태
+            state,                                    # 런타임 상태
+            fps=self.fps                              # FPS 전달 — dwell_threshold_sec 프레임 변환용
         )
 
     # ── 준비 완료 신호 (학습 완료 후 detector.py에서 호출) ──────────
@@ -198,12 +200,18 @@ class TrafficAnalyzer:
         # ── 5) 레벨 판정 (히스테리시스 포함, final_jam 기준) ─────────
         level, jam = self.congestion_judge.apply_level(final_jam, frame_num)
 
-        # ── 6) 미래 예측 (predict_future — 매 _future_pred_interval 프레임) ──
+        # ── 6) 미래 예측 (매 _future_pred_interval 프레임) ───────────────
         if (self._gru_module is not None
                 and frame_num % self._future_pred_interval == 0):
-            pred = self._gru_module.predict_future()  # N스텝 자기회귀 롤아웃
-            if pred is not None:                      # 버퍼 부족·warmup이면 None
-                self._last_future_pred = pred         # 결과 저장
+            # 자기회귀 롤아웃 (단기 — 수초)
+            pred = self._gru_module.predict_future()
+            if pred is not None:
+                self._last_future_pred = pred
+
+            # Direct 예측 (장기 — 1·3·5분 후)
+            direct = self._gru_module.predict_direct()
+            if direct is not None:                    # 학습 완료 후에만 결과 있음
+                self._last_direct_pred = direct
 
         # ── feature 저장 (detector.py에서 GRU online_step용 레벨 확인에 사용) ─
         self._last_feature = x_t                      # 마지막 feature 벡터 저장
@@ -256,7 +264,18 @@ class TrafficAnalyzer:
               "p_congested": float, "gru_score": float}, ...]
             GRU 미훈련·버퍼 부족이면 None.
         """
-        return self._last_future_pred                  # 미래 예측 결과 (웹 API용)
+        return self._last_future_pred                  # 자기회귀 예측 결과 (웹 API용)
+
+    def get_direct_prediction(self) -> list | None:
+        """1·3·5분 후 직접 예측 결과를 반환한다.
+
+        Returns:
+            [{"horizon_min": 1, "predicted_level": "SLOW",
+              "p_smooth": 0.1, "p_slow": 0.6, "p_congested": 0.3,
+              "confidence": 0.6}, ...]
+            학습 미완료이면 None.
+        """
+        return self._last_direct_pred                  # direct 예측 결과 (웹 API·화면 표시용)
 
     def get_volume(self) -> float:
         """교통량(대/시)을 추정한다.

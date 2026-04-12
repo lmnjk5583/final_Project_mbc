@@ -931,3 +931,37 @@
 **jam_score 가중치 재보정**: `0.29×slow + 0.25×stop + 0.20×sqrt(bbox) + 0.08×count`
 **slow_upper_nm**: 0.50→2.5, `nm_cy_correction_k`: 0.6→0.0
 수정: `src/config.py`, `congestion_judge.py`, `detector.py`, `feature_extractor.py`, `traffic_analyzer.py`
+
+## 2026-04-08 (74~79차 — 웹 버그픽스·동기화·자동시작) [수빈]
+
+### 74차 — cctv_state 키 불일치 버그픽스
+- `reverse_detector.py`: `display_name` 추가 (`_reverse` 접미사 제거)
+- `its.py`: `{name}_reverse` 키 우선 조회 후 `{name}` fallback
+
+### 75차 — jam_score 과도 상승 + 경부선 fallback 좌표
+- `reverse_detector.py`: src/congestion_judge.py 직접 import, `reset()` 교체
+- `its.py`: 경부선 GYEONGBU_FALLBACK 좌표 전면 교체
+
+### 76차 — bbox_coverage·count_ratio 분모 버그
+- `reverse_detector.py`: bbox_coverage 분모 전체그리드→방향별 유효셀, count_ratio 분모 n_known→n_total
+
+### 77차 — jam_score false positive (서버재시작 후)
+- `reverse_detector.py`: `set_baseline()`→`reset()` (EMA 0.5시작→0시작)
+- `its.py`: 경부선 fallback 좌표 재수정
+
+### 78차 — 대원 81~90차 pull 반영
+- `reverse_modules/config.py`: velocity_window·wrong_count_threshold·smooth_jam_threshold·slow_upper_nm 동기화
+- `reverse_detector.py`: `_make_x_t()` 소표본 보정 동기화
+
+### 79차 — 모델 고정·conf 버그·학습중 jam 차단·전체CCTV 자동시작
+- `reverse_detector.py`: GPU/CPU 분기 제거, conf falsy 버그 수정, 학습중 jam 차단
+- `its.py`: `_fetch_gyeongbu_cctvs(all_cameras=True)` 추가
+- `app.py`: `_auto_start_all_detectors()` 백그라운드 스레드 (부팅 후 전체 CCTV 자동 시작)
+
+### 수정 파일 (74~79차)
+`C:\finalPj_웹/backend_flask/` —
+`app.py`, `models.py`, `modules/traffic/its.py`,
+`modules/traffic/detectors/reverse_detector.py`,
+`modules/traffic/detectors/reverse_modules/config.py`
+
+---
