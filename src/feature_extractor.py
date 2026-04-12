@@ -32,17 +32,23 @@ class FeatureExtractor:
         frame_w, frame_h 참조.
     """
 
-    def __init__(self, cfg, state):
+    def __init__(self, cfg, state, fps: float = 30.0):
         """FeatureExtractor 초기화.
 
         Args:
             cfg: DetectorConfig.
             state: DetectorState — frame_w, frame_h.
+            fps: 영상 FPS — dwell_threshold_sec를 프레임 수로 변환하는 데 사용.
         """
         self.cfg = cfg                                 # 설정 객체 저장
         self.state = state                             # 런타임 상태 저장
         self._ready = False                            # set_baseline() 호출 후 True
         self._valid_cell_count_override: int | None = None  # 방향별 유효 셀 수 (None=전체 사용)
+
+        # dwell_threshold_sec(초) → 프레임 수로 변환 (FPS 기반)
+        # 30fps: 0.5초 × 30 = 15프레임 / 10fps: 0.5초 × 10 = 5프레임
+        _dwell_sec = getattr(cfg, "dwell_threshold_sec", 0.5)
+        self._dwell_thr_frames: int = max(1, int(_dwell_sec * fps))  # 최소 1프레임 보장
 
         # ── 방향별 자기보정 nm baseline (비대칭 EMA) ─────────────────
         self._nm_baseline: float = 0.0                 # 방향 고유 정상속도 기준 (자동 보정)
@@ -192,7 +198,7 @@ class FeatureExtractor:
         # ── flow map 기반 체류(dwell) 계산 ──────────────────────────────
         # 차량이 같은 그리드 셀에 dwell_threshold_frames 이상 머물면 체류 셀로 집계
         # nm 임계값 불필요 — 셀 이동 여부로만 판단 (CCTV 각도·거리 무관)
-        _dwell_thr = getattr(self.cfg, "dwell_threshold_frames", 15)
+        _dwell_thr = self._dwell_thr_frames            # __init__에서 FPS 기반으로 계산된 임계값
         _dwell_cells_set: set = set()                  # 체류 차량이 점유한 고유 셀 집합
         for t in tracks:
             _tid = t["id"]
@@ -276,25 +282,34 @@ class FeatureExtractor:
         #   밀도(density)  : 점유 셀 수 / valid_cell_count        (얼마나 많이 막혔는가)
         #   둘을 곱하면: 많이 막히고 + 오래 머물수록 높아짐
 
-        _ema_flat = self._cell_dwell_ema.flatten()
+        # 현재 점유 중인 셀들의 dwell_ema 값만 추출 (ema > 0.03 = 최소 의미있는 점유)
+        # ema=0.03 미만은 방금 진입한 셀이거나 오래전에 나간 잔류값 → 노이즈로 처리
         _occupied_emas = [
             self._cell_dwell_ema[_r, _c]
             for (_r, _c) in occupied_cells_set
-            if self._cell_dwell_ema[_r, _c] > 0.03   # 의미있는 점유만
+            if self._cell_dwell_ema[_r, _c] > 0.03
         ]
 
         if _occupied_emas:
-            _cds_intensity = float(np.mean(_occupied_emas))           # 점유 셀 평균 강도 (0~1)
-            _lane_cell_count = max(valid_cell_count // 2, 1)   # 단방향 차선 셀 수 추정
-            _cds_density = min(1.0, len(_occupied_emas) / _lane_cell_count)
-            # 강도 × 밀도 보정: 밀도 낮아도 강도 높으면 어느 정도 반영
+            _cds_intensity = float(np.mean(_occupied_emas))  # 점유 셀 평균 EMA 강도 (얼마나 오래 머물렀는가)
+            # 단방향 차선 셀 수 결정
+            # - override 주입된 경우: 이미 단방향 값 → 그대로 사용
+            # - 전체 셀 사용 중(양방향 통합): // 2로 단방향 추정
+            if self._valid_cell_count_override is not None:
+                _lane_cell_count = valid_cell_count     # 이미 단방향 값
+            else:
+                _lane_cell_count = max(valid_cell_count // 2, 1)  # 양방향 → 단방향 추정
+            _cds_density = min(1.0, len(_occupied_emas) / _lane_cell_count)  # 단방향 기준 점유 비율 (0~1)
+            # 최종 score = 강도 × (0.3 + 0.7 × 밀도)
+            #   밀도=0 이어도 강도가 높으면 0.3 × intensity로 최소 반영
+            #   밀도=1 이면 1.0 × intensity = 최대값
             cell_dwell_score = float(np.clip(
                 _cds_intensity * (0.3 + 0.7 * _cds_density), 0.0, 1.0
             ))
         else:
-            _cds_intensity = 0.0
-            _cds_density   = 0.0
-            cell_dwell_score = 0.0
+            _cds_intensity = 0.0   # 점유 셀 없음 → 강도 0
+            _cds_density   = 0.0   # 점유 셀 없음 → 밀도 0
+            cell_dwell_score = 0.0 # 정체 신호 없음
         # ── cell_persistence: 30프레임 전 점유 셀과 현재의 Jaccard 유사도 ──
         # 문제: 20×20 그리드 셀=64×36px → 정체 차량이 90px만 이동해도 셀 이탈 → persist 낮음
         # 해결: 2×2 블록 코어스 그리드(10×10, 셀=128×72px)로 다운샘플링
@@ -305,17 +320,17 @@ class FeatureExtractor:
              int(np.clip(t["cx"] / cell_w, 0, self.cfg.grid_size - 1)) // 2)
             for t in tracks if t["id"] in speed_known_tids
         )
-        self._occ_history.append(_coarse_occ)                    # 코어스 셀 집합 저장
-        if len(self._occ_history) >= self._OCC_HIST_LEN:         # 30프레임 이력 확보
-            _prev_occ = self._occ_history[0]                     # 30프레임 전 셀 집합
-            _inter = len(_coarse_occ & _prev_occ)                # 교집합 (유지된 코어스 셀)
-            _union = len(_coarse_occ | _prev_occ)                # 합집합
-            _raw_persist = _inter / _union if _union > 0 else 0.0  # 순간 Jaccard
+        self._occ_history.append(_coarse_occ)                    # 코어스 셀 집합 deque에 추가 (maxlen=31)
+        if len(self._occ_history) >= self._OCC_HIST_LEN:         # 31프레임 이력이 찼을 때만 계산
+            _prev_occ = self._occ_history[0]                     # deque[0] = 30프레임 전 코어스 셀 집합
+            _inter = len(_coarse_occ & _prev_occ)                # 교집합: 30f 전과 지금 모두 점유된 셀 수
+            _union = len(_coarse_occ | _prev_occ)                # 합집합: 둘 중 하나라도 점유된 셀 수
+            _raw_persist = _inter / _union if _union > 0 else 0.0  # Jaccard 유사도 (0=완전 이동, 1=완전 정체)
+            # EMA로 스무딩: 순간 Jaccard가 프레임마다 튀는 것을 완화
             self._persist_ema = (self._PERSIST_EMA_ALPHA * _raw_persist
                                  + (1.0 - self._PERSIST_EMA_ALPHA) * self._persist_ema)
-        else:
-            pass                                                 # 이력 부족 → ema 유지(0)
-        cell_persistence = self._persist_ema                     # EMA 평활화된 값 사용
+        # 이력 부족(초기 31프레임 미만)이면 _persist_ema=0.0 유지 — 정체 신호 억제
+        cell_persistence = self._persist_ema                     # EMA 평활화된 Jaccard 값
 
         # ── norm_speed_ratio 계산 ─────────────────────────────────────
         # 상위 50% 중앙값 사용: 정체 차량 소수가 nm을 낮춰도 정상 주행 차량의 속도를 반영
@@ -449,10 +464,9 @@ class FeatureExtractor:
             "deficit_count":         deficit_count,          # speed_ref 유효 차량 수
             "vdr_ready":             _vdr_ready,             # warmup 완료 여부
             
-                # 추가
-            "known_vehicle_count":   speed_known_count,
-            "occupied_cell_count":   occupied_cells,
-            "valid_cell_count":      valid_cell_count,
+                "known_vehicle_count":   speed_known_count,  # 궤적 확인된 차량 수 (저규모 가드용)
+            "occupied_cell_count":   occupied_cells,     # 현재 점유 셀 수 (저규모 가드용)
+            "valid_cell_count":      valid_cell_count,   # 유효 셀 수 (분모 기준)
 
             "rule_jam_score":        0.0,                    # jam_score (CJ 채움)
         }

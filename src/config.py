@@ -53,7 +53,13 @@ class DetectorConfig:
     log_interval_frames: int = 5        # 트랙/프레임 로그를 N프레임마다 기록
 
     # ==================== 정체 탐지 히스테리시스 ====================
-    congestion_hysteresis_sec: float = 3.0   # 정체 레벨 전환 유지 시간 (초)
+    congestion_hysteresis_sec: float = 7.0   # 정체 레벨 전환 유지 시간 (초) — 3.0→7.0: 순간 변동으로 인한 레벨 오락가락 방지
+
+    # ==================== 초기 확정 구간 (학습 완료 직후) ====================
+    initial_confirm_sec:     float = 5.0     # 학습 완료 후 이 시간 동안 초기 히스테리시스 적용
+                                             # cell_dwell_ema·cell_persistence 안정화에 최소 3초 필요 → 5초로 여유
+    initial_hysteresis_sec:  float = 2.0     # 초기 확정 구간 중 사용할 짧은 히스테리시스
+                                             # 정규(7초)보다 짧게 — 학습 직후 현재 도로 상태를 빠르게 확정
 
     # ==================== CongestionPredictor 파라미터 ====================
     free_flow_speed: float = 100.0           # 자유 흐름 속도 기준 (km/h) — 회복 예측용
@@ -81,13 +87,15 @@ class DetectorConfig:
 
     # ==================== jam_score 임계값 ====================
     smooth_jam_threshold:    float = 0.25   # jam_score 이 값 미만 → SMOOTH
-    slow_jam_threshold:      float = 0.55   # jam_score 이 값 미만 → SLOW, 이상 → CONGESTED
+    slow_jam_threshold:      float = 0.60   # jam_score 이 값 미만 → SLOW, 이상 → CONGESTED
     density_max_vehicles:   float = 40.0   # density 정규화 기준 차량 수 — 이 값 이상이면 density=1.0 (포화)
 
     # ==================== jam_score EMA 스무딩 ====================
     # 비대칭 EMA: 악화(올라갈 때)는 빠르게, 호전(내려갈 때)은 느리게
     # 실제 교통 특성 반영 — 정체는 순식간에 쌓이지만 해소는 수분 이상 걸림
-    jam_ema_alpha_up:   float = 0.70  # 악화 방향 EMA 속도 (0.15→0.25: 정체 진입 시 빠른 상승)
+    jam_ema_alpha_up:   float = 0.40  # 악화 방향 EMA 속도 — 빠른 상승 유지하면서 순간 노이즈 흡수
+                                      # 0.70은 EMA가 raw값과 거의 동일해져 비대칭 설계 의미 없어짐
+                                      # 0.40: 1프레임에 40% 반영, 3프레임이면 raw의 ~78% 수렴
     jam_ema_alpha_down: float = 0.04  # 호전 방향 EMA 속도 (새 값 4% 반영)  — 약 25프레임에 걸쳐 반응
 
     # ==================== 학습 연장 ====================
@@ -97,12 +105,26 @@ class DetectorConfig:
     gru_hidden: int = 64                    # GRU hidden state 크기
     gru_layers: int = 2                     # GRU 레이어 수
     gru_seq_len: int = 30                   # 입력 시퀀스 길이 (프레임)
-    gru_blend_ratio: float = 0.0           # GRU 기여 비율 (1 - 이 값 = rule 비율)
+    gru_blend_ratio: float = 0.20          # GRU 기여 비율 (1 - 이 값 = rule 비율)
+                                           # 0.20 = rule 80% + GRU 20% — 처음엔 낮게 시작해서 jam 이상 시 줄이기
     gru_warmup_frames: int = 30             # camera_switch 후 GRU 사용 금지 프레임
     gru_replay_size: int = 200              # replay_buffer 최대 크기
     gru_online_interval: int = 10           # 온라인 학습 gradient step 주기 (프레임)
     gru_lr: float = 1e-3                    # Adam optimizer 학습률
     gru_forecast_steps: int = 150           # 미래 예측 자기회귀 스텝 수 (150프레임 ≈ 5초@30fps)
+
+    # ==================== Direct 미래 예측 파라미터 ====================
+    # 자기회귀 롤아웃 대신 "현재 관측 → N분 후 상태" 를 직접 예측하는 헤드
+    # 오차 누적 없음 — 각 헤드가 독립적으로 해당 시점의 레벨을 학습
+    gru_predict_horizons_sec: tuple = (60, 180, 300)  # 예측 목표: 1분·3분·5분 후
+    gru_pretrain_min_sec: float = 600.0               # pretrain 시작 최소 데이터 (초)
+                                                      # 최대 horizon(5분) × 2 = 10분 — 충분한 학습 쌍 확보
+    gru_direct_epochs: int = 10                       # direct head 학습 epoch 수
+    gru_log_interval: int = 3                         # feature 로그 저장 주기 (프레임)
+                                                      # 매 프레임 저장 시 I/O 과부하 → 3프레임마다 1개 저장
+                                                      # 10fps × 1/3 ≈ 3.3개/초 → 1시간 ≈ 12,000개
+    gru_retrain_interval_sec: float = 3600.0          # 누적 데이터 증가 후 재학습 주기 (초)
+                                                      # 1시간마다 새 데이터 반영해 재학습
 
     # ==================== 화면 표시 설정 ====================
     display_width: int = 1280              # 화면 출력 창 너비 (픽셀). 0이면 원본 해상도 그대로
@@ -119,7 +141,8 @@ class DetectorConfig:
     nm_baseline_warmup:   int   = 300     # baseline 유효 최소 누적 프레임 (10초@30fps)
 
     # ==================== flow map 기반 체류 탐지 ====================
-    dwell_threshold_frames: int = 15       # 차량이 같은 셀에 이 프레임 이상 머물면 체류로 판정
+    dwell_threshold_sec: float = 0.5       # 차량이 같은 셀에 이 초 이상 머물면 체류로 판정
+                                           # (fps 무관하게 동일한 체감 — 30fps→15f, 10fps→5f 자동 변환)
     cell_dwell_ema_up:   float = 0.05      # 셀 점유 시 EMA 상승 속도 (30프레임 연속 → ema≈0.78)
     cell_dwell_ema_down: float = 0.02      # 셀 이탈 시 EMA 하락 속도 (50프레임 후 ema≈0.36)
 

@@ -4,6 +4,71 @@
 
 ---
 
+## 2026-04-12 (92차 — GRU 직접예측·연속학습·ITS 실시간 실행기) [대원]
+
+### 오늘 한 작업
+
+**구조적 버그 수정**
+- `congestion_judge.py`: 모듈 상단 DEBUG print(`import os`, `print(f"[DEBUG]...")`) 제거
+- `congestion_judge.py`: `set_baseline()` 내 `print(f"[CJ] alpha_up=...")` 제거
+- `feature_extractor.py`: `_ema_flat` 미사용 dead code 제거
+- `feature_extractor.py`: `_lane_cell_count // 2` 버그 수정 — `_valid_cell_count_override` 지정 시 이미 단방향값인데 다시 /2 해서 cds 2배 과대평가 → 조건부 분기로 수정
+- `congestion_judge.py`: `compute_jam_score_fallback()` cds 가중치 1.10→1.90 (위 버그 보정치 교정)
+
+**파라미터 개선**
+- `config.py`: `jam_ema_alpha_up` 0.70→0.40 (0.70은 EMA≈raw값으로 비대칭 설계 무의미)
+- `config.py`: `dwell_threshold_frames=15` → `dwell_threshold_sec=0.5` (FPS 독립적 설계)
+- `feature_extractor.py`: `__init__(fps)` 파라미터 추가 → `_dwell_thr_frames = int(0.5 * fps)` 변환
+- `config.py`: `congestion_hysteresis_sec` 3.0→7.0 (순간 변동으로 레벨 오락가락 방지)
+
+**초기 확정 구간 추가**
+- `config.py`: `initial_confirm_sec=5.0`, `initial_hysteresis_sec=2.0` 추가
+- `congestion_judge.py`: `apply_level()` — 학습 완료 후 5초간 2초 히스테리시스 적용, 이후 정규 7초 전환
+- `congestion_judge.py`: `reset()` 시 `_baseline_frame=None` 초기화
+
+**GRU Direct Prediction Head (1분·3분·5분 예측)**
+- `gru_module.py`: `_FEATURE_KEYS` 수정 — 실제 feature_extractor 출력키와 불일치하던 3개 키 교정
+  - 제거: `count_ratio`, `exit_rate_ratio`, `dwell_ratio`
+  - 추가: `norm_speed_ratio`, `slow_ratio`, `flow_occupancy`, `cell_dwell_score`, `cell_persistence`, `rule_jam_score`
+- `gru_module.py`: `_GRUNet.direct_heads` — horizon별 독립 FC 헤드(hidden→32→3) ModuleList 추가
+- `gru_module.py`: `pretrain()` 확장 — self-supervised MSE 후 direct head CrossEntropy 학습
+- `gru_module.py`: `predict_direct()` 추가 — 현재 hidden state → horizon별 level+confidence 반환
+- `config.py`: `gru_predict_horizons_sec=(60,180,300)`, `gru_pretrain_min_sec=600.0`, `gru_direct_epochs=10` 추가
+
+**GRU 연속 학습 (세션 간 데이터 누적)**
+- `gru_module.py`: `append_feature_log(features, path)` — pickle append로 디스크 누적
+- `gru_module.py`: `load_feature_log(path)` — 누적 pickle 로드
+- `gru_module.py`: `retrain_from_log(path)` — 전체 누적 데이터로 재학습
+- `config.py`: `gru_log_interval=3`, `gru_retrain_interval_sec=3600.0` 추가
+- `detector.py`: `_log_path_a/b`, 1시간마다 `retrain_from_log()` 자동 실행
+- `detector.py`: `online_step` SMOOTH 전용 → 3레벨(SMOOTH/SLOW/CONGESTED) 모두 학습
+- `config.py`: `gru_blend_ratio` 0.0→0.20 (GRU 활성화)
+
+**스트림 실행 지원**
+- `detector.py`: `run(video_name, max_seconds=None)` — HTTP/RTSP 스트림 감지, 읽기 실패 시 sleep+continue
+- `detector.py`: `result_dir=None` 시 VideoWriter 생성 건너뜀, write/release None 체크 추가
+
+**ITS 실시간 실행기 신규 생성**
+- `run_its_live.py`: ITS API로 CCTV 스트림 URL 조회 → 200초마다 자동 갱신 무한 루프
+- `.env`의 `ITS_API_KEY` 사용, CCTV별 독립 저장 폴더 (`flow_maps/[CCTV_NAME]/`)
+- HLS(M3U8) 응답 자동 감지 → URL 직접 스트림으로 사용
+- `DIRECT_STREAM_URL` 옵션 — API 없이 스트림 URL 직접 지정 가능
+
+### 수정 파일
+`src/config.py`, `src/congestion_judge.py`, `src/feature_extractor.py`,
+`src/traffic_analyzer.py`, `src/gru_module.py`, `src/detector.py`
+신규: `run_its_live.py`
+
+### 발생 오류 / 해결
+- `ITS_CCTV_API_URL`에 HLS 스트림 URL 입력 시 JSON 파싱 실패 → Content-Type 감지로 자동 처리
+- `result_dir=None`일 때 `_get_next_filename()` TypeError → VideoWriter 조건부 생성으로 수정
+
+### 작업 재개 위치
+- `python run_its_live.py` 실행 → 1800프레임 flow_map 학습 완료 후 GRU feature 누적 시작 확인
+- 10분 후 pretrain 로그(`🧠 GRU-A pretrain 완료`) 확인
+
+---
+
 ## 2026-04-09 (91차 — Cell Dwell EMA 기반 jam_score 전면 재설계) [대원]
 
 ### 오늘 한 작업
@@ -33,197 +98,15 @@
 - 모델: `yolo11n_v1` → `yolo11n_v5`
 - 영상: `임시/정체_완화_테스트.mp4` → `임시/2026-04-02_10-05-59/videos/record_2026-04-02_10-05-59.mp4`
 
-**신규 flow_map 파일 추가**
-- `flow_maps/flow_map-서행.npy`, `flow_maps/flow_map-정체.npy` (테스트용 케이스별 맵)
-- `flow_maps/gru_a.pt`, `flow_maps/gru_b.pt` (방향별 GRU 체크포인트)
-
 ### 수정 파일
 `src/config.py`, `src/congestion_judge.py`, `src/feature_extractor.py`, `src/traffic_analyzer.py`, `run_test.py`
 추가: `flow_maps/flow_map-서행.npy`, `flow_maps/flow_map-정체.npy`, `flow_maps/gru_a.pt`, `flow_maps/gru_b.pt`
 
 ### 발생 오류 / 확인 사항
 - GRU blend 0.40 시 rule 신호 희석 → blend 0.0으로 rule-only 확인 후 재조정 예정
-- DEBUG print 잔존 (`congestion_judge.py` 상단 `os.path.abspath`) — 프로덕션 전 제거 필요
+- DEBUG print 잔존 (`congestion_judge.py` 상단 `os.path.abspath`) — 92차에서 제거 완료
 
 ### 작업 재개 위치
-- `run_test.py` 실행 → cell_dwell_score / jam_score 범위 확인 (원활<0.25, 서행<0.55, 정체≥0.55)
-- DEBUG print 제거 후 웹 동기화 (`reverse_detector.py` + `congestion_judge.py` import 경로 확인)
-
----
-
-## 2026-04-08 (79차 — 모델 고정·conf 버그·학습중 jam 차단·전체CCTV 자동시작) [수빈]
-
-### 오늘 한 작업
-
-**모델 경로 통일 (항상 yolo11n_v1 사용)**
-- `reverse_detector.py`: GPU/CPU 분기 제거 → `C:\final_pj\runs\yolo11n_v1\weights\best.pt` 고정
-
-**conf=0 적용 안되는 버그 수정**
-- `reverse_detector.py`: `os.getenv(...) or conf or 0.35` → Python falsy로 0.0이 0.35로 치환됨
-- 수정: `if _env_conf / elif conf / else 0.35` 명시적 분기로 교체
-
-**학습 중 jam_score 계산 차단**
-- `reverse_detector.py`: congestion 블록에 `not st.is_learning and not st.relearning` 가드 추가
-- 이유: 학습 중엔 _ref_direction·cell_count 미설정 → bbox_coverage 오산 → jam 오염
-
-**전체 CCTV 자동 시작 (서버 부팅 시)**
-- `its.py`: `_fetch_gyeongbu_cctvs(all_cameras=True)` 파라미터 추가 — 20개 랜덤 제한 제거
-- `app.py`: `_auto_start_all_detectors()` 백그라운드 스레드 추가
-  - 서버 시작 8초 후 전체 경부선 CCTV detector 자동 생성
-  - 3분마다 ITS URL 갱신 (TTL=4분 만료 전 토큰 갱신)
-  - URL 변경 감지 시 해당 detector만 재시작
-
-### 수정 파일
-`C:\finalPj_웹` —
-- `backend_flask/app.py`
-- `backend_flask/modules/traffic/its.py`
-- `backend_flask/modules/traffic/detectors/reverse_detector.py`
-
-### 발생 오류 / 확인 사항
-- conf `or` 체인 falsy 버그: Python에서 0.0 or 0.35 = 0.35 → 항상 0.35로 overwrite
-- 학습 중 _valid_cells_up=1(기본값) → bbox_coverage = n/1 → 최대 1.0 → jam 오염
-
-### 작업 재개 위치
-- 플라스크 재시작 → 자동시작 로그 확인 ("🚀 [Auto-start] 전체 경부선 CCTV 자동 탐지 시작...")
-- 내가 클릭 안 한 CCTV도 학습 진행 여부 확인
-
----
-
-## 2026-04-08 (78차 — 대원 81~90차 pull 반영: 웹 config·feature 동기화) [수빈]
-
-### 오늘 한 작업
-
-**대원 81~90차 변경사항 웹 동기화**
-- `reverse_modules/config.py`: `velocity_window` 20→10, `wrong_count_threshold` 12→15 (src 동기화)
-- `reverse_modules/config.py`: `min_wrongway_track_age: int = 30` 추가 (역주행 판정 최소 추적 프레임)
-- `reverse_modules/config.py`: `smooth_jam_threshold` 0.30→0.25 (src 동기화)
-- `reverse_modules/config.py`: `slow_upper_nm` 2.5→0.70 (src 동기화: EMA smoothing 후 원거리 정상차량 오판 방지)
-- `reverse_detector.py`: `_make_x_t()` 소표본 보정 _MIN_RELIABLE 3→5, 선형→제곱 감쇠 (src/feature_extractor.py 동기화)
-- `congestion_judge.py`(src/ 직접 import): 가중치 0.29/0.25/0.20/0.08 → 0.80/0.70/0.45, count 제거 자동 반영
-
-**work_log 충돌 해결**
-- HEAD(수빈 75차) + remote(대원 81~90차) 충돌 → 두 항목 모두 유지
-
-### 수정 파일
-`C:\finalPj_웹` —
-- `backend_flask/modules/traffic/detectors/reverse_detector.py`
-- `backend_flask/modules/traffic/detectors/reverse_modules/config.py`
-
-### 작업 재개 위치
-- 플라스크 재시작 → jam_score 정상 범위 확인
-
----
-
-## 2026-04-08 (77차 — jam_score 0.4 false positive + 경부선 fallback 좌표 수정) [수빈]
-
-### 오늘 한 작업
-
-**jam_score 0.4 false positive 수정 (서버 재시작 후 원활 도로)**
-- `reverse_detector.py`: `cong_judge.set_baseline()` → `reset()`으로 교체 (load_flow_map, 초기학습완료, 재학습완료 3곳)
-- 원인: `set_baseline()`은 EMA=0.5로 초기화 → alpha_down=0.04 감소율로 30-40초간 false SLOW
-- 수정: `reset()`으로 EMA=0 시작 → 실제 도로 상태로 빠르게 수렴 (원활이면 5-10초내 0.1대)
-
-**경부선 fallback 좌표 수정**
-- `its.py`: GYEONGBU_FALLBACK 좌표 전면 교체 — 마지막 점 경도 오류(126.9→128.98 직선 점프)로 이상한 직선 표시됐던 것 수정
-- 수정: 서울TG→수원→오산→천안→대전→옥천→황간→김천→구미→칠곡→대구→경산→언양→부산TG 실제 경로 좌표
-
-### 수정 파일
-`C:\finalPj_웹` —
-- `backend_flask/modules/traffic/detectors/reverse_detector.py`
-- `backend_flask/modules/traffic/its.py`
-
-### 발생 오류 / 확인 사항
-- fallback 좌표 마지막 점 [35.1775, **128.9835**] — 앞 점들이 경도 126.9대인데 갑자기 128.98 → 직선 jump
-- EMA 0.5 시작 + alpha_down=0.04: 원활도로에서도 40초간 SLOW 오분류
-
-### 작업 재개 위치
-- 플라스크 재시작 → CCTV 탐지 → jam_score 원활도로 0.1대 확인 + 경부선 경로 정상 확인
-
----
-
-## 2026-04-08 (76차 — bbox_coverage·count_ratio 분모 버그 수정) [수빈]
-
-### 오늘 한 작업
-
-**bbox_coverage 분모 수정 (src/detector.py 동기화)**
-- `reverse_detector.py`: bbox_coverage 분모를 전체 그리드(225셀) → 방향별 유효 셀 수로 변경
-- `reverse_detector.py`: `_compute_direction_cell_counts()` 메서드 추가 (flow_map 유효 셀을 up/down으로 분류)
-- `reverse_detector.py`: `_valid_cells_up`, `_valid_cells_down` 필드 추가 (기본값 1)
-- `reverse_detector.py`: `_compute_ref_direction()` 호출 3곳에 `_compute_direction_cell_counts()` 추가 (load_flow_map, 초기학습완료, 재학습완료)
-
-**count_ratio 분모 수정 (src/feature_extractor.py 동기화)**
-- 기존: `n_known`(궤적≥20프레임 차량만) → 신규차량 무시로 count_ratio 과소평가
-- 수정: `n_total`(전체 활성 차량) — src/feature_extractor.py 동일 방식
-- `_make_x_t()` 시그니처 `(n_known, n_total, stop_c, slow_c, bcov)`로 변경
-
-### 수정 파일
-`C:\finalPj_웹` —
-- `backend_flask/modules/traffic/detectors/reverse_detector.py`
-
-### 발생 오류 / 확인 사항
-- bbox_coverage 원근 편향: 전체 225셀 분모 → up/down 실제 유효 셀 수(flow_map count>0) 기준으로 정규화
-- count_ratio 저평가: 신규 진입 차량(traj<20f)이 많을 때 count 기여 0 → 전체 차량 수 반영
-
-### 작업 재개 위치
-- 플라스크 재시작 후 CCTV 탐지 → jam_score 정상 범위 확인
-
----
-
-## 2026-04-08 (75차 — jam_score 과도 상승 원인 수정 + 파일 정리) [수빈]
-
-### 오늘 한 작업
-
-**jam_score 근본 수정 — src/ 동기화**
-- `reverse_detector.py`: `src/congestion_judge.py` 직접 import (웹 복사본 제거) → 대원 수정사항 자동 반영
-- `reverse_detector.py`: `n==0` 시 세 CongestionJudge 모두 `reset()` 호출 → 차량 0대 시 즉시 0.00
-- `reverse_modules/config.py`: `slow_upper_nm` 0.50→2.5, `nm_cy_correction_k` 추가 0.0 (src/config.py 동기화)
-- `reverse_detector.py`: nm 계산을 `velocity_window`(20프레임) 기반으로 수정 — 2프레임 gap → 고속 차량 slow 오분류 해소
-- `reverse_detector.py`: `bbox_coverage` → cell occupancy 방식으로 교체 (src/feature_extractor.py 동기화) — 원근 편향 제거
-- `reverse_detector.py`: 방향별 bbox_coverage_up/down 분리 계산
-
-**경부선 초록선 복구**
-- `its.py` `highway_line()`: Overpass 실패 시 정적 fallback 좌표 반환 → 서버 재시작 후에도 선 표시
-
-**파일 정리 (미니프로젝트 잔재 제거)**
-- 삭제: `plate/`, `raspi/`, `streaming.py`, `simulation.py`, `fire_detector.py`
-- 삭제: 프론트 `plate/`, `raspi/`, `stats/`, `traffic/components/`, `traffic/hooks/`, `traffic/api.js`
-- `app.py`: 제거 모듈 import/register 정리
-- `its.py`: `fire_feed` 라우트 제거
-- `models.py`: `FireResult`, `ManualResult` 제거
-
-**DB 초기화**
-- `detection_results`, `reverse_results`, `fire_results`, `manual_results` 전부 TRUNCATE
-
-### 수정 파일
-`C:\finalPj_웹` —
-- `backend_flask/modules/traffic/detectors/reverse_detector.py`
-- `backend_flask/modules/traffic/detectors/reverse_modules/config.py`
-- `backend_flask/modules/traffic/its.py`
-- `backend_flask/app.py`
-- `backend_flask/models.py`
-
-### 발생 오류 / 확인 사항
-- jam_score 과도 상승 원인: ①웹 congestion_judge가 구버전 복사본 ②nm 2프레임 기반 계산 → 모든 차량 slow 분류 ③slow_upper_nm 웹 config 미동기화
-
-### 작업 재개 위치
-- 플라스크 재시작 후 CCTV 탐지 → jam_score 정상 범위 확인
-
----
-
-## 2026-04-08 (74차 — cctv_state 키 불일치 버그픽스) [수빈]
-
-### 오늘 한 작업
-
-**CCTV 팝업 상태 미표시 버그 수정**
-- `reverse_detector.py`: `self.display_name` 추가 — cctv_name이 `{명칭}_reverse` 형태일 때 `_reverse` 접미사 제거
-- `its.py` `cctv_state()`: `{name}_reverse` 키 우선 조회, 없으면 `{name}` 시도
-
-### 수정 파일
-`C:\finalPj_웹` —
-- `backend_flask/modules/traffic/detectors/reverse_detector.py`
-- `backend_flask/modules/traffic/its.py`
-
-### 발생 오류 / 확인 사항
-- CCTV 팝업 열어도 방향별 jam 카드가 전부 0 → 키 불일치가 원인
+- 92차에서 전면 개선 완료 (GRU 활성화, 예측 헤드 추가, ITS 실행기 생성)
 
 ---

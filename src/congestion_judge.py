@@ -6,8 +6,6 @@
 # ======================================================================
 # 모듈 수준 함수 — jam_score 계산
 # ======================================================================
-import os
-print(f"[DEBUG] 실제 로드된 파일: {os.path.abspath(__file__)}")
 def _clip(value: float, lo: float, hi: float) -> float:
     """value를 [lo, hi] 범위로 클램프한다.
 
@@ -52,33 +50,43 @@ def compute_jam_score_fallback(x_t: dict) -> float:
     """
     import math
 
-    cds      = _clip(x_t.get("cell_dwell_score", 0.0), 0.0, 1.0)
-    flow_occ = _clip(x_t.get("flow_occupancy",   0.0), 0.0, 1.0)
-    persist  = _clip(x_t.get("cell_persistence", 0.0), 0.0, 1.0)
-    dwell    = _clip(x_t.get("dwell_cell_ratio", 0.0), 0.0, 1.0)
+    # ── feature 추출 ──────────────────────────────────────────────────
+    cds      = _clip(x_t.get("cell_dwell_score", 0.0), 0.0, 1.0)  # 셀 누적 점유 EMA (핵심 정체 신호)
+    flow_occ = _clip(x_t.get("flow_occupancy",   0.0), 0.0, 1.0)  # 차량 점유 셀 / 유효 셀 (순간 밀도)
+    persist  = _clip(x_t.get("cell_persistence", 0.0), 0.0, 1.0)  # 30프레임 전·현재 점유셀 Jaccard (체류 지속성)
+    dwell    = _clip(x_t.get("dwell_cell_ratio", 0.0), 0.0, 1.0)  # 체류 셀 / 유효 셀 (15f+ 머문 셀 비율)
 
-    known_cnt    = int(x_t.get("known_vehicle_count", 0))
-    occupied_cnt = int(x_t.get("occupied_cell_count", 0))
+    known_cnt    = int(x_t.get("known_vehicle_count", 0))  # 궤적 확인된 차량 수
+    occupied_cnt = int(x_t.get("occupied_cell_count", 0))  # 현재 점유 셀 수
 
-    # ── 1) 저규모 상황은 정체로 보지 않음 ─────────────────────
-    # 차량 1~2대 / 점유셀 1~2개는 "개별 차량 체류"일 가능성이 높음
-    # → cds, persist를 거의 무시
+    # ── 1) 저규모 가드: 차량·셀이 너무 적으면 체류 신호 억제 ─────────
+    # 근거: 차량 1~2대만 있을 때 그 차량이 우연히 같은 셀에 오래 있으면
+    #       cds가 높게 찍혀 CONGESTED 오탐 — 실제로는 "한 대 서행" 수준
+    # flow_occ 0.06 = 20×20 그리드 기준 약 2.4셀 점유 → 그 이하는 거의 빈 도로
     if known_cnt <= 2 or occupied_cnt <= 2 or flow_occ < 0.06:
-        return _clip(0.08 * math.sqrt(flow_occ), 0.0, 0.10)
+        return _clip(0.08 * math.sqrt(flow_occ), 0.0, 0.10)  # 최대 0.10으로 제한
 
-    # ── 2) 규모 게이트: 차량 수와 점유율이 충분할수록 체류 신호를 신뢰 ──
-    count_gate = _clip((known_cnt - 2) / 8.0, 0.0, 1.0)      # 2대 이하는 0, 10대면 1
-    occ_gate   = _clip((flow_occ - 0.06) / 0.20, 0.0, 1.0)   # 점유율 낮으면 억제
-    scale_gate = count_gate * occ_gate
+    # ── 2) 규모 게이트: 차량 수·점유율이 충분할수록 체류 신호를 신뢰 ──
+    # count_gate: 2대 이하=0.0, 10대=1.0 — 소수 차량 오탐 억제
+    # occ_gate  : flow_occ 0.06 이하=0.0, 0.26 이상=1.0 — 빈 도로에서 cds 억제
+    # scale_gate: 두 조건 모두 충족해야 체류 신호를 최대 반영
+    count_gate = _clip((known_cnt - 2) / 8.0, 0.0, 1.0)      # 2대 이하는 0, 10대면 1.0
+    occ_gate   = _clip((flow_occ - 0.06) / 0.20, 0.0, 1.0)   # 점유율 낮으면 0, 0.26 이상이면 1.0
+    scale_gate = count_gate * occ_gate                         # 두 게이트의 곱 (AND 조건)
 
-    # ── 3) 핵심 jam 계산 ─────────────────────────────────────
+    # ── 3) 핵심 jam 계산 ─────────────────────────────────────────────
+    # cds    × 1.10: EMA 누적 체류 강도 (주 신호) — 차량이 셀에 오래 머물수록 상승
+    # persist× 0.25: Jaccard 지속성 보조 — 점유 패턴이 30프레임 전과 유사할수록 상승
+    # dwell  × 0.10: sqrt 비선형 — 체류 셀 비율의 초기 상승 빠르게 반영
+    # 위 세 신호 모두 scale_gate로 스케일 — 저규모에서 과대 반응 방지
+    # 0.12×sqrt(flow_occ): scale_gate 없는 기저 신호 — 차량 많을수록 최소 jam 보장
     core = (
-        1.10 * cds
-        + 0.25 * persist
-        + 0.10 * math.sqrt(dwell)
+        1.90 * cds                   # 셀 누적 EMA (주 신호) — 1.10→1.90: _lane_cell_count 버그 수정으로 cds가 낮아진 것 보정
+        + 0.25 * persist             # 점유 지속성 (보조)
+        + 0.10 * math.sqrt(dwell)    # 체류 셀 비율 (sqrt 비선형)
     )
 
-    jam = core * scale_gate + 0.12 * math.sqrt(flow_occ)
+    jam = core * scale_gate + 0.12 * math.sqrt(flow_occ)  # 규모 게이트 적용 + 기저 신호
 
     return _clip(jam, 0.0, 1.0)
 
@@ -134,6 +142,16 @@ class CongestionJudge:
         self._congestion_start_frame: int | None = None  # 정체 시작 프레임 (SMOOTH이면 None)
         self._last_jam_score: float = 0.0              # 마지막 EMA jam_score (표시용)
 
+        # ── 초기 확정 구간 (학습 완료 직후) ──────────────────────────
+        # 학습 직후 cell_dwell_ema·cell_persistence 신호가 0에서 누적되는 동안
+        # 짧은 히스테리시스(initial_hysteresis_sec)로 현재 도로 상태를 빠르게 확정.
+        # initial_confirm_sec 경과 후 정규 히스테리시스(congestion_hysteresis_sec)로 전환.
+        _init_confirm_sec = getattr(cfg, "initial_confirm_sec", 5.0)
+        _init_hys_sec     = getattr(cfg, "initial_hysteresis_sec", 2.0)
+        self._init_confirm_frames: int = int(_init_confirm_sec * fps)   # 초기 확정 구간 길이 (프레임)
+        self._init_hysteresis_frames: int = int(_init_hys_sec * fps)    # 초기 히스테리시스 (프레임)
+        self._baseline_frame: int | None = None        # set_baseline() 호출 시 프레임 번호 저장
+
     # ── 상태 초기화 (카메라 전환 시 호출) ────────────────────────────
     def reset(self):
         """카메라 전환·재학습 시작 시 EMA와 히스테리시스 상태를 초기화한다.
@@ -146,6 +164,7 @@ class CongestionJudge:
         self._level_hold_frames = 0                    # 히스테리시스 카운터 초기화
         self._congestion_start_frame = None            # 정체 시작 프레임 초기화
         self._last_jam_score = 0.0                     # jam_score 초기화
+        self._baseline_frame = None                    # 초기 확정 구간 재시작 (카메라 전환 시에도 적용)
 
     # ── 기준선 설정 ──────────────────────────────────────────────────
     def set_baseline(self):
@@ -158,9 +177,9 @@ class CongestionJudge:
           - 학습 직후 "중립 → 실제 상태" 방향으로 빠르게 수렴
         """
         self._baseline_set = True                      # 학습 완료 표시
-        self._ema_jam = 0.0                            # EMA 중립값으로 초기화 (학습 직후 빠른 수렴)
-        self._last_jam_score = 0.0 
-        print(f"[CJ] alpha_up={self._alpha_up:.3f} alpha_down={self._alpha_down:.3f}")  # 추가
+        self._ema_jam = 0.0                            # EMA 0에서 시작 → 실제 도로 상태로 수렴
+        self._last_jam_score = 0.0
+        self._baseline_frame = None                    # apply_level() 첫 호출 시 프레임 번호 기록
 
     # ── 레벨 판정 ────────────────────────────────────────────────────
     def _classify(self, jam_score: float) -> str:
@@ -258,17 +277,30 @@ class CongestionJudge:
             (level: str, ema_jam: float) 튜플. ema_jam이 표시·판정에 사용됨.
         """
         # ── 비대칭 EMA 적용 ──────────────────────────────────────────
-        # 1. EMA 계산
-        if jam >= self._last_jam_score:  # rule_jam vs 마지막 ema_jam 비교
-            alpha = self._alpha_up
+        # 1. 방향 판단: 악화(상승)이면 alpha_up, 호전(하강)이면 alpha_down
+        if jam >= self._last_jam_score:  # 현재 순간값이 EMA보다 높으면 악화 방향
+            alpha = self._alpha_up       # 빠르게 반응 (기본 0.70 — 정체 진입 즉시 감지)
         else:
-            alpha = self._alpha_down
-        self._last_jam_score = alpha * jam + (1.0 - alpha) * self._last_jam_score
-        self._ema_jam = self._last_jam_score  # 동기화
+            alpha = self._alpha_down     # 천천히 반응 (기본 0.04 — 순간 개선에 흔들리지 않음)
 
-        # 3. 레벨 판정
+        # 2. EMA 갱신: new_ema = α × raw + (1-α) × prev_ema
+        self._last_jam_score = alpha * jam + (1.0 - alpha) * self._last_jam_score
+        self._ema_jam = self._last_jam_score           # get_jam_score() 반환값 동기화
+
+        # 3. 초기 확정 구간 판단 — 학습 완료 후 initial_confirm_sec 동안 짧은 히스테리시스 사용
+        if self._baseline_frame is None:               # 첫 apply_level() 호출 → 기준 프레임 기록
+            self._baseline_frame = frame_num
+        _elapsed = frame_num - self._baseline_frame    # 학습 완료 후 경과 프레임
+        if _elapsed < self._init_confirm_frames:       # 초기 확정 구간 내
+            self._hysteresis_frames = self._init_hysteresis_frames  # 짧은 히스테리시스 적용
+        else:                                          # 초기 확정 구간 종료
+            self._hysteresis_frames = int(             # 정규 히스테리시스로 전환
+                self.cfg.congestion_hysteresis_sec * self.fps
+            )
+
+        # 4. 레벨 판정 (SMOOTH / SLOW / CONGESTED)
         raw_level = self._classify(self._last_jam_score)
-        level = self._apply_hysteresis(raw_level)
+        level = self._apply_hysteresis(raw_level)      # 히스테리시스 적용 후 최종 레벨
 
         # 4. 정체 지속 시간 추적
         if level in ("SLOW", "CONGESTED"):
