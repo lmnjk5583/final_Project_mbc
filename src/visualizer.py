@@ -56,6 +56,7 @@ class Visualizer:
             print(f"바운딩박스: {'ON' if self.show_bbox else 'OFF'}")
         elif key == ord("w"):                                      # W키: 역주행 패널 토글
             self.show_wrongway = not self.show_wrongway
+            self.show_detection_stats = self.show_wrongway         # 우측 상단 Detection 패널도 같이 토글
             print(f"역주행 표시: {'ON' if self.show_wrongway else 'OFF'}")
 
     # ==================== 궤적 그리기 ====================
