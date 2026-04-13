@@ -120,6 +120,11 @@ class WrongWayJudge:
             if cos_dir < -0.5:                              # 120° 이상 방향 급변
                 st.last_velocity[track_id] = (ndx, ndy)    # 방향 갱신 후 건너뜀
                 st.last_correct_frame[track_id] = st.frame_num  # 방향 급변 = 직전까지 정상
+                # 급변 직후 guard 발동 — 리턴 후에도 후속 프레임에서 wrong_count가 쌓이지 않도록
+                # (stable_velocity edge 감지는 다음 프레임에서야 direction_change_frame을 세트하므로
+                #  1프레임 빠진 guard 공백이 생길 수 있음 → 여기서 즉시 세트)
+                st.direction_change_frame[track_id] = st.frame_num
+                st.wrong_way_count[track_id] = 0            # 이전 누적 카운트도 리셋
                 return False, 0, {"status": "dir_jump_filtered", "cos_values": []}
         st.last_velocity[track_id] = (ndx, ndy)            # 현재 방향 기록 (다음 프레임용)
 

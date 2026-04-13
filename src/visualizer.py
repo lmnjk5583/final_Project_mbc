@@ -22,6 +22,7 @@ class Visualizer:
         self.show_detection_stats = True # 탐지 소요시간 패널 ON/OFF
         self.show_congestion_panel = True  # 하단 Down/Up 정체 패널 ON/OFF (단축키 C)
         self.show_bbox = False           # 차량 바운딩박스 표시 ON/OFF (단축키 B, 기본 OFF)
+        self.show_wrongway = True        # 역주행 경고 박스·궤적·화살표 ON/OFF (단축키 W)
 
     # ==================== 키보드 입력 처리 ====================
     def handle_keys(self, key):
@@ -53,6 +54,9 @@ class Visualizer:
         elif key == ord("b"):                                      # B키: 바운딩박스 토글
             self.show_bbox = not self.show_bbox
             print(f"바운딩박스: {'ON' if self.show_bbox else 'OFF'}")
+        elif key == ord("w"):                                      # W키: 역주행 패널 토글
+            self.show_wrongway = not self.show_wrongway
+            print(f"역주행 표시: {'ON' if self.show_wrongway else 'OFF'}")
 
     # ==================== 궤적 그리기 ====================
     def draw_trajectory(self, frame, track_id, is_wrong=False):

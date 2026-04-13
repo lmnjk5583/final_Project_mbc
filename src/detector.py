@@ -674,7 +674,7 @@ class Detector:
                 if st.trajectories[tid]:
                     _prev_fx, _prev_fy = st.trajectories[tid][-1]
                     _solo_dist = ((fx - _prev_fx)**2 + (fy - _prev_fy)**2) ** 0.5
-                    if _solo_dist > _jump_thr * 1.5:                # 단독 jump는 더 엄격한 기준
+                    if _solo_dist > _jump_thr * 1.2:                # 단독 jump 기준 (1.5→1.2: 더 민감하게)
                         _solo_jump = True
                         # traj 전체를 현재 위치로 덮어씀
                         # → velocity 계산 구간(traj[-window]→traj[-1]) 안에
@@ -830,16 +830,20 @@ class Detector:
                     st.wrong_way_last_pos[tid] = (cx, cy, st.frame_num)  # 위치 기록
 
                 # ── 시각화 ──
+                # W키 OFF 시 역주행 차량은 정상 차량처럼 표시 (경고 박스/붉은 궤적 숨김)
+                _show_as_wrong = is_wrong_display and self.vis.show_wrongway
+
                 if self.vis.show_trails:                            # 궤적 표시 활성화 시
-                    self.vis.draw_trajectory(frame, tid, is_wrong_display)
+                    self.vis.draw_trajectory(frame, tid, _show_as_wrong)
 
                 if self.vis.show_direction and speed > 3:           # 방향 화살표 활성화 시
                     self.vis.draw_direction_arrow(frame, cx, cy, ndx, ndy,
-                                                 speed, is_wrong_display)
+                                                 speed, _show_as_wrong)
 
-                if is_wrong_display:                                # 역주행 차량은 항상 표시
+                if _show_as_wrong:                                  # 역주행 패널 ON + 역주행 차량
                     self.vis.draw_wrong_way_alert(frame, tid, x1, y1, x2, y2)      # 경고 표시
-                elif self.vis.show_bbox:                            # 정상 차량은 B키 ON일 때만
+                elif self.vis.show_bbox or (is_wrong_display and not self.vis.show_wrongway):
+                    # B키 ON 이거나 역주행인데 W키 OFF인 경우 → 일반 박스로 표시
                     self.vis.draw_normal_box(frame, tid, x1, y1, x2, y2)           # 초록 박스
 
                 if self.vis.show_speed and speed > 3:               # 속도 표시 활성화 시
