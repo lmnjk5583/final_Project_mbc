@@ -30,7 +30,7 @@ ITS_API_KEY  = os.getenv("ITS_API_KEY")               # .env의 ITS_API_KEY 사�
 if not ITS_API_KEY:
     raise EnvironmentError(".env에 ITS_API_KEY가 없습니다. c:\\final_pj\\.env 확인")
 
-ITS_CCTV_API_URL = "http://cctvsec.ktict.co.kr/100/spmnCZ2cxfcOECHMkqlBL8Uhrbm1M7FAqyIP9qfD5DCNBmALQ6A9LrbwLElwrDXgnB2Mt6OboQvF9h28l5zAPBJ2wpKAmrfTZP3aMnTQkkc="  # CCTV 목록 조회 API
+ITS_CCTV_API_URL = "http://cctvsec.ktict.co.kr/100/spmnCZ2cxfcOECHMkqlBL8Uhrbm1M7FAqyIP9qfD5DCNBmALQ6A9LrbwLElwrDXgBMVVonSbGpyHECRng19tMxJ2wpKAmrfTZP3aMnTQkkc="  # CCTV 목록 조회 API
 
 # 탐지할 CCTV 이름 — ITS API의 cctvname 값과 정확히 일치해야 함
 # 아래 CCTV_NAME을 바꾸면 해당 도로의 독립 폴더에 학습 데이터가 쌓임
@@ -42,14 +42,21 @@ CCTV_NAME = "[경부선] 양재"                                   # ← 원하�
 # 예: DIRECT_STREAM_URL = "http://xxx.xxx.xxx.xxx:8080/stream.m3u8"
 DIRECT_STREAM_URL: str | None = None                         # ← 직접 URL 알면 여기 입력
 
+# ── 강제 재학습 옵션 ─────────────────────────────────────────────────────
+# True로 바꾸면 기존 flow_map.npy·gru_a.pt·gru_b.pt를 삭제하고 처음부터 재학습
+# 학습 완료 후 자동으로 False로 돌려놓지 않으므로 재학습 후 다시 False로 변경할 것
+FORCE_RELEARN: bool = False
+
 # flow_map / GRU 저장 폴더 — CCTV 이름별로 분리되어 서로 덮어쓰지 않음
 ROAD_DIR = PROJECT_ROOT / "flow_maps" / CCTV_NAME
 ROAD_DIR.mkdir(parents=True, exist_ok=True)            # 폴더 없으면 자동 생성
 
 MODEL_PATH = PROJECT_ROOT / "runs" / "yolo11n_v5" / "weights" / "best.pt"
 
-# ITS 토큰 URL은 4분 후 만료 → 만료 전 갱신 주기 (초)
-URL_REFRESH_INTERVAL = 200                             # 3분 20초마다 URL 갱신
+# ITS API 토큰 URL 사용 시 만료 주기 (초) — 직접 HLS URL이면 실질적으로 사용 안 됨
+# detector.run()이 스트림 단절(연속 50프레임 실패)을 감지하면 자동으로 루프를 종료하고
+# 여기서 새 URL을 발급받아 재시작한다.
+URL_REFRESH_INTERVAL = None                            # None = 스트림 단절 시에만 재시작
 
 # ======================================================================
 # ── ITS API: CCTV URL 조회 ─────────────────────────────────────────────
@@ -140,6 +147,60 @@ def list_cctvs():
 
 
 # ======================================================================
+# ── flow_map 자동 매칭 ─────────────────────────────────────────────────
+# ======================================================================
+
+def _try_match_flow_map(cctv_url: str, target_flow_map_path: Path) -> bool:
+    """스트림 첫 프레임과 저장된 ref_frame들을 비교해 가장 유사한 flow_map을 복사한다.
+
+    Returns:
+        True  → 매칭 성공, target_flow_map_path에 flow_map.npy 복사 완료
+        False → 매칭 실패 (새 학습 필요)
+    """
+    try:
+        from flow_map_matcher import FlowMapMatcher
+        import cv2
+        import shutil
+    except ImportError:
+        return False
+
+    # ── 스트림 첫 프레임 읽기 ─────────────────────────────────────────
+    print("[매칭] 스트림 첫 프레임 읽는 중...")
+    cap = cv2.VideoCapture(cctv_url)
+    frame = None
+    for _ in range(30):                                # 최대 30프레임 시도
+        ret, f = cap.read()
+        if ret and f is not None:
+            frame = f
+            break
+    cap.release()
+
+    if frame is None:
+        print("[매칭] 프레임 읽기 실패 → 건너뜀")
+        return False
+
+    # ── 저장된 flow_map 폴더들과 비교 ────────────────────────────────
+    matcher = FlowMapMatcher(
+        flow_maps_root = PROJECT_ROOT / "flow_maps",
+        min_score      = 0.35,                         # 이 점수 미만이면 매칭 실패
+    )
+    best_dir, score = matcher.find_best(
+        current_frame = frame,
+        exclude_dir   = ROAD_DIR,                      # 자기 자신 제외
+    )
+
+    if best_dir is None:
+        return False
+
+    # ── flow_map.npy 복사 (gru_*.pt·pkl은 복사 안 함 — 도로별로 독립) ──
+    src_npy = best_dir / "flow_map.npy"
+    ROAD_DIR.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(str(src_npy), str(target_flow_map_path))
+    print(f"[매칭] flow_map 복사: {best_dir.name} → {ROAD_DIR.name} (score={score:.3f})")
+    return True
+
+
+# ======================================================================
 # ── Detector 설정 구성 ─────────────────────────────────────────────────
 # ======================================================================
 
@@ -153,7 +214,29 @@ def make_config(cctv_url: str) -> DetectorConfig:
         DetectorConfig.
     """
     flow_map_path = ROAD_DIR / "flow_map.npy"          # 도로별 flow_map 경로
-    detect_only   = flow_map_path.exists()              # 학습된 맵 있으면 탐지 전용 모드
+
+    if FORCE_RELEARN:                                  # 강제 재학습: 기존 파일 삭제
+        for _f in [flow_map_path,
+                   ROAD_DIR / "gru_a.pt",
+                   ROAD_DIR / "gru_b.pt",
+                   ROAD_DIR / "feature_log_a.pkl",
+                   ROAD_DIR / "feature_log_b.pkl"]:
+            if _f.exists():
+                _f.unlink()
+                print(f"[재학습] 삭제: {_f.name}")
+        print("[재학습] 기존 데이터 초기화 완료 → 처음부터 학습 시작")
+
+    # ── flow_map 없으면 저장된 다른 폴더와 자동 매칭 시도 ──────────────
+    # cctv_url로 스트림 첫 프레임을 읽어 ref_frame들과 비교 →
+    # 유사한 flow_map 폴더가 있으면 복사해서 즉시 탐지 모드로 시작
+    if not flow_map_path.exists() and not FORCE_RELEARN:
+        _matched = _try_match_flow_map(cctv_url, flow_map_path)
+        if _matched:
+            print(f"[매칭] ✅ 기존 flow_map 재사용 → 학습 생략")
+        else:
+            print(f"[매칭] 매칭 실패 또는 건너뜀 → 새로 학습")
+
+    detect_only = flow_map_path.exists()               # 학습된 맵 있으면 탐지 전용 모드
 
     if detect_only:
         print(f"[설정] flow_map 존재 → detect_only=True (탐지 + GRU 누적 학습 모드)")
@@ -162,12 +245,13 @@ def make_config(cctv_url: str) -> DetectorConfig:
 
     return DetectorConfig(
         model_path=MODEL_PATH,                         # YOLO 모델
-        conf=0.4,                                      # 검출 신뢰도
+        conf=0.3,                                      # 검출 신뢰도
         grid_size=20,                                  # 20×20 flow_map 그리드
         detect_only=detect_only,                       # 자동 판단
         flow_map_path=flow_map_path,                   # 도로별 저장 경로
         learning_frames=1800,                          # flow_map 학습 프레임 수
         log_dir=ROAD_DIR / "logs",                     # CSV 로그 저장
+        night_enhance=True                             # CLAHE 야간 저조도 보정 
     )
 
 
@@ -180,7 +264,7 @@ def main():
     print(f" ITS 실시간 탐지 시작")
     print(f" CCTV : {CCTV_NAME}")
     print(f" 저장 : {ROAD_DIR}")
-    print(f" URL 갱신 주기: {URL_REFRESH_INTERVAL}초")
+    print(f" URL 갱신: 스트림 단절 시 자동 재발급")
     print("=" * 60)
     print(" Ctrl+C 로 종료 — 종료 시 누적 feature 로그 자동 저장\n")
 
@@ -207,25 +291,38 @@ def main():
                 time.sleep(30)
                 continue
 
-        # ── Detector 생성 및 실행 ───────────────────────────────────
+        # ── Detector 생성 (최초 1회만) ─────────────────────────────
         cfg = make_config(url)
         detector = Detector(cfg)
 
+        # ── URL 재발급 콜백 — 스트림 단절 시 새 URL 반환 ────────────
+        # Detector 상태(trajectories, flow_map, GRU 등)를 유지한 채
+        # cap만 새 URL로 교체 → 끊김 없이 탐지 지속
+        def _get_fresh_url():
+            if DIRECT_STREAM_URL:
+                return DIRECT_STREAM_URL                   # 직접 URL은 만료 없음
+            for _retry in range(3):
+                _u = fetch_cctv_url(CCTV_NAME)
+                if _u:
+                    print(f"[URL] 재발급 성공")
+                    return _u
+                print(f"[URL] 재발급 실패 ({_retry+1}/3) — 10초 후 재시도")
+                time.sleep(10)
+            return None
+
         try:
-            # run()에 URL을 직접 전달 — OpenCV가 스트림으로 열음
-            # URL_REFRESH_INTERVAL 초 후 run()이 반환되면 새 URL로 재시작
-            detector.run(url, max_seconds=URL_REFRESH_INTERVAL)
+            detector.run(url, max_seconds=None, url_refresher=_get_fresh_url)
 
         except KeyboardInterrupt:
             print("\n[종료] 사용자 중단 — feature 로그 저장 후 종료")
             break
         except Exception as e:
             print(f"[오류] 탐지 중 예외 발생: {e}")
-            print("[재시도] 10초 후 새 URL로 재시작")
+            print("[재시도] 10초 후 재시작")
             time.sleep(10)
             continue
 
-        print(f"[세션 {session_count}] 완료 — 새 URL로 갱신 후 계속")
+        print(f"[세션 {session_count}] 루프 종료 — 재시작")
 
 
 if __name__ == "__main__":

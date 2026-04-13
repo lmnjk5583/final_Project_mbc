@@ -42,6 +42,14 @@ class DetectorConfig:
     cooldown_frames: int = 150        # 재학습 후 전환 감지 비활성 프레임 수
     switch_confirm_needed: int = 4    # 전환으로 확정하기 위해 필요한 연속 감지 횟수
 
+    # ==================== 안정 대기 (전환 후 재학습 시작 조건) ====================
+    stability_required_sec:  float = 4.0   # 전환 감지 후 이 시간 동안 화면이 안정돼야 재학습 시작
+                                           # 4초 = 카메라 팬/줌 완료 후 고정 확인용 최소 시간
+    stability_diff_threshold: float = 8.0  # 이 이하면 안정 판정 (인접 프레임 grayscale diff 기준)
+                                           # 8.0: 조명 변화/차량 움직임 허용, 카메라 이동 차단
+    relearn_abort_diff:       float = 15.0 # 재학습 중 이 이상이면 불안정 → 재학습 중단 후 대기 복귀
+                                           # stability_diff_threshold보다 높게 — 일시적 차량 오판 방지
+
     # ==================== 경로 관련 ====================
     flow_map_path: Path = None        # flow_map 저장/로드 파일 경로
     result_dir: Path = None           # 결과 영상 저장 폴더 경로
@@ -87,7 +95,7 @@ class DetectorConfig:
 
     # ==================== jam_score 임계값 ====================
     smooth_jam_threshold:    float = 0.25   # jam_score 이 값 미만 → SMOOTH
-    slow_jam_threshold:      float = 0.60   # jam_score 이 값 미만 → SLOW, 이상 → CONGESTED
+    slow_jam_threshold:      float = 0.60   # jam_score 이 값 미만 → SLOW, 이상 → JAM
     density_max_vehicles:   float = 40.0   # density 정규화 기준 차량 수 — 이 값 이상이면 density=1.0 (포화)
 
     # ==================== jam_score EMA 스무딩 ====================
@@ -117,8 +125,10 @@ class DetectorConfig:
     # 자기회귀 롤아웃 대신 "현재 관측 → N분 후 상태" 를 직접 예측하는 헤드
     # 오차 누적 없음 — 각 헤드가 독립적으로 해당 시점의 레벨을 학습
     gru_predict_horizons_sec: tuple = (60, 180, 300)  # 예측 목표: 1분·3분·5분 후
-    gru_pretrain_min_sec: float = 600.0               # pretrain 시작 최소 데이터 (초)
-                                                      # 최대 horizon(5분) × 2 = 10분 — 충분한 학습 쌍 확보
+    gru_pretrain_min_sec: float = 120.0               # pretrain 시작 최소 데이터 (초)
+                                                      # 실제 수집 속도 = 실fps ÷ log_interval(3) → 명목fps 기준 임계값이
+                                                      # 실수집 속도 대비 5배 과대 책정되는 문제 보정
+                                                      # 120초(2분치) → 실 6fps 환경에서 ~10분 후 pretrain 시작
     gru_direct_epochs: int = 10                       # direct head 학습 epoch 수
     gru_log_interval: int = 3                         # feature 로그 저장 주기 (프레임)
                                                       # 매 프레임 저장 시 I/O 과부하 → 3프레임마다 1개 저장
@@ -129,6 +139,21 @@ class DetectorConfig:
     # ==================== 화면 표시 설정 ====================
     display_width: int = 1280              # 화면 출력 창 너비 (픽셀). 0이면 원본 해상도 그대로
     display_height: int = 720              # 화면 출력 창 높이 (픽셀). 0이면 원본 해상도 그대로
+    night_enhance: bool = True             # CLAHE 야간 저조도 보정 (평균 밝기 < 80 시 자동 적용)
+
+    # ==================== 프레임 스킵(신호 끊김) 감지 ====================
+    frame_skip_jump_px:    float = 80.0  # 차량 1대 순간이동 판정 픽셀 (1프레임 최대 이동)
+                                         # 6fps 기준 정상 고속차 120km/h≈30px/f → 80px 초과는 이상
+    frame_skip_ratio:      float = 0.5   # 전체 추적 차량 중 이 비율 이상이 jump면 스킵 프레임 확정
+                                         # 0.5 = 절반 이상 동시 jump → 신호 끊김으로 판단
+
+    # ==================== GRU 학습 신뢰도 필터 ====================
+    gru_min_vehicles_for_log: int = 3      # GRU 로그 수집 최소 차량 수
+                                           # 이 미만이면 탐지 부족으로 판단 → feature 로그 스킵
+                                           # 야간·안개 등 탐지율 저하 시 오학습 방지
+    gru_min_brightness_for_log: float = 0.0  # 이 밝기(0~255 평균) 미만이면 로그 스킵
+                                              # 0.0 = 밝기 필터 비활성 (기본)
+                                              # 야간 탐지 불가 환경이면 50~70 설정 권장
 
     # ==================== 정체 탐지 slow_ratio 파라미터 ====================
     slow_upper_nm: float = 0.70            # 서행 판정 상한 nm (nm < 이 값 → 서행) — 0.50→0.70: EMA smoothing 도입 후 원거리 정상차량 nm 0.5~0.7 범위 오판 방지
@@ -141,8 +166,10 @@ class DetectorConfig:
     nm_baseline_warmup:   int   = 300     # baseline 유효 최소 누적 프레임 (10초@30fps)
 
     # ==================== flow map 기반 체류 탐지 ====================
-    dwell_threshold_sec: float = 0.5       # 차량이 같은 셀에 이 초 이상 머물면 체류로 판정
-                                           # (fps 무관하게 동일한 체감 — 30fps→15f, 10fps→5f 자동 변환)
+    dwell_threshold_sec: float = 1.5       # 차량이 같은 셀에 이 초 이상 머물면 체류로 판정
+                                           # (fps 무관하게 동일한 체감 — 30fps→45f, 10fps→15f 자동 변환)
+                                           # 0.5→1.5: 실시간 스트림 6~7fps 환경에서 3프레임(0.5초)은 너무 짧아
+                                           # 정상 차량도 체류 판정 → 1.5초(~10프레임)로 강화
     cell_dwell_ema_up:   float = 0.05      # 셀 점유 시 EMA 상승 속도 (30프레임 연속 → ema≈0.78)
     cell_dwell_ema_down: float = 0.02      # 셀 이탈 시 EMA 하락 속도 (50프레임 후 ema≈0.36)
 

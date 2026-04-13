@@ -1,7 +1,7 @@
 # 파일 경로: 최종 프로젝트/run_test.py
 # 역할: traffic_analyzer 연동 확인용 테스트 실행 스크립트
 #        detect_only=False → 영상 초반 자동 학습 후 탐지 시작
-#        화면 좌하단에 "Traffic: SMOOTH/SLOW/CONGESTED  xx.xkm/h" 표시되면 연동 성공
+#        화면 좌하단에 "Traffic: SMOOTH/SLOW/JAM  xx.xkm/h" 표시되면 연동 성공
 
 import sys                                              # sys.path 조작용
 from pathlib import Path                                # 경로 조작용
@@ -15,13 +15,13 @@ sys.path.insert(0, str(PROJECT_ROOT))                   # from src import ... �
 from src import Detector, DetectorConfig                # src/__init__.py 경유
 
 # ── 경로 설정 ──────────────────────────────────────────────────────
-MODEL_PATH = PROJECT_ROOT / "runs" / "yolo11n_v5" / "weights" / "best.pt"  # YOLO 모델 가중치
+MODEL_PATH = PROJECT_ROOT / "runs" / "yolo11n_v2" / "weights" / "best.pt"  # YOLO 모델 가중치
 
 VIDEO_DIR = Path(                                       # 영상이 들어있는 폴더
     r"N:\개인\대원&수빈\최종 프로젝트"
-    r"\임시\2026-04-02_10-05-59\videos"
+    r"\임시"
 )
-VIDEO_FILE = "record_2026-04-02_10-05-59.mp4"          # 실행할 영상 파일명
+VIDEO_FILE = "서행_테스트.mp4"          # 실행할 영상 파일명
 
 FLOW_MAP_PATH = PROJECT_ROOT / "flow_maps" / "flow_map.npy"  # 한강 학습 완료 flow_map
 # RESULT_DIR    = PROJECT_ROOT / "results"            # 결과 영상 저장 폴더
@@ -30,7 +30,7 @@ RESULT_DIR    = Path(r"N:\개인\대원&수빈\최종 프로젝트\임시\result
 # ── DetectorConfig 구성 ───────────────────────────────────────────
 cfg = DetectorConfig(
     model_path=MODEL_PATH,                              # YOLO 모델 경로
-    conf=0.45,                                           # 검출 신뢰도 임계값
+    conf=0.4,                                           # 검출 신뢰도 임계값
     grid_size=20,                                       # 20×20 Flow Map 그리드
     target_classes=None,                                # 모든 클래스 탐지
     detect_only=False,                                  # 학습 후 탐지 모드

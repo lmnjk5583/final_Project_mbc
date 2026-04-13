@@ -74,7 +74,7 @@ if _TORCH_AVAILABLE:                                   # PyTorch 있을 때만 �
             self.pred_head = nn.Linear(hidden, input_dim)  # 자기회귀 헤드: hidden → feature(7)
 
             # ── Direct 미래 예측 헤드 (horizon별 독립 분류기) ────────────
-            # 각 헤드: hidden(64) → 32 → ReLU → 3클래스 (SMOOTH/SLOW/CONGESTED)
+            # 각 헤드: hidden(64) → 32 → ReLU → 3클래스 (SMOOTH/SLOW/JAM)
             # 오차 누적 없이 현재 hidden state에서 N분 후를 직접 예측
             self.direct_heads = nn.ModuleList([
                 nn.Sequential(
@@ -248,8 +248,8 @@ class GRUModule:
         with torch.no_grad():                          # gradient 비활성화
             probs, self._hidden = self._net(x, self._hidden)  # (1, 3) 확률 + hidden 갱신
 
-        # ── gru_score: p_slow × 0.5 + p_congested × 1.0 ──────────────
-        p = probs[0]                                   # (3,) — [p_smooth, p_slow, p_congested]
+        # ── gru_score: p_slow × 0.5 + p_jam × 1.0 ──────────────
+        p = probs[0]                                   # (3,) — [p_smooth, p_slow, p_jam]
         gru_score = float(p[1] * 0.5 + p[2] * 1.0)   # 가중 합산
         gru_score = float(max(0.0, min(1.0, gru_score)))  # clip 0~1
 
@@ -264,7 +264,7 @@ class GRUModule:
 
         Returns:
             [{"horizon_sec": 60, "horizon_min": 1,
-              "p_smooth": 0.1, "p_slow": 0.6, "p_congested": 0.3,
+              "p_smooth": 0.1, "p_slow": 0.6, "p_jam": 0.3,
               "predicted_level": "SLOW"}, ...]
             학습 미완료·버퍼 부족·PyTorch 없으면 None.
         """
@@ -297,8 +297,8 @@ class GRUModule:
                     "horizon_min":      horizon_s // 60,             # 예측 목표 (분)
                     "p_smooth":         float(probs[0]),             # SMOOTH 확률
                     "p_slow":           float(probs[1]),             # SLOW 확률
-                    "p_congested":      float(probs[2]),             # CONGESTED 확률
-                    "predicted_level":  ["SMOOTH", "SLOW", "CONGESTED"][pred_idx],
+                    "p_jam":      float(probs[2]),             # JAM 확률
+                    "predicted_level":  ["SMOOTH", "SLOW", "JAM"][pred_idx],
                     "confidence":       float(probs[pred_idx]),      # 최고 확률값
                 })
 
@@ -316,7 +316,7 @@ class GRUModule:
             steps: 예측 스텝 수 (프레임). None이면 cfg.gru_forecast_steps.
 
         Returns:
-            [{"step": 1, "p_smooth": ..., "p_slow": ..., "p_congested": ...,
+            [{"step": 1, "p_smooth": ..., "p_slow": ..., "p_jam": ...,
               "gru_score": ...}, ...]
             버퍼 부족·warmup·PyTorch 없으면 None.
         """
@@ -351,16 +351,16 @@ class GRUModule:
                 )
                 logits = self._net.fc2(fc_out)         # (1, 3) 로짓
                 probs = self._net.softmax(logits)      # (1, 3) softmax 확률
-                p = probs[0]                           # (3,) — [smooth, slow, congested]
+                p = probs[0]                           # (3,) — [smooth, slow, jam]
                 gru_score = float(                     # 가중 합산 gru_score
-                    p[1] * 0.5 + p[2] * 1.0            # p_slow×0.5 + p_congested×1.0
+                    p[1] * 0.5 + p[2] * 1.0            # p_slow×0.5 + p_jam×1.0
                 )
 
                 results.append({                       # 스텝 결과 저장
                     "step": step_i,                    # 예측 스텝 번호
                     "p_smooth": float(p[0]),           # SMOOTH 확률
                     "p_slow": float(p[1]),             # SLOW 확률
-                    "p_congested": float(p[2]),        # CONGESTED 확률
+                    "p_jam": float(p[2]),        # JAM 확률
                     "gru_score": max(0.0, min(1.0, gru_score)),  # clip 0~1
                 })
 
@@ -394,93 +394,106 @@ class GRUModule:
 
         # ── 슬라이딩 윈도우로 (input, target) 쌍 생성 ─────────────────
         vecs = [self._dict_to_vec(f) for f in feature_sequence]  # dict → vec 변환
-        inputs, targets = [], []                       # 입력·타겟 리스트
-        seq_len = self.cfg.gru_seq_len                 # 시퀀스 길이 (30)
+        seq_len  = self.cfg.gru_seq_len                # 시퀀스 길이 (30)
+        # CPU 학습 속도 한계 — stride로 샘플 수 제한
+        # 10fps × 600s = 6000프레임 → stride=3이면 ~2000샘플 → forward 수초 내 완료
+        _stride  = max(1, len(vecs) // 2000)           # 최대 2000 샘플 유지
+        _batch   = 256                                 # 미니배치 크기
 
-        for i in range(len(vecs) - seq_len):           # 가능한 모든 슬라이딩 윈도우
-            inputs.append(vecs[i: i + seq_len])        # 입력: t~t+29
-            targets.append(vecs[i + seq_len])          # 타겟: t+30 (다음 프레임)
+        inputs, targets = [], []
+        for i in range(0, len(vecs) - seq_len, _stride):
+            inputs.append(vecs[i: i + seq_len])        # 입력: t~t+seq_len-1
+            targets.append(vecs[i + seq_len])          # 타겟: t+seq_len (다음 프레임)
 
-        if not inputs:                                 # 윈도우가 없으면
-            return None                                # 학습 불가
+        if not inputs:
+            return None
 
-        # ── Tensor 변환 ────────────────────────────────────────────────
-        X = torch.tensor(inputs, dtype=torch.float32)  # (N, seq_len, 7)
-        Y = torch.tensor(targets, dtype=torch.float32) # (N, 7) — 다음 타임스텝
+        X = torch.tensor(inputs,  dtype=torch.float32) # (N, seq_len, 7)
+        Y = torch.tensor(targets, dtype=torch.float32) # (N, 7)
+        N = X.shape[0]
 
-        # ── MSE Loss로 자기지도 학습 (1~2 epoch) ──────────────────────
-        criterion = nn.MSELoss()                       # 평균 제곱 오차 손실
-        self._net.train()                              # train 모드
-        epoch_losses = []                              # epoch별 loss 기록
+        # ── MSE Loss로 자기지도 학습 — 미니배치 ───────────────────────
+        criterion    = nn.MSELoss()
+        self._net.train()
+        epoch_losses = []
 
         for epoch in range(2):                         # 2 epoch
-            self._optimizer.zero_grad()                # gradient 초기화
-            out, _ = self._net.gru(X)                  # GRU 출력: (N, seq_len, hidden)
-            last_out = out[:, -1, :]                   # 마지막 타임스텝: (N, hidden)
-            # pred_head(64→7)로 다음 프레임 feature 예측 — GRU + pred_head 가중치 갱신
-            pred = self._net.pred_head(last_out)       # (N, 7) — 정식 예측 헤드 사용
-            loss = criterion(pred, Y)                  # MSE 손실 계산
-            loss.backward()                            # 역전파
-            self._optimizer.step()                     # 파라미터 갱신
-            epoch_losses.append(float(loss.item()))    # loss 기록
+            perm      = torch.randperm(N)              # 매 epoch 셔플
+            ep_loss   = 0.0
+            n_batches = 0
+            for start in range(0, N, _batch):          # 미니배치 순회
+                idx   = perm[start: start + _batch]
+                xb, yb = X[idx], Y[idx]
+                self._optimizer.zero_grad()
+                out, _ = self._net.gru(xb)             # (B, seq_len, hidden)
+                pred   = self._net.pred_head(out[:, -1, :])  # (B, 7)
+                loss   = criterion(pred, yb)
+                loss.backward()
+                self._optimizer.step()
+                ep_loss   += float(loss.item())
+                n_batches += 1
+            epoch_losses.append(ep_loss / max(n_batches, 1))
 
-        self._net.eval()                               # 자기지도 학습 후 eval 모드 복원
+        self._net.eval()
         self._is_pretrained = True                     # pretrain 완료 → blend 활성화
 
-        # ── Phase 2: Direct Prediction Head 학습 ──────────────────────
+        # ── Phase 2: Direct Prediction Head 학습 — 미니배치 ───────────
         # 입력: feature_sequence[i:i+seq_len]  (현재 관측 윈도우)
         # 타겟: feature_sequence[i+seq_len+horizon_f]의 rule_jam_score → 3클래스
-        # 각 horizon 헤드를 독립적으로 CrossEntropy 학습
-        smooth_thr = getattr(self.cfg, "smooth_jam_threshold", 0.25)  # SMOOTH 임계값
-        slow_thr   = getattr(self.cfg, "slow_jam_threshold",   0.55)  # SLOW 임계값
-        n_epochs   = getattr(self.cfg, "gru_direct_epochs",    10)    # 학습 epoch 수
-        criterion_ce = nn.CrossEntropyLoss()           # 분류 손실 함수
+        smooth_thr   = getattr(self.cfg, "smooth_jam_threshold", 0.25)
+        slow_thr     = getattr(self.cfg, "slow_jam_threshold",   0.55)
+        n_epochs     = getattr(self.cfg, "gru_direct_epochs",    10)
+        criterion_ce = nn.CrossEntropyLoss()
 
-        for h_i, horizon_f in enumerate(self._horizon_frames):  # 각 horizon 순회
-            # ── (입력, 타겟) 쌍 생성 ──────────────────────────────────
-            # i+seq_len+horizon_f 인덱스가 유효한 범위만 사용
+        for h_i, horizon_f in enumerate(self._horizon_frames):
             inputs_d, targets_d = [], []
-            for i in range(len(vecs) - seq_len - horizon_f):
-                future_jam = float(                    # horizon_f 프레임 후 실제 jam_score
+            for i in range(0, len(vecs) - seq_len - horizon_f, _stride):
+                future_jam = float(
                     feature_sequence[i + seq_len + horizon_f].get("rule_jam_score", 0.0)
                 )
-                # rule_jam_score → 3클래스 레이블 변환
                 if future_jam < smooth_thr:
                     label = 0                          # SMOOTH
                 elif future_jam < slow_thr:
                     label = 1                          # SLOW
                 else:
-                    label = 2                          # CONGESTED
+                    label = 2                          # JAM
                 inputs_d.append(vecs[i: i + seq_len])
                 targets_d.append(label)
 
-            if not inputs_d:                           # 데이터 부족 — 해당 horizon 스킵
+            if not inputs_d:
                 continue
 
             X_d = torch.tensor(inputs_d,  dtype=torch.float32)  # (N, seq_len, 7)
-            Y_d = torch.tensor(targets_d, dtype=torch.long)      # (N,) 클래스 레이블
+            Y_d = torch.tensor(targets_d, dtype=torch.long)      # (N,)
+            N_d = X_d.shape[0]
 
-            # ── direct head만 학습 (GRU 가중치 함께 갱신) ───────────────
             self._net.train()
             direct_losses = []
-            for _ in range(n_epochs):                  # epoch 반복
-                self._optimizer.zero_grad()
-                out_d, _ = self._net.gru(X_d)          # GRU 출력: (N, seq_len, hidden)
-                last_d = out_d[:, -1, :]               # 마지막 타임스텝: (N, hidden)
-                logits_d = self._net.direct_heads[h_i](last_d)  # (N, 3) 로짓
-                loss_d = criterion_ce(logits_d, Y_d)   # CrossEntropy 손실
-                loss_d.backward()
-                self._optimizer.step()
-                direct_losses.append(float(loss_d.item()))
+            for _ in range(n_epochs):
+                perm_d  = torch.randperm(N_d)
+                ep_loss = 0.0
+                n_b     = 0
+                for start in range(0, N_d, _batch):    # 미니배치 순회
+                    idx_d  = perm_d[start: start + _batch]
+                    xb_d, yb_d = X_d[idx_d], Y_d[idx_d]
+                    self._optimizer.zero_grad()
+                    out_d, _ = self._net.gru(xb_d)     # (B, seq_len, hidden)
+                    logits_d = self._net.direct_heads[h_i](out_d[:, -1, :])  # (B, 3)
+                    loss_d   = criterion_ce(logits_d, yb_d)
+                    loss_d.backward()
+                    self._optimizer.step()
+                    ep_loss += float(loss_d.item())
+                    n_b     += 1
+                direct_losses.append(ep_loss / max(n_b, 1))
 
             self._net.eval()
-            h_sec = self._horizon_secs[h_i]            # 초 단위 horizon
+            h_sec = self._horizon_secs[h_i]
             print(f"  └─ {h_sec//60}분 후 헤드: "
                   f"loss {direct_losses[0]:.4f}→{direct_losses[-1]:.4f} "
-                  f"({len(inputs_d)}쌍)")              # 학습 결과 출력
+                  f"({N_d}쌍, stride={_stride})")
 
-        self._is_direct_trained = True                 # direct head 학습 완료
-        return epoch_losses                            # 자기지도 phase loss 반환
+        self._is_direct_trained = True
+        return epoch_losses
 
     # ── save: GRU weights 저장 ───────────────────────────────────────────
     def save(self, path) -> bool:
@@ -530,7 +543,7 @@ class GRUModule:
         gru_online_interval 프레임마다 1회 gradient step 실행.
 
         Args:
-            label: int — SMOOTH=0, SLOW=1, CONGESTED=2.
+            label: int — SMOOTH=0, SLOW=1, JAM=2.
         """
         if not self._torch_ok or self._net is None:    # fallback 모드
             return                                     # no-op

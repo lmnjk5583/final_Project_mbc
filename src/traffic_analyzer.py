@@ -1,6 +1,6 @@
 # 파일 경로: C:\final_pj\src\traffic_analyzer.py
 # 역할: ByteTrack 추적 결과(tracks·speeds)를 받아
-#        정체 레벨(SMOOTH/SLOW/CONGESTED), 밀도맵, KPI를 산출하는 정체 탐지 모듈.
+#        정체 레벨(SMOOTH/SLOW/JAM), 밀도맵, KPI를 산출하는 정체 탐지 모듈.
 #        Phase 1: 절대 km/h 대신 baseline 대비 비율(normalized_mag) 기반.
 #        cv2·torch에 의존하지 않으며 numpy만 사용한다.
 
@@ -37,7 +37,7 @@ class TrafficAnalyzer:
     # ── 정체 레벨 상수 ──────────────────────────────────────────────
     SMOOTH = "SMOOTH"                                 # 원활 (LOS A~B)
     SLOW = "SLOW"                                     # 서행 (LOS C~D)
-    CONGESTED = "CONGESTED"                           # 정체 (LOS E~F)
+    JAM = "JAM"                           # 정체 (LOS E~F)
 
     def __init__(self, cfg, frame_w: int, frame_h: int, fps: float,
                  flow_map=None, congestion_judge=None, gru_module=None):
@@ -241,7 +241,7 @@ class TrafficAnalyzer:
         return self._last_norm_speed_ratio * 100.0    # 비율 → 0~100 스케일
 
     def get_congestion_level(self) -> str:
-        """현재 정체 레벨 문자열("SMOOTH"/"SLOW"/"CONGESTED")을 반환한다."""
+        """현재 정체 레벨 문자열("SMOOTH"/"SLOW"/"JAM")을 반환한다."""
         return self.congestion_judge.get_level()       # CJ에서 히스테리시스 적용된 레벨
 
     def get_jam_score(self) -> float:
@@ -261,7 +261,7 @@ class TrafficAnalyzer:
 
         Returns:
             [{"step": int, "p_smooth": float, "p_slow": float,
-              "p_congested": float, "gru_score": float}, ...]
+              "p_jam": float, "gru_score": float}, ...]
             GRU 미훈련·버퍼 부족이면 None.
         """
         return self._last_future_pred                  # 자기회귀 예측 결과 (웹 API용)
@@ -271,7 +271,7 @@ class TrafficAnalyzer:
 
         Returns:
             [{"horizon_min": 1, "predicted_level": "SLOW",
-              "p_smooth": 0.1, "p_slow": 0.6, "p_congested": 0.3,
+              "p_smooth": 0.1, "p_slow": 0.6, "p_jam": 0.3,
               "confidence": 0.6}, ...]
             학습 미완료이면 None.
         """
@@ -300,7 +300,7 @@ class TrafficAnalyzer:
         return (occupied / total_cells) * 100.0       # 백분율 변환
 
     def get_duration_sec(self) -> float:
-        """현재 정체 레벨(SLOW/CONGESTED) 지속 시간(초)을 반환한다.
+        """현재 정체 레벨(SLOW/JAM) 지속 시간(초)을 반환한다.
         SMOOTH 상태이면 0.0."""
         return self.congestion_judge.get_duration_sec(  # CJ에 위임
             self._last_frame_num, self.fps

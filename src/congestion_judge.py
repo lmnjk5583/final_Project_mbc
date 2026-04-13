@@ -1,5 +1,5 @@
 # 파일 경로: C:\final_pj\src\congestion_judge.py
-# 역할: jam_score 계산(fallback) + 레벨 판정(SMOOTH/SLOW/CONGESTED) + 히스테리시스
+# 역할: jam_score 계산(fallback) + 레벨 판정(SMOOTH/SLOW/JAM) + 히스테리시스
 # 의존성: math (표준 라이브러리 — sqrt)
 
 
@@ -37,10 +37,10 @@ def compute_jam_score_fallback(x_t: dict) -> float:
     정상 차량(빠른 통과): ema 낮게 유지 → cds 낮음
     정체 차량(같은 셀 오래 머묾): ema 서서히 누적 → cds 높음
 
-    설계 목표 (smooth<0.25, slow<0.55, congested≥0.55):
-      - 원활 (cds=0.05, occ=0.05): jam=0.045+0.015=0.060 → SMOOTH
-      - 서행 (cds=0.20, occ=0.15): jam=0.180+0.045=0.225 → SLOW
-      - 정체 (cds=0.60, occ=0.25): jam=0.540+0.075=0.615 → CONGESTED
+    설계 목표 (smooth<0.25, slow<0.55, jam≥0.55):
+      - 원활 (cds=0.05, occ=0.05): jam≈0.030 → SMOOTH
+      - 서행 (cds=0.20, occ=0.15): jam≈0.180 → SLOW
+      - 정체 (cds=0.60, occ=0.35): jam≈0.490 → JAM
 
     Args:
         x_t: feature 벡터 dict.
@@ -61,7 +61,7 @@ def compute_jam_score_fallback(x_t: dict) -> float:
 
     # ── 1) 저규모 가드: 차량·셀이 너무 적으면 체류 신호 억제 ─────────
     # 근거: 차량 1~2대만 있을 때 그 차량이 우연히 같은 셀에 오래 있으면
-    #       cds가 높게 찍혀 CONGESTED 오탐 — 실제로는 "한 대 서행" 수준
+    #       cds가 높게 찍혀 JAM 오탐 — 실제로는 "한 대 서행" 수준
     # flow_occ 0.06 = 20×20 그리드 기준 약 2.4셀 점유 → 그 이하는 거의 빈 도로
     if known_cnt <= 2 or occupied_cnt <= 2 or flow_occ < 0.06:
         return _clip(0.08 * math.sqrt(flow_occ), 0.0, 0.10)  # 최대 0.10으로 제한
@@ -70,8 +70,8 @@ def compute_jam_score_fallback(x_t: dict) -> float:
     # count_gate: 2대 이하=0.0, 10대=1.0 — 소수 차량 오탐 억제
     # occ_gate  : flow_occ 0.06 이하=0.0, 0.26 이상=1.0 — 빈 도로에서 cds 억제
     # scale_gate: 두 조건 모두 충족해야 체류 신호를 최대 반영
-    count_gate = _clip((known_cnt - 2) / 8.0, 0.0, 1.0)      # 2대 이하는 0, 10대면 1.0
-    occ_gate   = _clip((flow_occ - 0.06) / 0.20, 0.0, 1.0)   # 점유율 낮으면 0, 0.26 이상이면 1.0
+    count_gate = _clip((known_cnt - 2) / 10.0, 0.0, 1.0)     # 2대 이하는 0, 12대면 1.0 (13→10: 6fps 저감지 환경 보정)
+    occ_gate   = _clip((flow_occ - 0.06) / 0.20, 0.0, 1.0)   # 점유율 낮으면 0, 0.26 이상이면 1.0 (원래 기준 복구)
     scale_gate = count_gate * occ_gate                         # 두 게이트의 곱 (AND 조건)
 
     # ── 3) 핵심 jam 계산 ─────────────────────────────────────────────
@@ -81,7 +81,7 @@ def compute_jam_score_fallback(x_t: dict) -> float:
     # 위 세 신호 모두 scale_gate로 스케일 — 저규모에서 과대 반응 방지
     # 0.12×sqrt(flow_occ): scale_gate 없는 기저 신호 — 차량 많을수록 최소 jam 보장
     core = (
-        1.90 * cds                   # 셀 누적 EMA (주 신호) — 1.10→1.90: _lane_cell_count 버그 수정으로 cds가 낮아진 것 보정
+        1.50 * cds                   # 셀 누적 EMA (주 신호) — 1.30→1.50: count/occ gate 강화로 소수오탐 막으므로 가중치 복구
         + 0.25 * persist             # 점유 지속성 (보조)
         + 0.10 * math.sqrt(dwell)    # 체류 셀 비율 (sqrt 비선형)
     )
@@ -96,7 +96,7 @@ def compute_jam_score_fallback(x_t: dict) -> float:
 # ======================================================================
 
 class CongestionJudge:
-    """jam_score를 계산하고 SMOOTH/SLOW/CONGESTED 레벨을 판정한다.
+    """jam_score를 계산하고 SMOOTH/SLOW/JAM 레벨을 판정한다.
 
     히스테리시스: congestion_hysteresis_sec × fps 프레임 동안
     기존 레벨을 유지해야 새 레벨로 전환된다.
@@ -189,7 +189,7 @@ class CongestionJudge:
             jam_score: 0.0~1.0.
 
         Returns:
-            "SMOOTH", "SLOW", or "CONGESTED".
+            "SMOOTH", "SLOW", or "JAM".
         """
         smooth_thr = self.get_smooth_threshold()       # SMOOTH 임계값
         slow_thr = self._get_slow_threshold()          # SLOW 임계값
@@ -198,7 +198,7 @@ class CongestionJudge:
             return "SMOOTH"                            # 원활
         if jam_score < slow_thr:                       # SLOW 임계값 미만
             return "SLOW"                              # 서행
-        return "CONGESTED"                             # 정체
+        return "JAM"                             # 정체
 
     # ── 임계값 접근자 ─────────────────────────────────────────────────
     def get_smooth_threshold(self) -> float:
@@ -298,12 +298,12 @@ class CongestionJudge:
                 self.cfg.congestion_hysteresis_sec * self.fps
             )
 
-        # 4. 레벨 판정 (SMOOTH / SLOW / CONGESTED)
+        # 4. 레벨 판정 (SMOOTH / SLOW / JAM)
         raw_level = self._classify(self._last_jam_score)
         level = self._apply_hysteresis(raw_level)      # 히스테리시스 적용 후 최종 레벨
 
         # 4. 정체 지속 시간 추적
-        if level in ("SLOW", "CONGESTED"):
+        if level in ("SLOW", "JAM"):
             if self._congestion_start_frame is None:
                 self._congestion_start_frame = frame_num
         else:
@@ -330,7 +330,7 @@ class CongestionJudge:
         """현재 확정 레벨을 반환한다.
 
         Returns:
-            "SMOOTH", "SLOW", or "CONGESTED".
+            "SMOOTH", "SLOW", or "JAM".
         """
         return self._current_level                     # 히스테리시스 적용된 레벨
 
@@ -344,7 +344,7 @@ class CongestionJudge:
 
     def get_duration_sec(self, frame_num: int,
                          fps: float) -> float:
-        """현재 정체(SLOW/CONGESTED) 지속 시간(초)을 반환한다.
+        """현재 정체(SLOW/JAM) 지속 시간(초)을 반환한다.
 
         Args:
             frame_num: 현재 프레임 번호.

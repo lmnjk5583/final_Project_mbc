@@ -452,12 +452,12 @@ class Visualizer:
 
         plan.md §3.1 기반:
           SLOW       → VSL 하향 권고 + VMS 서행 안내
-          CONGESTED  → VMS 우회 안내 + 램프 미터링 권고
-          CONGESTED 5분+ → 순찰대 출동 요청 추가
+          JAM  → VMS 우회 안내 + 램프 미터링 권고
+          JAM 5분+ → 순찰대 출동 요청 추가
 
         Args:
-            level: "SMOOTH", "SLOW", "CONGESTED".
-            duration_sec: SLOW/CONGESTED 지속 시간(초).
+            level: "SMOOTH", "SLOW", "JAM".
+            duration_sec: SLOW/JAM 지속 시간(초).
 
         Returns:
             조치 권고 문자열. SMOOTH이면 빈 문자열.
@@ -466,7 +466,7 @@ class Visualizer:
             return ""
         if level == "SLOW":                                        # 서행
             return "VSL reduce  |  VMS: slow down"                # Papageorgiou 2006, MDPI 2024
-        if level == "CONGESTED":                                   # 정체
+        if level == "JAM":                                   # 정체
             if duration_sec >= 300:                                # 5분(300초) 이상 지속
                 return "VMS detour  |  Ramp meter  |  Patrol dispatch"  # FHWA CHART
             return "VMS detour  |  Ramp metering"                 # ALINEA 1991, MDPI 2024
@@ -484,9 +484,9 @@ class Visualizer:
 
         Args:
             frame: BGR 이미지 프레임.
-            level_a: A방향 정체 레벨 ("SMOOTH"/"SLOW"/"CONGESTED").
+            level_a: A방향 정체 레벨 ("SMOOTH"/"SLOW"/"JAM").
             jam_score_a: A방향 jam_score (0.0~1.0).
-            duration_sec_a: A방향 SLOW/CONGESTED 지속 시간(초).
+            duration_sec_a: A방향 SLOW/JAM 지속 시간(초).
             level_b: B방향 정체 레벨.
             jam_score_b: B방향 jam_score.
             duration_sec_b: B방향 지속 시간(초).
@@ -499,7 +499,7 @@ class Visualizer:
         _lv_colors = {                                             # 레벨→BGR 색상 매핑
             "SMOOTH":    (0, 200, 0),                              # 초록 — 원활
             "SLOW":      (0, 200, 255),                            # 노랑 — 서행
-            "CONGESTED": (0, 0, 255),                              # 빨강 — 정체
+            "JAM": (0, 0, 255),                              # 빨강 — 정체
         }
 
         # ── label 기준으로 Down/Up 데이터 매핑 ────────────────────
@@ -514,7 +514,7 @@ class Visualizer:
         color_up   = _lv_colors.get(up_lv,   (200, 200, 200))     # Up 색상
 
         # ── 최악 방향 기준 조치 권고 ──────────────────────────────
-        _lv_order = {"SMOOTH": 0, "SLOW": 1, "CONGESTED": 2}      # 레벨 심각도 순서
+        _lv_order = {"SMOOTH": 0, "SLOW": 1, "JAM": 2}      # 레벨 심각도 순서
         if _lv_order.get(down_lv, 0) >= _lv_order.get(up_lv, 0): # Down이 더 나쁘면
             worst_level, worst_dur = down_lv, down_dur             # 최악 = Down
         else:                                                      # Up이 더 나쁘면
@@ -538,7 +538,7 @@ class Visualizer:
             cv2.addWeighted(overlay, 0.75, frame, 0.25, 0, frame)  # 75% 불투명 합성
             cv2.rectangle(frame, (px, py),
                           (px + panel_w, py + p_h), color, 2)     # 레벨 색상 테두리
-            # 제목 + 레벨 텍스트 ("Down  CONGESTED")
+            # 제목 + 레벨 텍스트 ("Down  JAM")
             cv2.putText(frame, f"{title}  {level}",
                         (px + 8, py + 19),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.50, color, 2, cv2.LINE_AA)
@@ -556,7 +556,7 @@ class Visualizer:
             cv2.putText(frame, f"{jam:.2f}",                       # jam 수치 텍스트
                         (bar_x + bar_w + 4, bar_y + bar_h),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.36, (200, 200, 200), 1, cv2.LINE_AA)
-            # 지속 시간 (SLOW/CONGESTED 유지 시간)
+            # 지속 시간 (SLOW/JAM 유지 시간)
             if dur_sec > 0:                                        # 지속시간 있을 때만
                 mins = int(dur_sec // 60)                          # 분 계산
                 secs = int(dur_sec % 60)                           # 초 계산
@@ -596,3 +596,91 @@ class Visualizer:
             cv2.putText(frame, action,                             # 조치 권고 텍스트
                         (text_x, text_y),
                         cv2.FONT_HERSHEY_SIMPLEX, font_scale, (50, 200, 255), font_thick, cv2.LINE_AA)
+
+    # ==================== 미래 예측 패널 (하단 중앙) ====================
+    def draw_prediction_panel(self, frame, pred_a: list | None, pred_b: list | None,
+                               label_a: str = "UP"):
+        """화면 하단 중앙에 1·3·5분 후 예측 패널을 그린다.
+
+        Args:
+            frame:   BGR 이미지 프레임.
+            pred_a:  A방향 predict_direct() 결과 (None이면 학습 중 표시).
+            pred_b:  B방향 predict_direct() 결과.
+            label_a: A방향 레이블 ("UP" 또는 "DOWN"). B방향은 자동으로 반대 방향.
+        """
+        fh, fw = frame.shape[:2]
+
+        _lv_colors = {
+            "SMOOTH":    (0, 200, 0),
+            "SLOW":      (0, 200, 255),
+            "JAM": (0, 0, 255),
+        }
+        _lv_kr = {
+            "SMOOTH": "SMOOTH", "SLOW": "SLOW", "JAM": "JAM",
+        }
+
+        # ── 패널 크기·위치 계산 ───────────────────────────────────────
+        horizons = [1, 3, 5]                               # 예측 horizon (분)
+        col_w    = 70                                      # horizon 열 너비
+        row_h    = 18                                      # 방향 행 높이
+        pad      = 8                                       # 내부 여백
+        header_h = 16                                      # 상단 헤더 높이
+        n_rows   = 2                                       # 방향 수 (Down, Up)
+        panel_w  = pad + len(horizons) * col_w + pad       # 전체 패널 너비
+        panel_h  = pad + header_h + n_rows * row_h + pad  # 전체 패널 높이
+
+        px = (fw - panel_w) // 2                          # 화면 가로 중앙
+        py = fh - panel_h - 8                             # 화면 최하단 바로 위 (margin=8)
+
+        # ── 반투명 배경 ────────────────────────────────────────────────
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (px, py), (px + panel_w, py + panel_h), (20, 20, 20), -1)
+        cv2.addWeighted(overlay, 0.78, frame, 0.22, 0, frame)
+        cv2.rectangle(frame, (px, py), (px + panel_w, py + panel_h), (100, 100, 100), 1)
+
+        # ── 헤더 (1분후 / 3분후 / 5분후) ──────────────────────────────
+        for i, h in enumerate(horizons):
+            hx = px + pad + i * col_w + col_w // 2
+            cv2.putText(frame, f"{h}min",
+                        (hx - 14, py + pad + 11),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.38, (180, 180, 180), 1, cv2.LINE_AA)
+
+        # ── 방향별 예측 행 ─────────────────────────────────────────────
+        dirs = []
+        if label_a == "DOWN":
+            dirs = [("Down", pred_a), ("Up", pred_b)]
+        else:
+            dirs = [("Down", pred_b), ("Up", pred_a)]
+
+        for r, (dir_label, pred) in enumerate(dirs):
+            ry = py + pad + header_h + r * row_h          # 행 y 위치
+            # 방향 레이블
+            cv2.putText(frame, dir_label,
+                        (px + 4, ry + 13),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.33, (160, 160, 160), 1, cv2.LINE_AA)
+
+            if pred is None:                              # 학습 중 — 점선 표시
+                cv2.putText(frame, "Training...",
+                            (px + pad + 2, ry + 13),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.33, (120, 120, 120), 1, cv2.LINE_AA)
+                continue
+
+            # horizon별 예측 셀 표시
+            pred_by_min = {p["horizon_min"]: p for p in pred}
+            for i, h in enumerate(horizons):
+                p   = pred_by_min.get(h)
+                cx_ = px + pad + i * col_w + col_w // 2
+                if p is None:
+                    continue
+                lv    = p["predicted_level"]
+                conf  = p["confidence"]
+                color = _lv_colors.get(lv, (180, 180, 180))
+                text  = _lv_kr.get(lv, lv)
+                # 예측 레벨 텍스트
+                cv2.putText(frame, text,
+                            (cx_ - 13, ry + 13),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.38, color, 1, cv2.LINE_AA)
+                # 신뢰도 (작은 글씨)
+                cv2.putText(frame, f"{int(conf*100)}%",
+                            (cx_ - 9, ry + 13 + 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.28, (130, 130, 130), 1, cv2.LINE_AA)

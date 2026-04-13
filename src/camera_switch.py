@@ -12,6 +12,7 @@ class CameraSwitchDetector:
         self.reference_frame = None     # 기준 배경 프레임 (장면 전환 감지용)
         self.diff_history = []          # 인접 프레임 차이값 히스토리
         self.confirm_count = 0          # 카메라 전환 감지 누적 카운트
+        self.last_adj_diff = 0.0        # 직전 프레임 인접 diff (안정 판정용 — 외부에서 읽음)
 
     def reset_history(self):
         """히스토리/카운트 초기화"""
@@ -47,6 +48,7 @@ class CameraSwitchDetector:
 
         # ── 바로 이전 프레임과의 차이 (프레임 간 변화량) ──
         adj_diff = np.mean(np.abs(self.prev_small - small))
+        self.last_adj_diff = adj_diff            # 외부 안정 판정용으로 노출
         self.diff_history.append(adj_diff)       # 변화량 히스토리에 추가
         if len(self.diff_history) > 90:
             self.diff_history.pop(0)
@@ -70,8 +72,8 @@ class CameraSwitchDetector:
             if avg_diff > 2.0 and adj_diff / (avg_diff + 1e-6) > 5.0:
                 triggered = True
 
-        # 2) 기준 프레임과의 차이가 매우 크면(>50), 장면 자체가 완전히 바뀌었다고 판단
-        if ref_diff > 50:
+        # 2) 기준 프레임과의 차이가 매우 크면(>35), 장면 자체가 완전히 바뀌었다고 판단
+        if ref_diff > 35:
             triggered = True
 
         if triggered:

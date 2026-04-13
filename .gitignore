@@ -3,3 +3,12 @@ __pycache__/
 .env
 results/
 .claude/
+
+# ── 학습 결과물 (로컬 전용, 팀원 각자 생성) ──
+flow_maps/
+runs/
+
+# ── 대용량 바이너리 ──
+*.pt
+*.pkl
+*.npy

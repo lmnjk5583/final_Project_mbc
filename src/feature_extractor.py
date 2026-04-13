@@ -292,19 +292,20 @@ class FeatureExtractor:
 
         if _occupied_emas:
             _cds_intensity = float(np.mean(_occupied_emas))  # 점유 셀 평균 EMA 강도 (얼마나 오래 머물렀는가)
-            # 단방향 차선 셀 수 결정
-            # - override 주입된 경우: 이미 단방향 값 → 그대로 사용
-            # - 전체 셀 사용 중(양방향 통합): // 2로 단방향 추정
-            if self._valid_cell_count_override is not None:
-                _lane_cell_count = valid_cell_count     # 이미 단방향 값
-            else:
-                _lane_cell_count = max(valid_cell_count // 2, 1)  # 양방향 → 단방향 추정
-            _cds_density = min(1.0, len(_occupied_emas) / _lane_cell_count)  # 단방향 기준 점유 비율 (0~1)
-            # 최종 score = 강도 × (0.3 + 0.7 × 밀도)
-            #   밀도=0 이어도 강도가 높으면 0.3 × intensity로 최소 반영
-            #   밀도=1 이면 1.0 × intensity = 최대값
+            # ── 고밀도 보정: 차량 수 대비 체류 EMA 높은 셀 비율 ─────────────
+            # 실도로에서 차량 5~8대 → 5~8셀 / 유효셀 40~60개 = density 0.10~0.15
+            # → density 기반 보정은 실제 정체를 과도하게 억제
+            # 개선: 점유 셀 중 고강도(ema > 0.20) 비율로 판단
+            #   ema > 0.20 = 약 5프레임 이상 연속 점유 (6fps 기준 ~0.8초)
+            #   정체 차량: 수초~수분 체류 → 대부분 0.20 초과
+            #   정상 통과: 1~2프레임 점유 → 대부분 0.20 미만
+            _high_ema_count = sum(1 for e in _occupied_emas if e > 0.20)
+            _cds_density = min(1.0, _high_ema_count / max(len(_occupied_emas), 1))  # 고강도 셀 비율
+            # 최종 score = 강도 × (0.4 + 0.6 × 고강도비율)
+            #   고강도 셀 없어도 intensity × 0.4 최소 반영
+            #   대부분 고강도이면 intensity × 1.0 = 최대값
             cell_dwell_score = float(np.clip(
-                _cds_intensity * (0.3 + 0.7 * _cds_density), 0.0, 1.0
+                _cds_intensity * (0.4 + 0.6 * _cds_density), 0.0, 1.0
             ))
         else:
             _cds_intensity = 0.0   # 점유 셀 없음 → 강도 0

@@ -23,6 +23,12 @@ try:
 except ImportError:                                 # gru_module.py 없거나 torch 없으면
     _GRU_AVAILABLE = False                          # fallback 모드
 
+try:
+    from flow_map_matcher import FlowMapMatcher, save_ref_frame  # flow_map 자동 매칭
+    _MATCHER_AVAILABLE = True
+except ImportError:
+    _MATCHER_AVAILABLE = False
+
 
 class Detector:
     """역주행 탐지 + 정체 탐지를 수행하는 메인 오케스트레이터."""
@@ -33,7 +39,8 @@ class Detector:
         # ── 런타임 상태(state) + 모듈 생성 ──────────────────────────────
         self.state = DetectorState()                                # 프레임 번호, 궤적, 역주행 카운트 등
         self.flow = FlowMap(cfg.grid_size, cfg.alpha, cfg.min_samples)  # 정상 흐름 벡터 그리드
-        self.tracker = YoloTracker(cfg.model_path, cfg.conf, cfg.target_classes)  # YOLO+ByteTrack
+        self.tracker = YoloTracker(cfg.model_path, cfg.conf, cfg.target_classes,
+                                   night_enhance=getattr(cfg, "night_enhance", True))  # YOLO+ByteTrack
         self.judge = WrongWayJudge(cfg, self.flow, self.state)      # 역주행 판정기
         self.idm = IDManager(cfg, self.flow, self.state)            # ID 관리 + 재매칭
         self.switch = CameraSwitchDetector(cfg)                     # 카메라 전환 감지기
@@ -182,13 +189,16 @@ class Detector:
             idx += 1                                                # 존재하면 번호 증가
 
     # ==================== 메인 루프 ====================
-    def run(self, video_name, max_seconds: float | None = None):
+    def run(self, video_name, max_seconds: float | None = None,
+            url_refresher=None):
         """영상 파일 또는 스트림 URL을 열어 프레임 단위로 처리한다.
 
         Args:
             video_name: 파일명(str) 또는 스트림 URL(http/rtsp로 시작).
             max_seconds: 이 시간(초) 경과 후 루프 종료. None이면 영상 끝까지.
-                         ITS URL 갱신 주기로 사용 — 만료 전에 새 URL로 재시작.
+            url_refresher: () -> str | None 콜백. 스트림 단절 시 새 URL을 반환.
+                           None이면 단절 시 루프 종료 (기존 동작).
+                           Detector 상태(trajectories, flow_map 등)는 유지됨.
         """
         cfg = self.cfg                                              # 설정 단축 참조
         st = self.state                                             # 상태 단축 참조
@@ -255,6 +265,7 @@ class Detector:
             self._compute_direction_cell_counts()                  # 방향별 셀 수 계산 → TA 주입
         print("✅ 정체 탐지 활성화 완료")
 
+        save_path = None                                            # 녹화 경로 (없으면 None)
         if self.cfg.result_dir:                                     # result_dir 없으면 녹화 안 함
             save_path = self._get_next_filename()                   # 결과 저장 파일명
             fourcc = cv2.VideoWriter_fourcc(*"mp4v")                # mp4 인코더 설정
@@ -324,7 +335,19 @@ class Detector:
         if _disp_w > 0 and _disp_h > 0:                        # 0이 아닌 경우에만 크기 고정
             cv2.resizeWindow(_win_name, _disp_w, _disp_h)      # 창 크기 고정
 
-        _run_start_time = time.time()                               # 루프 시작 시각 (max_seconds 계산용)
+        _run_start_time  = time.time()                              # 루프 시작 시각 (max_seconds 계산용)
+        _stream_fail_cnt = 0                                        # 연속 read 실패 횟수 (스트림 단절 감지)
+        _STREAM_FAIL_MAX = 50                                       # 이 횟수 초과 시 스트림 단절로 판단
+
+        # ── 실제 처리 fps 측정 → jump 임계값 동적 스케일링 ──────────────
+        # CCTV는 30fps이지만 CPU 처리 속도가 10fps이면 3프레임치 이동이
+        # 1프레임에 한 번에 발생 → 정상 이동도 jump로 오감지됨.
+        # 실측 처리fps 기반으로 jump_px를 (stream_fps / proc_fps) 비율로 확대.
+        _proc_fps_samples   = []                                    # 최근 N프레임 처리 시간 샘플
+        _proc_fps_win       = 30                                    # 측정 윈도우 크기
+        _last_frame_time    = time.time()                           # 직전 프레임 처리 완료 시각
+        _base_jump_px       = getattr(cfg, "frame_skip_jump_px", 80.0)  # 30fps 기준 jump 임계값
+        _jump_thr_dynamic   = _base_jump_px                         # 실측 fps 반영 동적 임계값
 
         while cap.isOpened():                                       # 비디오 스트림이 열려 있는 동안
             # ── max_seconds 초과 시 루프 종료 (ITS URL 갱신 타이밍) ──
@@ -334,11 +357,38 @@ class Detector:
                     break
 
             ret, frame = cap.read()                                 # 프레임 읽기
-            if not ret:                                             # 더 이상 프레임 없으면
-                if is_stream:                                       # 스트림이면 잠시 대기 후 재시도
-                    time.sleep(0.1)
+            if not ret:                                             # 프레임 읽기 실패
+                if is_stream:
+                    _stream_fail_cnt += 1
+                    if _stream_fail_cnt >= _STREAM_FAIL_MAX:        # 연속 50회 실패 = 스트림 단절
+                        if url_refresher is not None:               # 콜백 있으면 재연결 시도
+                            print(f"[run] 스트림 단절 → URL 재발급 시도 (상태 유지)")
+                            _new_url = url_refresher()              # 새 URL 발급
+                            if _new_url:
+                                cap.release()                       # 기존 cap 해제
+                                cap = cv2.VideoCapture(_new_url)    # 새 URL로 재연결
+                                _stream_fail_cnt = 0               # 카운터 리셋
+                                print(f"[run] 재연결 완료 — Detector 상태 유지")
+                                continue
+                        print(f"[run] 스트림 단절 감지 ({_STREAM_FAIL_MAX}회 연속 실패) → 루프 종료")
+                        break                                       # 콜백 없거나 실패 → 종료
+                    time.sleep(0.02)
                     continue
                 break                                               # 파일이면 종료
+            _stream_fail_cnt = 0                                    # 성공 시 실패 카운터 초기화
+
+            # ── 실제 처리 fps 측정 및 jump 임계값 갱신 ──────────────────
+            _now = time.time()
+            _proc_fps_samples.append(_now - _last_frame_time)
+            _last_frame_time = _now
+            if len(_proc_fps_samples) > _proc_fps_win:
+                _proc_fps_samples.pop(0)
+            if len(_proc_fps_samples) >= 5:                         # 5프레임 이상 쌓이면 측정
+                _avg_interval = sum(_proc_fps_samples) / len(_proc_fps_samples)
+                _proc_fps     = 1.0 / max(_avg_interval, 0.01)     # 실측 처리 fps
+                # 스케일 = stream_fps / proc_fps: 10fps 처리 시 3배 확대
+                _scale = max(1.0, fps / max(_proc_fps, 1.0))
+                _jump_thr_dynamic = _base_jump_px * min(_scale, 5.0)  # 최대 5배 제한
 
             st.frame_num += 1                                       # 프레임 번호 증가
 
@@ -346,7 +396,45 @@ class Detector:
             tracks = self.tracker.track(frame)                      # [{id, x1, y1, x2, y2, cx, cy}, ...]
             active_ids = {t["id"] for t in tracks}                  # 현재 프레임에 보이는 ID들
 
-            # 처음 등장한 프레임 기록 + on_entry 호출
+            # ── 프레임 스킵(신호 끊김) 감지 ──────────────────────────────
+            # HLS 스트림 끊김 시 모든 차량이 동시에 큰 변위를 가짐
+            # → 절반 이상이 jump_px 초과 시 해당 프레임의 궤적·학습·판정 전부 스킵
+            _jump_thr   = _jump_thr_dynamic                             # 실측 fps 기반 동적 임계값
+            _jump_ratio = getattr(cfg, "frame_skip_ratio",    0.5)
+            _jump_count = 0
+            _jump_total = 0
+            for _t in tracks:
+                _tid = _t["id"]
+                _traj = st.trajectories.get(_tid)
+                if _traj:                                           # 이전 위치 있는 차량만 비교
+                    _dx = _t["cx"] - _traj[-1][0]
+                    _dy = _t["cy"] - _traj[-1][1]
+                    _dist = (_dx**2 + _dy**2) ** 0.5
+                    _jump_total += 1
+                    if _dist > _jump_thr:
+                        _jump_count += 1
+            _is_frame_skip = (
+                _jump_total >= 2                                    # 비교 가능 차량 2대 이상 (1→2: 차량 적은 상황 대응)
+                and _jump_count / _jump_total >= _jump_ratio        # 절반 이상 jump
+            )
+            if _is_frame_skip:
+                print(f"[F:{st.frame_num}] ⚠️ 프레임 스킵 감지 ({_jump_count}/{_jump_total}대 jump) → 이 프레임 스킵")
+                # 스킵 후 궤적 전체를 현재 위치로 채움
+                # velocity 계산: traj[-velocity_window] → traj[-1] 구간을 사용하므로
+                # 마지막 점만 바꿔도 나머지 점(jump 전)이 남아 다음 프레임에서도
+                # "순간이동 벡터"가 계산되어 역주행 오탐이 이어짐.
+                # → 궤적 전체를 현재 위치로 덮어써서 velocity 계산 기점을 초기화.
+                for _t in tracks:
+                    _tid = _t["id"]
+                    if st.trajectories[_tid]:                       # 기존 궤적 있으면
+                        _cur_pos = (_t["cx"], _t["cy"])
+                        st.trajectories[_tid] = [_cur_pos] * len(st.trajectories[_tid])  # 전체를 현재 위치로 초기화
+                    st.last_velocity.pop(_tid, None)                # 방향 벡터 리셋 (dir_jump 오감지 차단)
+                    st.wrong_way_count[_tid] = 0                    # 누적 의심 카운트 리셋
+                    st.direction_change_frame[_tid] = st.frame_num  # guard 발동: velocity_window 동안 판정 차단
+                    st.wrong_way_ids.discard(_tid)                  # 혹시 스킵 직전에 확정됐으면 취소
+
+            # 처음 등장한 프레임 기록
             for t in tracks:                                        # 각 트랙 순회
                 if t["id"] not in st.first_seen_frame:              # 처음 보는 ID이면
                     st.first_seen_frame[t["id"]] = st.frame_num     # 등장 프레임 기록
@@ -375,7 +463,7 @@ class Detector:
                 _lvl_b = (self.traffic_analyzer_b.get_congestion_level()  # B방향 레벨
                           if self.traffic_analyzer_b else "SMOOTH")
                 _worst_jam = max(_jam_a, _jam_b)                    # 둘 중 높은 jam_score
-                _lo = {"SMOOTH": 0, "SLOW": 1, "CONGESTED": 2}     # 레벨 순위
+                _lo = {"SMOOTH": 0, "SLOW": 1, "JAM": 2}     # 레벨 순위
                 _worst_lvl = (_lvl_a if _lo.get(_lvl_a, 0) >= _lo.get(_lvl_b, 0)  # 더 나쁜 레벨
                               else _lvl_b)
                 # worst-of-both 방향의 rule_jam / gru_score 선택 (jam 기준)
@@ -397,25 +485,85 @@ class Detector:
                     gru_score=_gru_score                            # GRU 예측값 (warmup 중 None)
                 )
 
-            # ── 카메라 전환 감지 ──
-            if not st.is_learning and not st.relearning:            # 학습/재학습 중이 아닐 때만
-                if self.switch.check(frame, st.frame_num, st.cooldown_until):  # 전환 감지되면
-                    st.reset_for_relearn()                          # 상태 초기화
-                    self.flow.reset()                               # flow_map 초기화
-                    self.traffic_analyzer_a.congestion_judge.reset()  # A방향 EMA·히스테리시스 초기화
-                    self.traffic_analyzer_b.congestion_judge.reset()  # B방향 EMA·히스테리시스 초기화
-                    if self.gru_module_a is not None:               # A방향 GRU 있으면
-                        self.gru_module_a.reset()                   # 버퍼·hidden·warmup 초기화
-                    if self.gru_module_b is not None:               # B방향 GRU 있으면
-                        self.gru_module_b.reset()                   # 버퍼·hidden·warmup 초기화
-                    self._gru_feature_history_a = []                # A방향 feature 이력 초기화
-                    self._gru_feature_history_b = []                # B방향 feature 이력 초기화
-                    self._gru_pretrain_pending_a = False             # A방향 pretrain 예약 초기화
-                    self._gru_pretrain_pending_b = False             # B방향 pretrain 예약 초기화
-                    self._ref_direction = None                      # 기준 방향 초기화 (재학습 후 재계산)
-                    self._track_direction.clear()                   # 차량 방향 매핑 초기화
-                    _relearn_smoothed_80 = False                    # 재학습 80% smoothing 플래그 리셋
-                    _relearn_smoothed_95 = False                    # 재학습 95% smoothing 플래그 리셋
+            # ── 카메라 전환 감지 및 안정 대기 상태 머신 ─────────────────
+            # 상태: 탐지 중 → (전환 감지) → waiting_stable → (안정 확인) → 재학습 → 탐지 중
+            # 재학습 중 또 흔들리면 → waiting_stable 복귀 (잘못된 흐름 학습 방지)
+
+            _stability_required_frames = int(
+                getattr(cfg, "stability_required_sec", 4.0) * fps)  # 안정 대기 프레임 수
+            _stability_thr   = getattr(cfg, "stability_diff_threshold", 8.0)   # 안정 판정 diff 임계값
+            _relearn_abort   = getattr(cfg, "relearn_abort_diff", 15.0)        # 재학습 중단 diff 임계값
+
+            if not st.is_learning:
+                # ── (A) 탐지 중: 전환 감지 → waiting_stable 진입 ──────────
+                if not st.relearning and not st.waiting_stable:
+                    if self.switch.check(frame, st.frame_num, st.cooldown_until):
+                        print("📷 카메라 전환 감지 → 화면 안정 대기 중...")
+                        st.waiting_stable = True
+                        st.stable_since_frame = st.frame_num       # 안정 타이머 시작
+                        # GRU만 즉시 리셋 (flow_map은 안정 후 재학습 시작 시 초기화)
+                        if self.gru_module_a is not None:
+                            self.gru_module_a.reset()
+                        if self.gru_module_b is not None:
+                            self.gru_module_b.reset()
+                        self._track_direction.clear()
+
+                # ── (B) 안정 대기 중: diff 모니터링 ────────────────────────
+                elif st.waiting_stable:
+                    # switch.check()을 호출해서 last_adj_diff를 업데이트
+                    self.switch.check(frame, st.frame_num, st.cooldown_until)
+                    _cur_diff = self.switch.last_adj_diff
+
+                    if _cur_diff > _stability_thr:                 # 아직 불안정 → 타이머 리셋
+                        st.stable_since_frame = st.frame_num
+                        if st.frame_num % 30 == 0:
+                            print(f"[대기] 아직 불안정 diff={_cur_diff:.1f} > {_stability_thr}")
+                    else:
+                        # 안정 지속 중 — 충분히 유지됐으면 재학습 시작
+                        stable_frames = st.frame_num - st.stable_since_frame
+                        if stable_frames >= _stability_required_frames:
+                            print(f"✅ 화면 안정 확인 ({stable_frames}프레임) → 재학습 시작")
+                            st.waiting_stable = False
+                            st.reset_for_relearn()                 # 재학습 모드 진입
+                            self.flow.reset()                      # flow_map 초기화
+                            self.traffic_analyzer_a.congestion_judge.reset()
+                            self.traffic_analyzer_b.congestion_judge.reset()
+                            # 메모리 history를 pkl에 먼저 저장 — 전환 전 데이터도 보존
+                            if self._log_path_a and self._gru_feature_history_a:
+                                self.gru_module_a.append_feature_log(
+                                    self._gru_feature_history_a, self._log_path_a)
+                            if self._log_path_b and self._gru_feature_history_b:
+                                self.gru_module_b.append_feature_log(
+                                    self._gru_feature_history_b, self._log_path_b)
+                            self._gru_feature_history_a = []
+                            self._gru_feature_history_b = []
+                            self._gru_pretrain_pending_a = False
+                            self._gru_pretrain_pending_b = False
+                            self._ref_direction = None
+                            _relearn_smoothed_80 = False
+                            _relearn_smoothed_95 = False
+
+                # ── (C) 재학습 중: 또 흔들리면 중단 → 대기 복귀 ───────────
+                elif st.relearning:
+                    self.switch.check(frame, st.frame_num, st.cooldown_until)
+                    _cur_diff = self.switch.last_adj_diff
+                    if _cur_diff > _relearn_abort:
+                        print(f"⚠️ 재학습 중 화면 불안정 (diff={_cur_diff:.1f}) → 재학습 중단, 안정 대기 복귀")
+                        st.relearning = False
+                        st.waiting_stable = True
+                        st.stable_since_frame = st.frame_num
+                        self.flow.reset()                          # 오염된 flow_map 초기화
+                        _relearn_smoothed_80 = False
+                        _relearn_smoothed_95 = False
+                        # GRU feature 이력도 초기화 — 재학습 중 수집된 오염 데이터 제거
+                        self._gru_feature_history_a = []
+                        self._gru_feature_history_b = []
+                        self._gru_pretrain_pending_a = False
+                        self._gru_pretrain_pending_b = False
+                        if self.gru_module_a is not None:
+                            self.gru_module_a.reset()
+                        if self.gru_module_b is not None:
+                            self.gru_module_b.reset()
 
             # ── 초기 학습 완료 처리 ──
             if st.is_learning:                                      # 학습 모드일 때만 체크
@@ -431,6 +579,9 @@ class Detector:
                     self._compute_direction_cell_counts()           # 방향별 셀 수 계산 → TA 주입
                     if cfg.flow_map_path:                           # 저장 경로 있으면
                         self.flow.save(cfg.flow_map_path)           # flow_map만 저장
+                        # ref_frame 저장 — 다음 실행 시 자동 매칭에 사용
+                        if _MATCHER_AVAILABLE:
+                            save_ref_frame(frame, cfg.flow_map_path.parent)
                     st.is_learning = False                          # 학습 모드 종료
                     print(f"학습 완료! (frame={st.frame_num})")
                     # GRU pretrain: 버퍼에 쌓인 feature로 자기지도 사전학습
@@ -455,6 +606,9 @@ class Detector:
                     self._compute_direction_cell_counts()           # 방향별 셀 수 재계산 → TA 주입
                     if cfg.flow_map_path:                           # 저장 경로 있으면
                         self.flow.save(cfg.flow_map_path)           # flow_map만 저장 (baseline 미포함)
+                        # ref_frame 갱신 — 카메라 전환 후 새 화면으로 매칭 기준 교체
+                        if _MATCHER_AVAILABLE:
+                            save_ref_frame(frame, cfg.flow_map_path.parent)
                     st.relearning = False                           # 재학습 모드 종료
                     st.cooldown_until = st.frame_num + cfg.cooldown_frames  # 쿨다운 설정
                     self.switch.set_reference(frame)                # 새 기준 프레임 설정
@@ -486,7 +640,7 @@ class Detector:
                 # 개선: 궤적 3점 이상이면 velocity 벡터로 즉시 분류
                 #       원거리 차량은 YOLO가 자주 끊겨 traj<20인 경우 많음 →
                 #       velocity_window(20) 대기 없이 조기 정확 분류
-                if not st.is_learning and not st.relearning and self._ref_direction is not None:
+                if not st.is_learning and not st.relearning and not st.waiting_stable and self._ref_direction is not None:
                     _traj_dir = st.trajectories[tid]                # 이번 프레임 추가 전 궤적
                     _DIR_WIN = min(cfg.velocity_window, len(_traj_dir))  # 가용 최대 window
                     if _DIR_WIN >= 3:                               # 3포인트 이상이면 velocity 사용
@@ -506,14 +660,33 @@ class Detector:
                         self._track_direction[tid] = self._classify_direction(fx, fy)
 
                 # ID 재매칭 시도 (학습 모드가 아닐 때만)
-                if not st.is_learning and not st.relearning:        # 탐지 모드일 때만
+                if not st.is_learning and not st.relearning and not st.waiting_stable:        # 탐지 모드일 때만
                     self.idm.check_reappear(tid, cx, cy)            # 재매칭 시도
 
                 # 궤적에 현재 위치 추가 — 첫 등장 3프레임은 YOLO 초기 bbox가 불안정하므로 건너뜀
                 # EMA 스무딩 적용: bbox jitter가 velocity 벡터에 미치는 영향 완화
                 # alpha=0.4: 현재 40% + 직전 60% → 갑작스러운 위치 튐을 흡수
+                # 프레임 스킵 시: 궤적 추가 자체를 건너뜀 → 이상 변위가 궤적에 남지 않음
                 _age = st.frame_num - st.first_seen_frame.get(tid, st.frame_num)  # 트랙 경과 프레임
-                if _age >= 3:                                        # 3프레임 이상 된 트랙만 궤적 추가
+
+                # 개별 차량 단독 jump 체크 (프레임 스킵 미감지 시에도 1대가 튀는 경우)
+                _solo_jump = False
+                if st.trajectories[tid]:
+                    _prev_fx, _prev_fy = st.trajectories[tid][-1]
+                    _solo_dist = ((fx - _prev_fx)**2 + (fy - _prev_fy)**2) ** 0.5
+                    if _solo_dist > _jump_thr * 1.5:                # 단독 jump는 더 엄격한 기준
+                        _solo_jump = True
+                        # traj 전체를 현재 위치로 덮어씀
+                        # → velocity 계산 구간(traj[-window]→traj[-1]) 안에
+                        #   jump 전 좌표가 남으면 다음 프레임에도 오탐 벡터가 계산됨
+                        _cur_pos = (fx, fy)
+                        st.trajectories[tid] = [_cur_pos] * len(st.trajectories[tid])
+                        st.last_velocity.pop(tid, None)             # 방향 벡터 리셋
+                        st.wrong_way_count[tid] = 0                 # 누적 카운트 리셋
+                        st.direction_change_frame[tid] = st.frame_num  # guard 발동: velocity_window 동안 판정 차단
+                        st.wrong_way_ids.discard(tid)               # 스킵 직전 확정됐으면 취소
+
+                if _age >= 3 and not _is_frame_skip and not _solo_jump:
                     _traj_cur = st.trajectories[tid]
                     if _traj_cur:                                    # 이전 점이 있으면 EMA 스무딩
                         _px, _py = _traj_cur[-1]
@@ -547,7 +720,7 @@ class Detector:
                     # flow_map 기반(_classify_direction)은 미학습 셀(상단)에서
                     # nearest-neighbor가 반대 방향 셀을 반환해 오분류 발생.
                     # velocity 벡터(vdx, vdy)는 실제 이동 방향 → 더 신뢰도 높음.
-                    if (not st.is_learning and not st.relearning
+                    if (not st.is_learning and not st.relearning and not st.waiting_stable
                             and self._ref_direction is not None
                             and mag > 1.0):                         # 최소 이동 확인
                         _vn_x = vdx / mag                          # 정규화 속도 x
@@ -572,7 +745,9 @@ class Detector:
                         speeds[tid] = speed                         # 속도 딕셔너리 갱신 (이미 mag이나 명시적 유지)
 
                         _learn_min_mag = max(1.0, _bh * cfg.norm_learn_threshold)  # nm 역산 최소 mag (학습·온라인 공용)
-                        if st.is_learning or st.relearning:         # 학습/재학습 모드
+                        if _is_frame_skip or _solo_jump:            # 프레임 스킵·단독 jump → 학습/판정 스킵
+                            pass
+                        elif st.is_learning or st.relearning:       # 학습/재학습 모드
                             self.flow.learn_step(                   # 흐름장 업데이트 (footpoint 기준)
                                 traj[-cfg.velocity_window][0],
                                 traj[-cfg.velocity_window][1],
@@ -743,7 +918,7 @@ class Detector:
 
             # ── 방향별 TrafficAnalyzer·GRU 갱신 ──────────────────────────
             if (self.traffic_analyzer_a is not None                 # 초기화 완료 확인
-                    and not st.is_learning and not st.relearning):  # 탐지 모드일 때만
+                    and not st.is_learning and not st.relearning and not st.waiting_stable):  # 탐지 모드일 때만
                 # A방향 정체 탐지 갱신
                 self.traffic_analyzer_a.update(tracks_a, speeds_a, st.frame_num)
                 self.predictor_a.update(self.traffic_analyzer_a.get_avg_speed())
@@ -751,19 +926,30 @@ class Detector:
                 self.traffic_analyzer_b.update(tracks_b, speeds_b, st.frame_num)
                 self.predictor_b.update(self.traffic_analyzer_b.get_avg_speed())
 
+                # ── GRU 로그 수집 신뢰도 판단 ────────────────────────────
+                # 탐지 차량이 너무 적거나(야간·안개) 프레임이 너무 어두우면
+                # feature가 실제 교통 상황을 반영하지 못함 → 로그 스킵
+                _min_veh = getattr(cfg, "gru_min_vehicles_for_log", 3)
+                _min_bri = getattr(cfg, "gru_min_brightness_for_log", 0.0)
+                _total_tracks = len(tracks_a) + len(tracks_b)       # 전체 탐지 차량 수
+                _brightness_ok = True
+                if _min_bri > 0:                                    # 밝기 필터 활성 시
+                    import numpy as _np
+                    _gray_mean = float(_np.mean(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)))
+                    _brightness_ok = (_gray_mean >= _min_bri)
+                _feature_reliable = (_total_tracks >= _min_veh and _brightness_ok)
+
                 # ── feature 누적 (A방향) — pretrain·로그 공용 ─────────────
-                # pretrain_pending 여부와 무관하게 항상 수집
-                # → 세션이 달라져도 로그가 쌓여 점점 다양한 패턴 학습 가능
+                # 신뢰도 필터 통과 시에만 수집 — 오학습 방지
                 if self.gru_module_a is not None and st.frame_num % self._log_interval == 0:
                     feat_a = self.traffic_analyzer_a.get_last_feature()
-                    if feat_a is not None:
+                    if feat_a is not None and _feature_reliable:
                         self._gru_feature_history_a.append(feat_a)  # pretrain용 메모리 누적
-                        # 로그 파일 실시간 append는 매 프레임 I/O 대신 세션 종료 시 일괄 저장
 
                 # ── feature 누적 (B방향) ──────────────────────────────────
                 if self.gru_module_b is not None and st.frame_num % self._log_interval == 0:
                     feat_b = self.traffic_analyzer_b.get_last_feature()
-                    if feat_b is not None:
+                    if feat_b is not None and _feature_reliable:
                         self._gru_feature_history_b.append(feat_b)
 
                 # ── GRU pretrain / 재학습 (A방향) ────────────────────────
@@ -833,15 +1019,15 @@ class Detector:
 
                 # ── GRU online_step: 매 프레임 현재 레벨로 실시간 학습 ──────
                 # SMOOTH만 학습하던 방식 → 전체 레벨 학습으로 확장
-                # 이유: 하루종일 실행 시 아침 러시(CONGESTED), 낮(SMOOTH), 저녁 러시(SLOW) 등
+                # 이유: 하루종일 실행 시 아침 러시(JAM), 낮(SMOOTH), 저녁 러시(SLOW) 등
                 #       다양한 패턴을 실시간으로 반영해야 예측 정확도가 올라감
-                _level_map = {"SMOOTH": 0, "SLOW": 1, "CONGESTED": 2}
-                if self.gru_module_a is not None:
+                _level_map = {"SMOOTH": 0, "SLOW": 1, "JAM": 2}
+                if self.gru_module_a is not None and _feature_reliable:  # 신뢰 구간만 학습
                     _lv_a = self.traffic_analyzer_a.get_congestion_level()
-                    self.gru_module_a.online_step(label=_level_map[_lv_a])  # 전체 레벨 학습
-                if self.gru_module_b is not None:
+                    self.gru_module_a.online_step(label=_level_map[_lv_a])
+                if self.gru_module_b is not None and _feature_reliable:  # 신뢰 구간만 학습
                     _lv_b = self.traffic_analyzer_b.get_congestion_level()
-                    self.gru_module_b.online_step(label=_level_map[_lv_b])  # 전체 레벨 학습
+                    self.gru_module_b.online_step(label=_level_map[_lv_b])
 
                 # ── flow_map speed_ref 온라인 학습 (SMOOTH 구간만) ────────
                 # SMOOTH 구간의 nm을 셀별로 EMA 축적 → 위치별 정상속도 기준 확보
@@ -886,8 +1072,17 @@ class Detector:
                             (fw // 2 - 240, 40),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 200, 100), 2, cv2.LINE_AA)
 
+            # 안정 대기 중이면 화면 상단에 대기 텍스트 표시
+            elif st.waiting_stable:                                 # 안정 대기 모드이면
+                stable_frames = st.frame_num - st.stable_since_frame
+                remain = max(0, _stability_required_frames - stable_frames)
+                remain_sec = remain / max(fps, 1)
+                cv2.putText(frame, f"CAMERA MOVED - WAITING STABLE: {remain_sec:.1f}s",
+                            (fw // 2 - 240, 40),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2, cv2.LINE_AA)
+
             # 재학습 중이면 화면 상단에 상태 텍스트 표시
-            elif st.relearning:                                     # 재학습 모드이면 (elif — 동시 표시 방지)
+            elif st.relearning:                                     # 재학습 모드이면
                 elapsed = st.frame_num - st.relearn_start_frame     # 경과 프레임
                 progress = min(100, elapsed / cfg.relearn_frames * 100)  # 진행률 (%)
                 cv2.putText(frame, f"CAMERA SWITCHED - RE-LEARNING: {progress:.0f}%",
@@ -895,7 +1090,7 @@ class Detector:
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2, cv2.LINE_AA)
 
             # ── 방향별 정체 상태 패널 표시 (좌하단) ────────────────────
-            if st.is_learning or st.relearning:                     # 학습/재학습 중이면
+            if st.is_learning or st.relearning or st.waiting_stable:  # 학습·재학습·대기 중이면
                 self.vis.draw_learning_status(frame, st.frame_num)  # "데이터 수집 중" 패널 표시
             elif self.traffic_analyzer_a is not None:               # 탐지 모드 + 초기화 완료 확인
                 level_a     = self.traffic_analyzer_a.get_congestion_level()  # A방향 정체 레벨
@@ -911,6 +1106,13 @@ class Detector:
                         level_b, jam_score_b, dur_sec_b,            # B방향 데이터
                         label_a=self._dir_label_a,                  # "UP" 또는 "DOWN"
                         label_b=self._dir_label_b                   # "DOWN" 또는 "UP"
+                    )
+                    # ── 미래 예측 패널 (1·3·5분 후) ─────────────────────
+                    pred_a = self.traffic_analyzer_a.get_direct_prediction()
+                    pred_b = self.traffic_analyzer_b.get_direct_prediction()
+                    self.vis.draw_prediction_panel(
+                        frame, pred_a, pred_b,
+                        label_a=self._dir_label_a                   # A방향 레이블로 Down/Up 자동 배치
                     )
 
             # FPS 계산 및 표시
@@ -955,7 +1157,8 @@ class Detector:
         cap.release()                                               # 비디오 캡처 해제
         if writer:
             writer.release()                                        # 비디오 라이터 해제
-        cv2.destroyAllWindows()                                     # 모든 OpenCV 창 닫기
+        if not is_stream:                                           # 파일 재생 완료 시에만 창 닫기
+            cv2.destroyAllWindows()                                 # 스트림은 URL 갱신 후 재사용하므로 유지
 
         # 학습이 완료되지 않은 채로 종료된 경우 마지막 flow_map 저장
         if not st.is_learning and cfg.flow_map_path:                # 학습 완료 상태이면
@@ -989,7 +1192,10 @@ class Detector:
         # detection_stats에 기록된 역주행 차량(라벨)의 수 = 최종 역주행 차량 수
         total_wrong = len(st.detection_stats)                       # 총 역주행 차량 수
 
-        print(f"\n✅ 저장 완료: {save_path} ({st.frame_num} 프레임)")
+        if save_path:
+            print(f"\n✅ 저장 완료: {save_path} ({st.frame_num} 프레임)")
+        else:
+            print(f"\n✅ 완료 ({st.frame_num} 프레임, 녹화 없음)")
         print(f"   총 역주행 차량: {total_wrong}대")
 
         # 각 역주행 라벨(W1, W2...)에 어떤 ID들이 쓰였는지 출력
