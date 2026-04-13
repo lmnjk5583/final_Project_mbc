@@ -19,7 +19,6 @@
 | 요청 유형 | 읽을 파일 (순서대로) |
 |-----------|----------------------|
 | 개발 관련 작업 (src/ 코드, 테스트, 설계) | **`Docs/dev_guide.md`** + **`Docs/dev_guide_phase2.md`** (Phase 1·2 모두 완료) |
-| **웹 개발 작업 (C:\finalPj_웹)** | **`C:\finalPj_웹\dev_guide_web.md`** (API·구조·현황·미구현 항목) |
 | 현재 상태 파악 / 어디까지 했는지 | `work_log.md` |
 | 전체 계획 / 마일스톤 | `Docs/plan.md` |
 | 논문 근거 / 조치 권고 상세 | `Docs/research.md` |
