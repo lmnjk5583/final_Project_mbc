@@ -830,20 +830,16 @@ class Detector:
                     st.wrong_way_last_pos[tid] = (cx, cy, st.frame_num)  # 위치 기록
 
                 # ── 시각화 ──
-                # W키 OFF 시 역주행 차량은 정상 차량처럼 표시 (경고 박스/붉은 궤적 숨김)
-                _show_as_wrong = is_wrong_display and self.vis.show_wrongway
-
                 if self.vis.show_trails:                            # 궤적 표시 활성화 시
-                    self.vis.draw_trajectory(frame, tid, _show_as_wrong)
+                    self.vis.draw_trajectory(frame, tid, is_wrong_display)
 
                 if self.vis.show_direction and speed > 3:           # 방향 화살표 활성화 시
                     self.vis.draw_direction_arrow(frame, cx, cy, ndx, ndy,
-                                                 speed, _show_as_wrong)
+                                                 speed, is_wrong_display)
 
-                if _show_as_wrong:                                  # 역주행 패널 ON + 역주행 차량
+                if is_wrong_display:                                # 역주행 차량은 항상 경고 표시
                     self.vis.draw_wrong_way_alert(frame, tid, x1, y1, x2, y2)      # 경고 표시
-                elif self.vis.show_bbox or (is_wrong_display and not self.vis.show_wrongway):
-                    # B키 ON 이거나 역주행인데 W키 OFF인 경우 → 일반 박스로 표시
+                elif self.vis.show_bbox:                            # 정상 차량은 B키 ON일 때만
                     self.vis.draw_normal_box(frame, tid, x1, y1, x2, y2)           # 초록 박스
 
                 if self.vis.show_speed and speed > 3:               # 속도 표시 활성화 시
