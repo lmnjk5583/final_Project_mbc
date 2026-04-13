@@ -4,6 +4,33 @@
 
 ---
 
+## 2026-04-13 (93차 — 역주행 오탐 수정 + W키 단축키) [대원]
+
+### 오늘 한 작업
+
+**역주행 오탐 수정 (순간이동 오감지 근본 원인 제거)**
+- `judge.py`: `dir_jump_filtered` 조기 리턴 시 `direction_change_frame` 즉시 세트 + `wrong_way_count=0`
+  - 기존: 방향 급변 감지 후 1프레임 공백 → 후속 프레임에서 wrong_count 누적 가능
+  - 수정: 급변 감지와 동시에 120프레임 guard 발동 → 완전 차단
+- `detector.py`: solo_jump 기준 배수 `1.5 → 1.2` (단독 차량 순간이동 탐지 범위 확대)
+
+**역주행 패널 W키 토글**
+- `visualizer.py`: `show_wrongway=True` 플래그 추가, `W`키 핸들러 등록
+- `detector.py`: `_show_as_wrong` 변수로 역주행 시각화 통합 게이팅
+  - W키 OFF → 역주행 차량도 일반 박스(초록)로만 표시, 경고 텍스트/붉은 궤적 숨김
+
+### 수정 파일
+`src/judge.py`, `src/detector.py`, `src/visualizer.py`
+
+### 발생 오류 / 해결
+- dir_jump_filtered가 direction_change_frame을 세트하지 않아 guard 1프레임 공백 → 즉시 세트로 해결
+
+### 작업 재개 위치
+- `python run_its_live.py` 실행 후 역주행 오탐 빈도 확인
+- 여전히 오탐 발생 시: `wrong_count_threshold` 15→20 상향 검토
+
+---
+
 ## 2026-04-12 (92차 — GRU 직접예측·연속학습·ITS 실시간 실행기) [대원]
 
 ### 오늘 한 작업
