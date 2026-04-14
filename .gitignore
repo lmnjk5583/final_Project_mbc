@@ -12,3 +12,8 @@ runs/
 *.pt
 *.pkl
 *.npy
+
+# ── 문서 (로컬 전용 — work_log 제외) ──
+*.md
+!work_log.md
+!work_log_archive.md
