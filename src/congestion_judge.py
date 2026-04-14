@@ -71,7 +71,7 @@ def compute_jam_score_fallback(x_t: dict) -> float:
     # occ_gate  : flow_occ 0.06 이하=0.0, 0.26 이상=1.0 — 빈 도로에서 cds 억제
     # scale_gate: 두 조건 모두 충족해야 체류 신호를 최대 반영
     count_gate = _clip((known_cnt - 2) / 10.0, 0.0, 1.0)     # 2대 이하는 0, 12대면 1.0 (13→10: 6fps 저감지 환경 보정)
-    occ_gate   = _clip((flow_occ - 0.06) / 0.20, 0.0, 1.0)   # 점유율 낮으면 0, 0.26 이상이면 1.0 (원래 기준 복구)
+    occ_gate   = _clip((flow_occ - 0.06) / 0.30, 0.0, 1.0)   # 점유율 낮으면 0, 0.36 이상이면 1.0 (0.20→0.30: 서행 밀도에서 gate 조기 개방 방지)
     scale_gate = count_gate * occ_gate                         # 두 게이트의 곱 (AND 조건)
 
     # ── 3) 핵심 jam 계산 ─────────────────────────────────────────────
@@ -81,7 +81,7 @@ def compute_jam_score_fallback(x_t: dict) -> float:
     # 위 세 신호 모두 scale_gate로 스케일 — 저규모에서 과대 반응 방지
     # 0.12×sqrt(flow_occ): scale_gate 없는 기저 신호 — 차량 많을수록 최소 jam 보장
     core = (
-        1.50 * cds                   # 셀 누적 EMA (주 신호) — 1.30→1.50: count/occ gate 강화로 소수오탐 막으므로 가중치 복구
+        1.30 * cds                   # 셀 누적 EMA (주 신호) — 1.50→1.30: 서행 cds(0.40~0.50)가 JAM 임계를 넘지 않게 억제
         + 0.25 * persist             # 점유 지속성 (보조)
         + 0.10 * math.sqrt(dwell)    # 체류 셀 비율 (sqrt 비선형)
     )
