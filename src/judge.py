@@ -95,6 +95,21 @@ class WrongWayJudge:
         _min_age = getattr(cfg, "min_wrongway_track_age", 30)
         _track_age = st.frame_num - st.first_seen_frame.get(track_id, st.frame_num)
         if _track_age < _min_age:
+            # age gate 중에도 정방향 주행 여부를 기록 → sudden_change_rejected 가드가 올바르게 동작
+            #
+            # [핵심 설계 의도]
+            # 처음부터 역주행하는 차량: age gate 동안 cos < threshold → lcf 갱신 안 됨 → lcf=0 유지
+            #   → age gate 해제 후 wrong_count 누적 → 확정 가능 (오탐 아님)
+            # 정방향 주행 중 글리치로 갑자기 역방향: age gate 동안 cos >= threshold → lcf 갱신됨
+            #   → age gate 해제 직후 역방향으로 바뀌면 fsf-lcf < guard_frames → 확정 거부 (오탐 방지) ✓
+            _bh_c = max(bbox_h, cfg.min_bbox_h)                     # bbox_h 클램프
+            _nm   = speed / _bh_c                                   # 정규화 속도
+            if _nm >= cfg.norm_speed_gate_threshold and traj:       # 속도 충분 + 궤적 있으면
+                _fv = self.flow.get_interpolated(traj[-1][0], traj[-1][1])  # 현재 위치 flow 조회
+                if _fv is not None:
+                    _cos = float(ndx * _fv[0] + ndy * _fv[1])      # 방향 코사인
+                    if _cos >= cfg.cos_threshold:                   # 정방향 확인 (threshold 이상)
+                        st.last_correct_frame[track_id] = st.frame_num  # 정상 주행 기록
             return False, 0, {"status": "too_young", "cos_values": []}
 
         # ── nm 기반 속도 게이트 (원근 정규화) ───────────────────────────

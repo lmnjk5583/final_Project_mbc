@@ -22,8 +22,8 @@ class DetectorConfig:
     velocity_window: int = 10         # 속도/방향 계산 프레임 간격 — 원거리 상행 차량 ID 수명 짧아 10으로 설정
     base_speed_threshold: float = 7.0 # 기본 속도 임계값 (원근에 따라 가중을 곱해 사용)
     cos_threshold: float = -0.75      # 코사인 유사도 임계값 (원본값 복원 — smoothing 오염 방지로 오탐 차단)
-    wrong_count_threshold: int = 15   # 역주행 확정까지 필요한 연속 의심 횟수 — 8→12→15 (오탐 감소)
-    min_wrongway_track_age: int = 30  # 역주행 판정 시작까지 최소 추적 프레임 수 — 합류·ID 리셋 직후 오탐 차단
+    wrong_count_threshold: int = 25   # 역주행 확정까지 필요한 연속 의심 횟수 — 15→25 (10fps 기준 2.5초 지속)
+    min_wrongway_track_age: int = 45  # 역주행 판정 시작까지 최소 추적 프레임 수 — 30→45 (ID 초기 불안정 기간 추가 커버)
     vote_threshold: float = 0.7       # 투표 시 역방향 비율 임계값 (원본값 복원 — 60% 이상이면 역주행 의심)
     min_move_distance: float = 10.0    # 최소 누적 이동 거리 (이하면 정지로 판단) — 원래 20.0, 원거리 CCTV 대응 완화
     min_move_per_frame: float = 0.4   # 프레임당 평균 이동거리 (이하면 정지) — 원래 1.5, 원거리 CCTV 대응 완화
@@ -61,7 +61,7 @@ class DetectorConfig:
     log_interval_frames: int = 5        # 트랙/프레임 로그를 N프레임마다 기록
 
     # ==================== 정체 탐지 히스테리시스 ====================
-    congestion_hysteresis_sec: float = 7.0   # 정체 레벨 전환 유지 시간 (초) — 3.0→7.0: 순간 변동으로 인한 레벨 오락가락 방지
+    congestion_hysteresis_sec: float = 3.0   # 정체 레벨 전환 유지 시간 (초) — 3.0→7.0: 순간 변동으로 인한 레벨 오락가락 방지
 
     # ==================== 초기 확정 구간 (학습 완료 직후) ====================
     initial_confirm_sec:     float = 5.0     # 학습 완료 후 이 시간 동안 초기 히스테리시스 적용
