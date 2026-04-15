@@ -126,8 +126,8 @@ def print_results(results, title="평가 결과"):
 
 
 def main():
-    DATA_ROOT    = Path(r"N:\개인\대원&수빈\최종 프로젝트\capture")
-    PROJECT_ROOT = Path(r"C:\final_pj")
+    DATA_ROOT    = Path(r"N:\개인\대원&수빈\최종 프로젝트\capture4")
+    PROJECT_ROOT = Path(r"N:\개인\대원&수빈\최종 프로젝트")
 
     # ✅ 수정: GPU 자동 감지
     DEVICE = 0 if torch.cuda.is_available() else 'cpu'
@@ -186,7 +186,7 @@ def main():
         # ---- 기본 설정 ----
         epochs=150,                 # 최대 에폭 수 (최대 200까지, patience로 조기 종료)
         imgsz=640,                  # 학습/검증에 사용할 입력 이미지 크기 (640x640)
-        batch=8,                    # 배치 크기 (한 번에 올리는 이미지 수)
+        batch=16,                    # 배치 크기 (한 번에 올리는 이미지 수)
         patience=20,                # 30에폭 동안 성능 향상 없으면 조기 종료
         device=DEVICE,              # GPU 번호 (자동 감지된 DEVICE 사용)
         workers=2,                  # DataLoader 병렬 작업자 수 (RAM/OOM 고려해서 2)
@@ -206,9 +206,11 @@ def main():
         copy_paste=0.1,             # Copy-Paste 증강 비율 (객체를 잘라 다른 이미지에 붙이기)
         degrees=0.0,                # 회전 각도 범위 (CCTV 고정이므로 0)
         perspective=0.0,            # 원근 변환 강도 (CCTV 자체가 원근이라 추가 변환 X)
+        # scale=0.5,
+        # erasing=0.1,
 
         project=str(PROJECT_ROOT / "runs"),
-        name="yolo11n_v1",
+        name="yolo11n_v6",
     )
 
     # ============================================================
@@ -219,7 +221,7 @@ def main():
     # ============================================================
     # 5단계: Test 평가
     # ============================================================
-    best_pt = PROJECT_ROOT / "runs" / "yolo11n_v1" / "weights" / "best.pt"
+    best_pt = PROJECT_ROOT / "runs" / "yolo11n_v6" / "weights" / "best.pt"
 
     if not best_pt.exists():
         candidates = list((PROJECT_ROOT / "runs").rglob("best.pt"))

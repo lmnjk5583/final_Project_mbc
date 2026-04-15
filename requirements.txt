@@ -1,0 +1,18 @@
+# 고속도로 CCTV 교통 흐름 모니터링 시스템
+# 의존성 패키지 목록
+# pip install -r requirements.txt
+
+# 딥러닝 및 컴퓨터 비전
+ultralytics>=8.3.0
+torch>=2.0.0
+torchvision>=0.15.0
+opencv-python>=4.8.0
+
+# 데이터 처리
+numpy>=1.24.0
+
+# 시각화
+matplotlib>=3.7.0
+
+# PDF 생성 (보고서 생성용)
+reportlab>=4.0.0

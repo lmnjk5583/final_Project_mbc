@@ -81,7 +81,7 @@ def compute_jam_score_fallback(x_t: dict) -> float:
     # 위 세 신호 모두 scale_gate로 스케일 — 저규모에서 과대 반응 방지
     # 0.12×sqrt(flow_occ): scale_gate 없는 기저 신호 — 차량 많을수록 최소 jam 보장
     core = (
-        1.30 * cds                   # 셀 누적 EMA (주 신호) — 1.50→1.30: 서행 cds(0.40~0.50)가 JAM 임계를 넘지 않게 억제
+        1.10 * cds                   # 셀 누적 EMA (주 신호) — 1.30→1.10: 6fps 환경 서행 cds(0.30~0.50)가 JAM 임계(0.60) 초과 방지
         + 0.25 * persist             # 점유 지속성 (보조)
         + 0.10 * math.sqrt(dwell)    # 체류 셀 비율 (sqrt 비선형)
     )

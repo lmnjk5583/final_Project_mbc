@@ -271,6 +271,45 @@ class WrongWayJudge:
             debug_info["status"] = "long_window_ok"   # 장기 윈도우 통과로 필터링
             return False, disagree_ratio, debug_info
 
+        # ── 고신뢰 즉시 확정 (fast-track) ───────────────────────────────
+        # 단기/장기 투표 모두 역방향 + 압도적 비율 + 고속 + age gate 이후 정방향 없었음
+        # wrong_count 누적 없이 바로 전체 궤적 검증 → 확정
+        # [수정] age gate 기간(first_seen~first_seen+min_age) 중 기록된 lcf는 방향 벡터 노이즈이므로 무시.
+        #        age gate 이후에 한 번도 정방향으로 판정된 적 없어야 fast-track 허용.
+        _lcf_ft = st.last_correct_frame.get(track_id, 0)
+        # age gate 해제 직후 velocity_window 동안 방향 벡터가 아직 전환 중 → lcf 갱신은 노이즈.
+        # age_gate_end + velocity_window 이내의 lcf는 전환 노이즈로 간주하고 fast-track 허용.
+        _age_gate_end_ft = (st.first_seen_frame.get(track_id, 0)
+                            + _min_age + cfg.velocity_window)
+        if (disagree_ratio >= cfg.fast_confirm_ratio    # 투표 압도적 역방향
+                and nm_speed >= cfg.fast_confirm_speed  # 중속 이상 (서행 오탐 방지)
+                and _lcf_ft <= _age_gate_end_ft):       # velocity_window 안정화 이후 정방향 없었음
+            # 전체 궤적 방향 검증 (일반 경로와 동일)
+            # flow를 한 곳도 못 찾으면 확정 불가 (_ft_ok=False) — bypass 금지
+            _ft_ok = False
+            if len(traj) >= cfg.velocity_window:
+                _gvdx = traj[-1][0] - traj[0][0]
+                _gvdy = traj[-1][1] - traj[0][1]
+                _gmag = np.sqrt(_gvdx**2 + _gvdy**2)
+                if _gmag > cfg.min_move_distance:
+                    _gndx, _gndy = _gvdx / _gmag, _gvdy / _gmag
+                    for _ti in [-1, 0, len(traj) // 2]:
+                        _fv = self.flow.get_interpolated(traj[_ti][0], traj[_ti][1])
+                        if _fv is not None:
+                            _gc = float(_gndx * _fv[0] + _gndy * _fv[1])
+                            _ft_ok = (_gc < self._get_cos_threshold(
+                                traj[_ti][0], traj[_ti][1], level="global"))
+                            debug_info["global_cos"] = round(_gc, 4)
+                            break
+            if _ft_ok:
+                st.wrong_way_ids.add(track_id)
+                debug_info["status"] = "FAST_CONFIRMED"
+                _gc_str = f", global_cos={debug_info['global_cos']}" if debug_info.get("global_cos") is not None else ", global_cos=None(bypassed)"
+                print(f"   🚨 ID:{track_id} 역주행 즉시 확정 "
+                      f"(fast-track, frame={st.frame_num}, "
+                      f"disagree={disagree_ratio:.2f}, nm={nm_speed:.2f}{_gc_str})")
+                return True, disagree_ratio, debug_info
+
         # ── 의심 카운트 증가 (단기·장기 모두 역방향 통과) ───────────────
         if track_id not in st.first_suspect_frame:     # 첫 의심 시작 기록
             st.first_suspect_frame[track_id] = st.frame_num
@@ -283,15 +322,20 @@ class WrongWayJudge:
         # ── 의심 횟수 임계값 도달 → 확정 전 다단계 검증 ─────────────────
         if st.wrong_way_count[track_id] >= cfg.wrong_count_threshold:
 
-            # ── ★ 방향 급변 필터 (사용자 요청) ─────────────────────────
+            # ── ★ 방향 급변 필터 ────────────────────────────────────────
             # 정상 주행 중인 차량이 갑자기 역방향으로 바뀌면 CCTV 글자/오클루전 가능.
-            # last_correct_frame이 기록되어 있고(한 번이라도 정상으로 판정된 적 있고)
-            # 의심 시작(first_suspect_frame)이 마지막 정상 프레임으로부터
-            # direction_change_guard_frames 이내이면 → 급변으로 판정 → 확정 거부.
-            # 실제 역주행 차량은 처음부터 역방향이므로 last_correct_frame=0 → 이 검사 통과.
+            # [수정] age gate 기간 중 기록된 lcf는 방향 벡터 노이즈이므로 무시.
+            #        age gate 이후(lcf > _age_gate_end)에 정방향이 확인된 차량에 대해서만 급변 필터 적용.
+            #        실제 처음부터 역주행 차량: age gate 기간에 lcf가 노이즈로 기록돼도 필터 통과.
             lcf = st.last_correct_frame.get(track_id, 0)       # 마지막 정상 프레임
             fsf = st.first_suspect_frame.get(track_id, 0)      # 첫 의심 프레임
-            if lcf > 0 and (fsf - lcf) <= cfg.direction_change_guard_frames:
+            # age gate 해제 후 velocity_window 동안은 방향 벡터 전환 노이즈 → 이 기간 lcf는 무시.
+            # 실제 처음부터 역주행 차량: lcf가 이 경계 이내에 있어 급변 필터 통과.
+            # 정방향 주행 후 급변 차량: lcf가 경계 이후에 기록되어 급변 필터 적용.
+            _scr_boundary = (st.first_seen_frame.get(track_id, 0)
+                             + _min_age + cfg.velocity_window)
+            if (lcf > _scr_boundary                            # 안정화 이후 정상 주행 확인
+                    and (fsf - lcf) <= cfg.direction_change_guard_frames):  # 급변 거리 이내
                 st.wrong_way_count[track_id] = 0               # 카운트 완전 리셋
                 debug_info["status"] = "sudden_change_rejected" # 급변 거부
                 return False, disagree_ratio, debug_info
@@ -299,14 +343,17 @@ class WrongWayJudge:
             # ── ① 전체 궤적 방향 최종 검증 ──────────────────────────────
             # 저장된 전체 궤적(traj[0]→traj[-1])의 시작→끝 방향도 역방향이어야 최종 확정.
             # 의심 카운트가 쌓이는 도중 전체 이동은 사실 정방향인 경우(합류·차선변경)를 걸러냄.
-            global_ok = True                           # 기본값: 패스 (궤적 짧으면 생략)
+            # flow를 한 곳도 못 찾으면 확정 불가 (bypass 금지 — eroded 맵에서 오탐 방지)
+            global_ok = False                          # 기본값: 패스 불가 (flow 없으면 확정 금지)
 
             if len(traj) >= cfg.velocity_window:       # 단기 윈도우 이상 궤적 있을 때
                 gvdx = traj[-1][0] - traj[0][0]       # 전체 궤적 시작→끝 x 이동
                 gvdy = traj[-1][1] - traj[0][1]       # 전체 궤적 시작→끝 y 이동
                 gmag = np.sqrt(gvdx**2 + gvdy**2)     # 전체 이동 크기
 
-                if gmag > cfg.min_move_distance:       # 전체 이동이 충분할 때만
+                if gmag <= cfg.min_move_distance:      # 이동 부족 = 정지/서행 → flow 방향 의존
+                    global_ok = True                   # 이동 없으면 방향 검증 생략 (단기 투표에 위임)
+                else:
                     gndx = gvdx / gmag                 # 전체 단위 x 방향
                     gndy = gvdy / gmag                 # 전체 단위 y 방향
 
@@ -325,12 +372,11 @@ class WrongWayJudge:
                             gndx * flow_v_global[0] + gndy * flow_v_global[1]
                         )
                         debug_info["global_cos"] = round(global_cos, 4)  # 디버그 기록
-                        # ── 개선 3: 전체 궤적 확정은 완화 없음 (원본 threshold) ──
-                        # 최종 확정 단계는 가장 엄격해야 함 — smoothed 셀이어도 -0.75 적용
                         global_threshold = self._get_cos_threshold(  # global 레벨 → 항상 원본
                             try_x, try_y, level="global"
                         )
                         global_ok = (global_cos < global_threshold)  # 역방향이어야 확정
+                    # flow_v_global=None: 3곳 모두 flow 없음 → global_ok=False (확정 불가)
 
             if global_ok:                              # 전체 궤적도 역방향 → 최종 확정
                 st.wrong_way_ids.add(track_id)         # 역주행 차량으로 등록

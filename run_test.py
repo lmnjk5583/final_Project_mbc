@@ -15,13 +15,12 @@ sys.path.insert(0, str(PROJECT_ROOT))                   # from src import ... �
 from src import Detector, DetectorConfig                # src/__init__.py 경유
 
 # ── 경로 설정 ──────────────────────────────────────────────────────
-MODEL_PATH = PROJECT_ROOT / "runs" / "yolo11n_v2" / "weights" / "best.pt"  # YOLO 모델 가중치
+MODEL_PATH = PROJECT_ROOT / "runs" / "yolo11n_v6" / "weights" / "best.pt"  # YOLO 모델 가중치
 
 VIDEO_DIR = Path(                                       # 영상이 들어있는 폴더
-    r"N:\개인\대원&수빈\최종 프로젝트"
-    r"\임시"
+    r"N:\개인\박대원\0211~0313_miniproject\highway-anomaly-detection\data"
 )
-VIDEO_FILE = "서행_테스트.mp4"          # 실행할 영상 파일명
+VIDEO_FILE = "역주행테스트.mp4"          # 실행할 영상 파일명
 
 FLOW_MAP_PATH = PROJECT_ROOT / "flow_maps" / "flow_map.npy"  # 한강 학습 완료 flow_map
 # RESULT_DIR    = PROJECT_ROOT / "results"            # 결과 영상 저장 폴더
@@ -33,7 +32,7 @@ cfg = DetectorConfig(
     conf=0.4,                                           # 검출 신뢰도 임계값
     grid_size=20,                                       # 20×20 Flow Map 그리드
     target_classes=None,                                # 모든 클래스 탐지
-    detect_only=False,                                  # 학습 후 탐지 모드
+    detect_only=True,                                  # 학습 후 탐지 모드
     flow_map_path=FLOW_MAP_PATH,                        # 학습 완료 후 저장될 경로
     result_dir=RESULT_DIR,                              # 결과 영상 저장 폴더
     data_dir=VIDEO_DIR,                                 # 입력 영상 폴더

@@ -30,17 +30,28 @@ ITS_API_KEY  = os.getenv("ITS_API_KEY")               # .env의 ITS_API_KEY 사�
 if not ITS_API_KEY:
     raise EnvironmentError(".env에 ITS_API_KEY가 없습니다. c:\\final_pj\\.env 확인")
 
-ITS_CCTV_API_URL = "http://cctvsec.ktict.co.kr/100/spmnCZ2cxfcOECHMkqlBL8Uhrbm1M7FAqyIP9qfD5DCNBmALQ6A9LrbwLElwrDXgBMVVonSbGpyHECRng19tMxJ2wpKAmrfTZP3aMnTQkkc="  # CCTV 목록 조회 API
+# ITS CCTV 목록 조회 API 엔드포인트 — .env의 ITS_API_URL에서 읽음
+# cctvurl은 ITS 서버에서 주기적으로 바뀌므로 매 세션마다 API를 호출해 최신 URL을 받아야 함
+ITS_API_URL = os.getenv("ITS_API_URL")
+if not ITS_API_URL:
+    raise EnvironmentError(
+        ".env에 ITS_API_URL이 없습니다.\n"
+        "  ITS_API_URL=http://openapi.its.go.kr:8081/api/cctv  형태로 추가하세요."
+    )
 
-# 탐지할 CCTV 이름 — ITS API의 cctvname 값과 정확히 일치해야 함
-# 아래 CCTV_NAME을 바꾸면 해당 도로의 독립 폴더에 학습 데이터가 쌓임
-CCTV_NAME = "[경부선] 양재"                                   # ← 원하는 CCTV 이름으로 변경
+# 탐지할 CCTV 이름 — .env의 CCTV_NAME에서 읽음 (ITS API cctvname 필드와 정확히 일치해야 함)
+CCTV_NAME = os.getenv("CCTV_NAME")
+if not CCTV_NAME:
+    raise EnvironmentError(
+        ".env에 CCTV_NAME이 없습니다.\n"
+        "  CCTV_NAME=[경부선] 양재  형태로 추가하세요."
+    )
 
 # ── 직접 스트림 URL (선택) ────────────────────────────────────────────
-# ITS API 없이 스트림 URL을 직접 아는 경우 여기에 입력하면 API 호출을 건너뜀.
-# 사용하지 않으면 None으로 두면 됨.
-# 예: DIRECT_STREAM_URL = "http://xxx.xxx.xxx.xxx:8080/stream.m3u8"
-DIRECT_STREAM_URL: str | None = None                         # ← 직접 URL 알면 여기 입력
+# ITS API 없이 스트림 URL을 직접 아는 경우 .env에 DIRECT_STREAM_URL 추가.
+# 설정하면 API 호출을 건너뛰고 이 URL을 직접 사용한다.
+# 예: DIRECT_STREAM_URL=http://xxx.xxx.xxx.xxx:8080/stream.m3u8
+DIRECT_STREAM_URL: str | None = os.getenv("DIRECT_STREAM_URL") or None
 
 # ── 강제 재학습 옵션 ─────────────────────────────────────────────────────
 # True로 바꾸면 기존 flow_map.npy·gru_a.pt·gru_b.pt를 삭제하고 처음부터 재학습
@@ -51,12 +62,12 @@ FORCE_RELEARN: bool = False
 ROAD_DIR = PROJECT_ROOT / "flow_maps" / CCTV_NAME
 ROAD_DIR.mkdir(parents=True, exist_ok=True)            # 폴더 없으면 자동 생성
 
-MODEL_PATH = PROJECT_ROOT / "runs" / "yolo11n_v5" / "weights" / "best.pt"
+MODEL_PATH = PROJECT_ROOT / "runs" / "yolo11n_v6" / "weights" / "best.pt"
 
-# ITS API 토큰 URL 사용 시 만료 주기 (초) — 직접 HLS URL이면 실질적으로 사용 안 됨
-# detector.run()이 스트림 단절(연속 50프레임 실패)을 감지하면 자동으로 루프를 종료하고
-# 여기서 새 URL을 발급받아 재시작한다.
-URL_REFRESH_INTERVAL = None                            # None = 스트림 단절 시에만 재시작
+# ITS 토큰 URL 선제 갱신 주기 (초)
+# ITS cctvurl은 약 200초마다 만료됨 → 만료 전에 미리 새 URL로 교체해 끊김 방지
+# 스트림 단절(연속 50프레임 실패) 시에도 url_refresher 콜백으로 즉시 재발급
+URL_REFRESH_INTERVAL = 180                             # 180초마다 선제 갱신 (만료 20초 전)
 
 # ======================================================================
 # ── ITS API: CCTV URL 조회 ─────────────────────────────────────────────
@@ -73,23 +84,17 @@ def fetch_cctv_url(name: str) -> str | None:
     """
     params = {
         "apiKey":   ITS_API_KEY,
-        "type":     "ex",                              # 고속도로
+        "type":     "고속도로",                        # 고속도로 CCTV
         "cctvType": "1",                               # 실시간 스트리밍
-        "minX": "126.0", "maxX": "129.5",
-        "minY": "34.5",  "maxY": "38.0",
+        "minX": "120", "maxX": "130",                  # 전국 범위
+        "minY": "30",  "maxY": "40",
         "getType":  "json",
     }
     try:
-        res = requests.get(ITS_CCTV_API_URL, params=params, timeout=10, verify=False)
+        res = requests.get(ITS_API_URL, params=params, timeout=10, verify=False)
         ct = res.headers.get("Content-Type", "")
         print(f"[ITS] HTTP {res.status_code} — Content-Type: {ct}")
         res.raise_for_status()
-
-        # ITS_CCTV_API_URL이 JSON API가 아닌 스트림 URL인 경우 — M3U8 플레이리스트 응답
-        # 이 경우 URL 자체를 스트림으로 사용한다 (OpenCV가 HLS 직접 재생 가능)
-        if "mpegurl" in ct or res.text.lstrip().startswith("#EXTM3U"):
-            print(f"[ITS] HLS 스트림 URL로 직접 사용: {ITS_CCTV_API_URL[:60]}...")
-            return ITS_CCTV_API_URL
 
         try:
             body = res.json()
@@ -130,14 +135,14 @@ def list_cctvs():
     """ITS API에서 조회 가능한 CCTV 이름 전체를 출력한다 (CCTV_NAME 설정 참고용)."""
     params = {
         "apiKey":   ITS_API_KEY,
-        "type":     "ex",
+        "type":     "고속도로",
         "cctvType": "1",
-        "minX": "126.0", "maxX": "129.5",
-        "minY": "34.5",  "maxY": "38.0",
+        "minX": "120", "maxX": "130",
+        "minY": "30",  "maxY": "40",
         "getType":  "json",
     }
     try:
-        res = requests.get(ITS_CCTV_API_URL, params=params, timeout=10, verify=False)
+        res = requests.get(ITS_API_URL, params=params, timeout=10, verify=False)
         items = res.json().get("response", {}).get("data", [])
         print(f"\n[ITS] 전체 CCTV 목록 ({len(items)}개):")
         for item in items:
@@ -251,7 +256,7 @@ def make_config(cctv_url: str) -> DetectorConfig:
         flow_map_path=flow_map_path,                   # 도로별 저장 경로
         learning_frames=1800,                          # flow_map 학습 프레임 수
         log_dir=ROAD_DIR / "logs",                     # CSV 로그 저장
-        night_enhance=True                             # CLAHE 야간 저조도 보정 
+        night_enhance=False                             # CLAHE 야간 저조도 보정 
     )
 
 
@@ -259,70 +264,59 @@ def make_config(cctv_url: str) -> DetectorConfig:
 # ── 메인 루프 — URL 만료 시 자동 갱신하며 무한 실행 ─────────────────────
 # ======================================================================
 
+def _fetch_url_with_retry(max_retry: int = 5) -> str | None:
+    """URL 발급 실패 시 재시도. max_retry 횟수 초과 시 None 반환."""
+    if DIRECT_STREAM_URL:
+        return DIRECT_STREAM_URL
+    for i in range(max_retry):
+        url = fetch_cctv_url(CCTV_NAME)
+        if url:
+            return url
+        wait = 10 * (i + 1)                            # 10s, 20s, 30s … 지수 백오프
+        print(f"[URL] 발급 실패 ({i+1}/{max_retry}) — {wait}초 후 재시도")
+        time.sleep(wait)
+    return None
+
+
 def main():
     print("=" * 60)
     print(f" ITS 실시간 탐지 시작")
     print(f" CCTV : {CCTV_NAME}")
     print(f" 저장 : {ROAD_DIR}")
-    print(f" URL 갱신: 스트림 단절 시 자동 재발급")
+    print(f" URL 갱신: {URL_REFRESH_INTERVAL}초마다 선제 갱신 + 단절 시 즉시 재발급")
     print("=" * 60)
     print(" Ctrl+C 로 종료 — 종료 시 누적 feature 로그 자동 저장\n")
 
     # CCTV 이름을 모르면 아래 주석 해제해서 목록 확인
     # list_cctvs(); return
 
-    session_count = 0                                  # 세션(URL 갱신) 횟수
+    # ── Detector 최초 1회 생성 ───────────────────────────────────────
+    # URL 갱신 시에도 이 인스턴스를 재사용 → 궤적·flow_map·GRU 상태 유지
+    print("[초기화] 첫 URL 발급 중...")
+    _init_url = _fetch_url_with_retry()
+    if _init_url is None:
+        print("[오류] 초기 URL 발급 실패 — 종료")
+        return
+    cfg     = make_config(_init_url)
+    detector = Detector(cfg)
 
-    while True:
-        session_count += 1
-        print(f"\n{'─'*50}")
-        print(f" [세션 {session_count}] URL 발급 중...")
-        print(f"{'─'*50}")
+    # ── URL 재발급 콜백 — 단절 감지 시 즉시 호출 ────────────────────
+    # run() 내부의 _stream_fail_cnt >= 50 조건에서 호출됨
+    def _get_fresh_url():
+        print("[URL] 스트림 단절 감지 → 즉시 재발급")
+        return _fetch_url_with_retry(max_retry=3)
 
-        # ── ITS URL 발급 ────────────────────────────────────────────
-        if DIRECT_STREAM_URL:
-            # 직접 URL이 있으면 API 호출 없이 그 URL을 그대로 사용
-            url = DIRECT_STREAM_URL
-            print(f"[ITS] 직접 URL 사용: {url[:60]}...")
-        else:
-            url = fetch_cctv_url(CCTV_NAME)
-            if url is None:
-                print("[오류] URL 발급 실패 — 30초 후 재시도")
-                time.sleep(30)
-                continue
-
-        # ── Detector 생성 (최초 1회만) ─────────────────────────────
-        cfg = make_config(url)
-        detector = Detector(cfg)
-
-        # ── URL 재발급 콜백 — 스트림 단절 시 새 URL 반환 ────────────
-        # Detector 상태(trajectories, flow_map, GRU 등)를 유지한 채
-        # cap만 새 URL로 교체 → 끊김 없이 탐지 지속
-        def _get_fresh_url():
-            if DIRECT_STREAM_URL:
-                return DIRECT_STREAM_URL                   # 직접 URL은 만료 없음
-            for _retry in range(3):
-                _u = fetch_cctv_url(CCTV_NAME)
-                if _u:
-                    print(f"[URL] 재발급 성공")
-                    return _u
-                print(f"[URL] 재발급 실패 ({_retry+1}/3) — 10초 후 재시도")
-                time.sleep(10)
-            return None
-
-        try:
-            detector.run(url, max_seconds=None, url_refresher=_get_fresh_url)
-
-        except KeyboardInterrupt:
-            print("\n[종료] 사용자 중단 — feature 로그 저장 후 종료")
-            break
-        except Exception as e:
-            print(f"[오류] 탐지 중 예외 발생: {e}")
-            print("[재시도] 10초 후 재시작")
-            time.sleep(10)
-            continue
-
-        print(f"[세션 {session_count}] 루프 종료 — 재시작")
+    try:
+        # url_refresh_interval: run() 내부에서 선제 갱신 → 화면 멈춤 없이 무한 실행
+        # url_refresher: 단절(50프레임 실패) 또는 선제 갱신 시 새 URL 반환
+        detector.run(_init_url,
+                     url_refresh_interval=URL_REFRESH_INTERVAL,
+                     url_refresher=_get_fresh_url)
+    except KeyboardInterrupt:
+        print("\n[종료] 사용자 중단 — feature 로그 저장 후 종료")
+    except Exception as e:
+        print(f"[오류] 탐지 중 예외 발생: {e}")
+        import traceback; traceback.print_exc()
 
 
 if __name__ == "__main__":

@@ -4,6 +4,7 @@
 import cv2                                          # OpenCV — 영상 입출력·시각화
 import numpy as np                                  # 수치 계산
 import time                                         # FPS 측정용 타이머
+import threading                                    # URL 선제 갱신용 백그라운드 스레드
 
 from .config import DetectorConfig                  # 모든 파라미터가 담긴 설정 클래스
 from .state import DetectorState                    # 프레임 번호·궤적·역주행 카운트 등 런타임 상태
@@ -38,7 +39,11 @@ class Detector:
 
         # ── 런타임 상태(state) + 모듈 생성 ──────────────────────────────
         self.state = DetectorState()                                # 프레임 번호, 궤적, 역주행 카운트 등
-        self.flow = FlowMap(cfg.grid_size, cfg.alpha, cfg.min_samples)  # 정상 흐름 벡터 그리드
+        self.flow = FlowMap(                                            # 정상 흐름 벡터 그리드
+            cfg.grid_size, cfg.alpha, cfg.min_samples,
+            bbox_alpha_decay=getattr(cfg, "bbox_alpha_decay", 0.5),
+            bbox_gating_alpha_ratio=getattr(cfg, "bbox_gating_alpha_ratio", 0.3),
+        )
         self.tracker = YoloTracker(cfg.model_path, cfg.conf, cfg.target_classes,
                                    night_enhance=getattr(cfg, "night_enhance", True))  # YOLO+ByteTrack
         self.judge = WrongWayJudge(cfg, self.flow, self.state)      # 역주행 판정기
@@ -190,15 +195,18 @@ class Detector:
 
     # ==================== 메인 루프 ====================
     def run(self, video_name, max_seconds: float | None = None,
-            url_refresher=None):
+            url_refresher=None, url_refresh_interval: float | None = None):
         """영상 파일 또는 스트림 URL을 열어 프레임 단위로 처리한다.
 
         Args:
             video_name: 파일명(str) 또는 스트림 URL(http/rtsp로 시작).
             max_seconds: 이 시간(초) 경과 후 루프 종료. None이면 영상 끝까지.
-            url_refresher: () -> str | None 콜백. 스트림 단절 시 새 URL을 반환.
+            url_refresher: () -> str | None 콜백. 스트림 단절 또는 선제 갱신 시 새 URL을 반환.
                            None이면 단절 시 루프 종료 (기존 동작).
                            Detector 상태(trajectories, flow_map 등)는 유지됨.
+            url_refresh_interval: 이 주기(초)마다 루프 안에서 cap을 교체 (화면 멈춤 없음).
+                           갱신 20초 전부터 백그라운드 스레드로 새 스트림을 미리 열어둠.
+                           설정 시 max_seconds 기반 루프 종료는 비활성.
         """
         cfg = self.cfg                                              # 설정 단축 참조
         st = self.state                                             # 상태 단축 참조
@@ -339,6 +347,13 @@ class Detector:
         _stream_fail_cnt = 0                                        # 연속 read 실패 횟수 (스트림 단절 감지)
         _STREAM_FAIL_MAX = 50                                       # 이 횟수 초과 시 스트림 단절로 판단
 
+        # ── 선제 URL 갱신 상태 (url_refresh_interval 사용 시) ────────────
+        _url_timer        = time.time()     # 현재 URL 사용 시작 시각
+        _prefetch_lock    = threading.Lock()
+        _next_cap         = [None]          # 백그라운드에서 미리 열어둔 새 cap
+        _prefetch_started = [False]         # 백그라운드 스레드 실행 여부
+        _PREFETCH_AHEAD   = 20.0            # 갱신 N초 전에 미리 열기 시작
+
         # ── 실제 처리 fps 측정 → jump 임계값 동적 스케일링 ──────────────
         # CCTV는 30fps이지만 CPU 처리 속도가 10fps이면 3프레임치 이동이
         # 1프레임에 한 번에 발생 → 정상 이동도 jump로 오감지됨.
@@ -350,11 +365,49 @@ class Detector:
         _jump_thr_dynamic   = _base_jump_px                         # 실측 fps 반영 동적 임계값
 
         while cap.isOpened():                                       # 비디오 스트림이 열려 있는 동안
-            # ── max_seconds 초과 시 루프 종료 (ITS URL 갱신 타이밍) ──
-            if max_seconds is not None:
+            # ── max_seconds 초과 시 루프 종료 (url_refresh_interval 미사용 시 fallback) ──
+            if max_seconds is not None and url_refresh_interval is None:
                 if time.time() - _run_start_time >= max_seconds:
-                    print(f"[run] {max_seconds:.0f}초 경과 → URL 갱신을 위해 루프 종료")
+                    print(f"[run] {max_seconds:.0f}초 경과 → 루프 종료")
                     break
+
+            # ── 선제 URL 갱신 (url_refresh_interval 설정 시) ─────────────
+            if url_refresh_interval and url_refresher and is_stream:
+                _url_elapsed = time.time() - _url_timer
+
+                # t = interval-20s: 백그라운드에서 새 URL 발급 + 새 cap 미리 열기
+                if not _prefetch_started[0] and _url_elapsed >= url_refresh_interval - _PREFETCH_AHEAD:
+                    _prefetch_started[0] = True
+                    def _do_prefetch(_lock=_prefetch_lock, _nc_ref=_next_cap):
+                        _nu = url_refresher()                   # 새 URL 발급
+                        if _nu:
+                            _nc = cv2.VideoCapture(_nu)         # 새 스트림 미리 열기
+                            with _lock:
+                                _nc_ref[0] = _nc if _nc.isOpened() else None
+                        else:
+                            with _lock:
+                                _nc_ref[0] = None
+                    threading.Thread(target=_do_prefetch, daemon=True).start()
+                    print(f"[run] 새 스트림 사전 준비 시작 (잔여 ~{_PREFETCH_AHEAD:.0f}초)")
+
+                # t = interval: 미리 열어둔 cap으로 교체
+                if _prefetch_started[0] and _url_elapsed >= url_refresh_interval:
+                    with _prefetch_lock:
+                        _nc = _next_cap[0]
+                    if _nc is not None:
+                        cap.release()
+                        cap = _nc
+                        print(f"[run] ✅ 스트림 교체 완료 (사전 준비 성공 — 끊김 없음)")
+                    else:
+                        # 사전 준비 실패 시 동기 fallback
+                        print(f"[run] ⚠️ 사전 준비 미완료 → 동기 교체")
+                        _nu = url_refresher()
+                        if _nu:
+                            cap.release()
+                            cap = cv2.VideoCapture(_nu)
+                    _next_cap[0] = None
+                    _prefetch_started[0] = False
+                    _url_timer = time.time()                    # 타이머 리셋
 
             ret, frame = cap.read()                                 # 프레임 읽기
             if not ret:                                             # 프레임 읽기 실패
@@ -573,8 +626,12 @@ class Detector:
                     or st.frame_num >= max_learning_frames
                 )
                 if learning_done:                                   # 학습 완료이면
-                    self.flow.apply_spatial_smoothing(verbose=True) # 공간 보정 (상세 진단)
-                    self.flow.apply_boundary_erosion()              # 경계 셀 제거 (오탐 차단)
+                    self.flow.apply_spatial_smoothing(verbose=True) # ① 초기 공간 채움
+                    self.flow.apply_overlap_erosion(               # ② bbox 겹침 경계 셀 제거
+                        contra_threshold=cfg.bbox_contra_threshold
+                    )
+                    self.flow.apply_direction_repair()             # ③ 프레임 스킵 방향 오류 교정
+                    self.flow.apply_spatial_smoothing()            # ④ 재채움 (중앙선 불가침)
                     self._compute_ref_direction()                   # 기준 방향 벡터 계산
                     self._compute_direction_cell_counts()           # 방향별 셀 수 계산 → TA 주입
                     if cfg.flow_map_path:                           # 저장 경로 있으면
@@ -600,8 +657,12 @@ class Detector:
                     or elapsed >= relearn_max                      # 강제 종료
                 )
                 if relearn_done:                                    # 재학습 완료이면
-                    self.flow.apply_spatial_smoothing(verbose=True) # 공간 보정 (상세 진단)
-                    self.flow.apply_boundary_erosion()              # 경계 셀 제거 (오탐 차단)
+                    self.flow.apply_spatial_smoothing(verbose=True) # ① 초기 공간 채움
+                    self.flow.apply_overlap_erosion(               # ② bbox 겹침 경계 셀 제거
+                        contra_threshold=cfg.bbox_contra_threshold
+                    )
+                    self.flow.apply_direction_repair()             # ③ 프레임 스킵 방향 오류 교정
+                    self.flow.apply_spatial_smoothing()            # ④ 재채움 (중앙선 불가침)
                     self._compute_ref_direction()                   # 기준 방향 벡터 재계산
                     self._compute_direction_cell_counts()           # 방향별 셀 수 재계산 → TA 주입
                     if cfg.flow_map_path:                           # 저장 경로 있으면
@@ -748,10 +809,23 @@ class Detector:
                         if _is_frame_skip or _solo_jump:            # 프레임 스킵·단독 jump → 학습/판정 스킵
                             pass
                         elif st.is_learning or st.relearning:       # 학습/재학습 모드
-                            self.flow.learn_step(                   # 흐름장 업데이트 (footpoint 기준)
+                            # 궤적 전체 방향 계산 (traj[0] → 현재 위치)
+                            # velocity_window 단기 벡터보다 안정적 → 중앙점 방향 오탐 방지
+                            _traj_ndx, _traj_ndy = None, None
+                            if len(traj) >= cfg.velocity_window:
+                                _tx = fx - traj[0][0]              # 전체 이동 x
+                                _ty = fy - traj[0][1]              # 전체 이동 y
+                                _tmag = np.sqrt(_tx ** 2 + _ty ** 2)
+                                if _tmag >= cfg.min_move_distance:  # 충분히 이동한 경우만
+                                    _traj_ndx = _tx / _tmag         # 궤적 단위 방향 x
+                                    _traj_ndy = _ty / _tmag         # 궤적 단위 방향 y
+                            self.flow.learn_step(                   # 흐름장 업데이트 (bbox 전체 셀)
                                 traj[-cfg.velocity_window][0],
                                 traj[-cfg.velocity_window][1],
-                                fx, fy, _learn_min_mag              # nm 기반 min_move 전달
+                                fx, fy, _learn_min_mag,
+                                bbox=(x1, y1, x2, y2),             # bbox 전체 셀 갱신 + 반대방향 겹침 추적
+                                traj_ndx=_traj_ndx,                # 궤적 방향 (중앙점 학습용)
+                                traj_ndy=_traj_ndy
                             )
                         else:                                       # 감지 모드
                             # 역주행 여부 판단 (bbox_h 전달 — nm 기반 속도 게이트용)
@@ -918,7 +992,8 @@ class Detector:
 
             # ── 방향별 TrafficAnalyzer·GRU 갱신 ──────────────────────────
             if (self.traffic_analyzer_a is not None                 # 초기화 완료 확인
-                    and not st.is_learning and not st.relearning and not st.waiting_stable):  # 탐지 모드일 때만
+                    and not st.is_learning and not st.relearning and not st.waiting_stable  # 탐지 모드일 때만
+                    and not _is_frame_skip):                        # 프레임 스킵(순간이동) 프레임은 jam_score 업데이트 차단
                 # A방향 정체 탐지 갱신
                 self.traffic_analyzer_a.update(tracks_a, speeds_a, st.frame_num)
                 self.predictor_a.update(self.traffic_analyzer_a.get_avg_speed())

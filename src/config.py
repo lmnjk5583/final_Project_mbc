@@ -22,13 +22,31 @@ class DetectorConfig:
     velocity_window: int = 10         # 속도/방향 계산 프레임 간격 — 원거리 상행 차량 ID 수명 짧아 10으로 설정
     base_speed_threshold: float = 7.0 # 기본 속도 임계값 (원근에 따라 가중을 곱해 사용)
     cos_threshold: float = -0.75      # 코사인 유사도 임계값 (원본값 복원 — smoothing 오염 방지로 오탐 차단)
-    wrong_count_threshold: int = 25   # 역주행 확정까지 필요한 연속 의심 횟수 — 15→25 (10fps 기준 2.5초 지속)
-    min_wrongway_track_age: int = 45  # 역주행 판정 시작까지 최소 추적 프레임 수 — 30→45 (ID 초기 불안정 기간 추가 커버)
+    wrong_count_threshold: int = 20   # 역주행 확정까지 필요한 연속 의심 횟수 — 25→20 (fast-track이 명확한 경우 처리, normal path는 오탐 방지용 보수적 유지)
+    min_wrongway_track_age: int = 20  # 역주행 판정 시작까지 최소 추적 프레임 수 — 45→20 (빠른 역주행 차량 age gate 병목 해소)
     vote_threshold: float = 0.7       # 투표 시 역방향 비율 임계값 (원본값 복원 — 60% 이상이면 역주행 의심)
     min_move_distance: float = 10.0    # 최소 누적 이동 거리 (이하면 정지로 판단) — 원래 20.0, 원거리 CCTV 대응 완화
     min_move_per_frame: float = 0.4   # 프레임당 평균 이동거리 (이하면 정지) — 원래 1.5, 원거리 CCTV 대응 완화
     direction_change_guard_frames: int = 120 # 방향 급변 이후 가드 기간 (프레임 수) — 급변 감지 시점부터 이 프레임 동안 의심 카운트 차단
     direction_change_cos_threshold: float = 0.3  # 급변 감지 임계값 (cos 기준) — 0.0(90°)→0.3(72°): bbox jitter 45~60° 편차도 가드 트리거
+
+    # ── 고신뢰 즉시 확정 (fast-track) ─────────────────────────────────
+    # 투표 결과가 압도적이고 속도가 충분하면 wrong_count 누적 없이 바로 확정
+    # 조건: disagree_ratio >= fast_confirm_ratio AND nm_speed >= fast_confirm_speed
+    #       AND 처음부터 역방향(lcf==0) — 갑자기 방향 바뀐 차량은 일반 경로 유지
+    fast_confirm_ratio: float = 0.95  # 단기 투표 역방향 비율 임계 (8포인트 중 ~모두 역방향)
+    fast_confirm_speed: float = 0.20  # nm_speed 임계 (중속 이상 역주행 즉시 확정 — 0.40→0.20: 중속 역주행 차량도 fast-track 적용)
+
+    # ── bbox 겹침 기반 경계 침식 ───────────────────────────────────────
+    # 학습 중 반대 차선 차량의 bbox가 이 셀을 N회 이상 밟았으면 중앙선 경계로 판정 → 제거
+    bbox_contra_threshold: int = 8      # 반대방향 bbox 방문 횟수 임계값 (이상이면 경계 셀로 삭제) — 3→8: bbox 풋프린트 확대 후 중앙선 인접 셀 과잉 침식 방지
+
+    # ── bbox 거리 기반 alpha 감쇠 ────────────────────────────────────────
+    # bbox 중심에서 멀어질수록 alpha를 감쇠 → 중앙점 우선 학습.
+    # edge 셀(방향 게이팅 임계 미만)은 잠기지 않아 반대 차선이 덮어쓸 수 있음.
+    # dist=0: alpha×1.0 / dist=1: alpha×decay / dist=2: alpha×decay² / ...
+    bbox_alpha_decay: float = 0.5       # 거리 1셀당 alpha 감쇠율 (0.5 → 2셀 거리에서 alpha/4)
+    bbox_gating_alpha_ratio: float = 0.3  # 이 비율(decay^dist) 미만이면 방향 게이팅·count 증가 비적용
 
     # ==================== ID 매핑 관련 ====================
     id_match_distance: int = 120      # ID 재매칭 허용 거리 (픽셀 단위, 이전 ID와 새 ID 위치 비교)
@@ -113,8 +131,9 @@ class DetectorConfig:
     gru_hidden: int = 64                    # GRU hidden state 크기
     gru_layers: int = 2                     # GRU 레이어 수
     gru_seq_len: int = 30                   # 입력 시퀀스 길이 (프레임)
-    gru_blend_ratio: float = 0.20          # GRU 기여 비율 (1 - 이 값 = rule 비율)
-                                           # 0.20 = rule 80% + GRU 20% — 처음엔 낮게 시작해서 jam 이상 시 줄이기
+    gru_blend_ratio: float = 0.0           # GRU 기여 비율 (1 - 이 값 = rule 비율)
+                                           # 0.0 = rule 100% (GRU 비활성) — 클래스 불균형·레이블 오염 해결 전까지 비활성
+                                           # 재활성 조건: retrain 후 precision/recall 검증 완료 시 0.10~0.20으로 점진 증가
     gru_warmup_frames: int = 30             # camera_switch 후 GRU 사용 금지 프레임
     gru_replay_size: int = 200              # replay_buffer 최대 크기
     gru_online_interval: int = 10           # 온라인 학습 gradient step 주기 (프레임)
@@ -170,7 +189,8 @@ class DetectorConfig:
                                            # (fps 무관하게 동일한 체감 — 30fps→45f, 10fps→15f 자동 변환)
                                            # 0.5→1.5: 실시간 스트림 6~7fps 환경에서 3프레임(0.5초)은 너무 짧아
                                            # 정상 차량도 체류 판정 → 1.5초(~10프레임)로 강화
-    cell_dwell_ema_up:   float = 0.05      # 셀 점유 시 EMA 상승 속도 (30프레임 연속 → ema≈0.78)
+    cell_dwell_ema_up:   float = 0.03      # 셀 점유 시 EMA 상승 속도 (30프레임 연속 → ema≈0.59)
+                                           # 0.05→0.03: 6fps 서행 차량 2초 체류(12f) 시 ema 0.46→0.31 억제
     cell_dwell_ema_down: float = 0.02      # 셀 이탈 시 EMA 하락 속도 (50프레임 후 ema≈0.36)
 
     # ==================== 방향별 차선 분리 파라미터 ====================
