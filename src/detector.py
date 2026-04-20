@@ -44,6 +44,7 @@ class Detector:
             bbox_alpha_decay=getattr(cfg, "bbox_alpha_decay", 0.5),
             bbox_gating_alpha_ratio=getattr(cfg, "bbox_gating_alpha_ratio", 0.3),
             edge_margin=getattr(cfg, "flow_map_edge_margin", 1),
+            max_cross_flow_cells=getattr(cfg, "max_cross_flow_cells", 1.2),
         )
         self.tracker = YoloTracker(cfg.model_path, cfg.conf, cfg.target_classes,
                                    night_enhance=getattr(cfg, "night_enhance", True))  # YOLO+ByteTrack
@@ -88,6 +89,14 @@ class Detector:
                 # v3 이하(채널 없음)도 기존 global flow로부터 채널을 즉시 구성해
                 # 중앙선 오염 방지·contamination-aware fallback을 활성화한다.
                 self._compute_ref_direction()                       # 기준 방향 계산 (최다 샘플 셀)
+                # ── 123차: 로드 후 중앙선 경계 셀 침식 + 재채움 ──────────────
+                # _bbox_contra_count는 npy에 저장되지 않으므로 apply_overlap_erosion은
+                # 로드 시 효과 없음. apply_boundary_erosion은 방향 벡터 일관성만으로
+                # 경계를 판정하므로 저장된 npy에도 적용 가능.
+                # 중앙선 인접 셀(코사인 급변 셀)을 삭제 → get_interpolated None 반환
+                # → vote skip → 오탐 원천 차단.
+                self.flow.apply_boundary_erosion()                  # 방향 불일치 경계 셀 제거
+                self.flow.apply_spatial_smoothing()                 # 침식 후 빈 셀 재채움
                 if self._ref_direction is not None:                 # 기준 방향이 있으면
                     self.flow.build_directional_channels(           # 양방향 채널 구성
                         *self._ref_direction
@@ -376,6 +385,8 @@ class Detector:
         _freeze_frame_count = 0                                      # 연속 정지 프레임 수 (끊김 감지용)
         _adj_diff_history   = []                                     # adj_diff 롤링 평균용 (최근 90프레임)
         _prev_fleet_cos     = None                                   # 직전 프레임 fleet 평균 코사인 (함대 끊김 감지용)
+        _prev_cap_ts_ms     = None                                   # 직전 프레임의 스트림 타임스탬프 (ms)
+        _is_time_gap        = False                                  # 이번 프레임이 타임스탬프 갭 직후인지
 
         while cap.isOpened():                                       # 비디오 스트림이 열려 있는 동안
             # ── max_seconds 초과 시 루프 종료 (url_refresh_interval 미사용 시 fallback) ──
@@ -458,6 +469,31 @@ class Detector:
 
             st.frame_num += 1                                       # 프레임 번호 증가
 
+            # ── 타임스탬프 갭 감지 (partial drop 포착) ──────────────────────
+            # freeze 감지: adj_diff ≈ 0 → 동결(반복) 프레임만 감지.
+            # displacement: 다수 차량 동시 jump → 전체 끊김만 감지.
+            # 이 감지: 스트림 타임스탬프 간격으로 "프레임이 빠진" 상황을 포착.
+            # CAP_PROP_POS_MSEC: 파일이면 디코드 위치, 스트림이면 재생 시점.
+            # 1~3프레임 partial drop 시: adj_diff는 정상(다른 장면이므로),
+            # 차량 displacement는 정상 범위 내일 수 있지만 시간 갭이 발생.
+            # 갭 감지 시: solo_jump 임계값을 시간 비율로 확대하여 정상 이동을
+            # jump로 오판하는 것을 방지 + 속도 벡터에 갭 보정 적용.
+            _cur_cap_ts_ms = cap.get(cv2.CAP_PROP_POS_MSEC)             # 현재 프레임 타임스탬프 (ms)
+            _time_gap_ratio = 1.0                                       # 기본: 갭 없음
+            _is_time_gap = False
+            if _prev_cap_ts_ms is not None and _cur_cap_ts_ms > 0:
+                _ts_delta_ms = _cur_cap_ts_ms - _prev_cap_ts_ms        # 프레임 간 시간 차이 (ms)
+                _expected_ms = 1000.0 / max(fps, 1.0)                  # 예상 프레임 간격 (ms)
+                if _expected_ms > 0 and _ts_delta_ms > 0:
+                    _time_gap_ratio = _ts_delta_ms / _expected_ms      # 실제/예상 비율
+                    if _time_gap_ratio > 2.5 and _ts_delta_ms > 400:   # 2.5배 + 0.4초 이상
+                        _is_time_gap = True
+                        print(f"[F:{st.frame_num}] ⏱ 타임스탬프 갭 감지 "
+                              f"(간격={_ts_delta_ms:.0f}ms, "
+                              f"예상={_expected_ms:.0f}ms, "
+                              f"비율={_time_gap_ratio:.1f}x)")
+            _prev_cap_ts_ms = _cur_cap_ts_ms                           # 다음 프레임용 저장
+
             # ── YOLO 추적 ──
             tracks = self.tracker.track(frame)                      # [{id, x1, y1, x2, y2, cx, cy}, ...]
             active_ids = {t["id"] for t in tracks}                  # 현재 프레임에 보이는 ID들
@@ -465,7 +501,9 @@ class Detector:
             # ── 프레임 스킵(신호 끊김) 감지 ──────────────────────────────
             # HLS 스트림 끊김 시 모든 차량이 동시에 큰 변위를 가짐
             # → 절반 이상이 jump_px 초과 시 해당 프레임의 궤적·학습·판정 전부 스킵
-            _jump_thr   = _jump_thr_dynamic                             # 실측 fps 기반 동적 임계값
+            # 타임스탬프 갭 감지 시: jump 임계값을 시간 비율만큼 확대
+            # → partial drop 동안의 정상 이동을 jump로 오판하지 않음
+            _jump_thr   = _jump_thr_dynamic * min(_time_gap_ratio, 5.0) if _is_time_gap else _jump_thr_dynamic
             _jump_ratio = getattr(cfg, "frame_skip_ratio",    0.5)
             _jump_count = 0
             _jump_total = 0
@@ -501,6 +539,23 @@ class Detector:
                     st.wrong_way_count[_tid] = 0                    # 누적 의심 카운트 리셋
                     st.direction_change_frame[_tid] = st.frame_num  # guard 발동: velocity_window 동안 판정 차단
                     st.wrong_way_ids.discard(_tid)                  # 혹시 스킵 직전에 확정됐으면 취소
+
+            # ── 타임스탬프 갭 기반 궤적 초기화 (displacement 미탐지 partial drop) ──
+            # _is_frame_skip(displacement 기반)이 미탐지했으나 타임스탬프 갭이 감지된 경우:
+            # 1~3프레임 partial drop에서 차량 displacement가 jump 임계값 미만이지만
+            # 시간적으로 갭이 있어 velocity 벡터가 갭 구간을 포함하게 되는 경우.
+            # 궤적을 초기화하여 갭 구간의 변위가 velocity 계산에 개입하는 것을 차단.
+            # _is_frame_skip과 달리 wrong_way_ids는 유지 (이미 확정된 역주행은 취소 불필요).
+            if _is_time_gap and not _is_frame_skip:
+                st.post_reconnect_frame = st.frame_num              # 재연결 이벤트 기록
+                for _t in tracks:
+                    _tid = _t["id"]
+                    if st.trajectories[_tid]:
+                        _cur_pos = (_t["cx"], _t["cy"])
+                        st.trajectories[_tid] = [_cur_pos] * len(st.trajectories[_tid])
+                    st.last_velocity.pop(_tid, None)
+                    st.wrong_way_count[_tid] = 0
+                    st.direction_change_frame[_tid] = st.frame_num
 
             # 처음 등장한 프레임 기록
             for t in tracks:                                        # 각 트랙 순회
@@ -857,6 +912,8 @@ class Detector:
                 _age = st.frame_num - st.first_seen_frame.get(tid, st.frame_num)  # 트랙 경과 프레임
 
                 # 개별 차량 단독 jump 체크 (프레임 스킵 미감지 시에도 1대가 튀는 경우)
+                # 타임스탬프 갭 감지 시: _jump_thr이 이미 시간 비율로 확대되어 있으므로
+                # 갭 동안의 정상 이동은 jump로 오판되지 않음.
                 _solo_jump = False
                 if st.trajectories[tid]:
                     _prev_fx, _prev_fy = st.trajectories[tid][-1]
@@ -894,14 +951,33 @@ class Detector:
 
                 # 궤적 길이가 velocity_window 이상일 때만 속도/방향 계산
                 if len(traj) >= cfg.velocity_window:                # 충분한 궤적 있으면
-                    # ── 중앙값 속도 벡터 (117차) ─────────────────────────────
+                    # ── 중앙값 속도 벡터 (117차) + IQR 이상치 필터 (124차) ──────
                     # endpoint-to-endpoint 대신 프레임별 변위의 중앙값 사용.
                     # 단일 프레임 끊김·순간이동(신호 지연 등)이 있어도 중앙값에는
                     # 영향 없음 → fleet_cos/solo_jump 의존 없이 방향 벡터가 견고해짐.
+                    # [124차] IQR 이상치 필터 추가: 프레임 드롭 후 궤적에 남은
+                    # 이상 변위(갭 구간 포함)를 제거한 후 중앙값 계산.
+                    # 중앙값만으로도 50% 미만 이상치는 필터되지만, 2~3프레임 연속
+                    # 드롭 시 velocity_window(10f) 내 이상치 비율 20~30%가 돼
+                    # 중앙값이 이상치 쪽으로 편향될 수 있음. IQR은 이를 방어.
                     _w   = cfg.velocity_window
                     _si  = len(traj) - _w
                     _pfx = [traj[_si+i+1][0] - traj[_si+i][0] for i in range(_w-1)]
                     _pfy = [traj[_si+i+1][1] - traj[_si+i][1] for i in range(_w-1)]
+
+                    # IQR 이상치 필터: per-frame 변위 크기의 Q1~Q3 범위 밖 제거
+                    _pf_mags = [(_pfx[i]**2 + _pfy[i]**2)**0.5 for i in range(len(_pfx))]
+                    if len(_pf_mags) >= 5:                           # 충분한 샘플 시에만
+                        _q1 = float(np.percentile(_pf_mags, 25))
+                        _q3 = float(np.percentile(_pf_mags, 75))
+                        _iqr = _q3 - _q1
+                        _upper = _q3 + 2.0 * _iqr                   # 상한 (2×IQR — 보수적)
+                        if _upper > 0:                               # 유효한 상한이 있으면
+                            _keep = [i for i in range(len(_pfx)) if _pf_mags[i] <= _upper]
+                            if len(_keep) >= 3:                      # 필터 후 최소 3개 남아야
+                                _pfx = [_pfx[i] for i in _keep]
+                                _pfy = [_pfy[i] for i in _keep]
+
                     vdx  = float(np.median(_pfx)) * (_w - 1)        # 중앙값 × 창 크기 (mag 단위 유지)
                     vdy  = float(np.median(_pfy)) * (_w - 1)
                     mag  = np.sqrt(vdx ** 2 + vdy ** 2)             # 속도 크기 (픽셀)

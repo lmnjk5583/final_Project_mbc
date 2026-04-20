@@ -12,13 +12,15 @@ class FlowMap:
     def __init__(self, grid_size: int, alpha: float, min_samples: int,
                  bbox_alpha_decay: float = 0.5,
                  bbox_gating_alpha_ratio: float = 0.3,
-                 edge_margin: int = 1):
+                 edge_margin: int = 1,
+                 max_cross_flow_cells: float = 1.2):
         self.grid_size = grid_size                        # 흐름 맵을 나눌 격자 크기 (N x N)
         self.alpha = alpha                                # EMA 학습 속도 (새 데이터 반영 비율)
         self.min_samples = min_samples                    # 셀당 최소 학습 샘플 수 (이하이면 공간 보정)
         self._bbox_alpha_decay = bbox_alpha_decay         # bbox 거리당 alpha 감쇠율
         self._bbox_gating_ratio = bbox_gating_alpha_ratio # 이 비율 미만 셀 → 방향 게이팅·count 비적용
         self._edge_margin = edge_margin                   # 학습 제외 가장자리 셀 수
+        self._max_cross_flow = max_cross_flow_cells       # 횡방향(차선 횡단) 최대 확산 셀 수
 
         # 각 셀의 정상 이동 방향 벡터 (ndx, ndy) — 학습 단계에서 단일 글로벌 맵으로 학습
         self.flow = np.zeros((grid_size, grid_size, 2), np.float32)
@@ -160,6 +162,13 @@ class FlowMap:
             cells = [(_log_r, _log_c)]
             r_center, c_center = _log_r, _log_c
 
+        # ── cross-flow 제한용 방향 벡터 (차선 횡단 방향 확산 차단) ─────────
+        # bbox 확산 시 이동 방향에 수직인 방향(=차선 횡단)으로의 확산을
+        # max_cross_flow_cells 이내로 제한. 이동 방향과 평행한 방향(=차선 내
+        # 전후방)은 제한 없음. 중앙선 annotation 없이 구조적 오염 차단.
+        _cf_dx = traj_ndx if traj_ndx is not None else ndx  # cross-flow 계산용 방향
+        _cf_dy = traj_ndy if traj_ndy is not None else ndy
+
         # ── 셀별 EMA 갱신 ────────────────────────────────────────────────
         for r, c in cells:
             # erosion으로 제거된 셀은 영구 재학습 금지
@@ -180,6 +189,25 @@ class FlowMap:
                 dist        = 0                                    # 단일 셀 모드 → 항상 중앙점
                 alpha_ratio = 1.0
                 alpha_cell  = self.alpha
+
+            # ── cross-flow 제한: 차선 횡단 방향 확산 차단 ─────────────────
+            # dist>=1 셀에 대해 bbox 중심→해당 셀 오프셋의 횡방향 성분을 계산.
+            # 차량 이동 방향에 수직인 방향 = 차선 횡단 방향.
+            # 이 성분이 max_cross_flow_cells 초과 시 학습 스킵.
+            # 이동 방향과 평행(전후방)은 제한 없음 → 차선 내 커버리지 유지.
+            # 설계 근거:
+            #   고속도로 중앙선은 이동 방향과 평행 → 횡방향 확산이 차선 넘김.
+            #   기존 bbox_learn_w_ratio는 bbox 폭만 제한 (각도 무관).
+            #   이 방식은 차량 실제 이동 방향 기반 → 곡선 구간에서도 적응.
+            if bbox is not None and dist >= 1:
+                _off_px_x = (c - c_center) * self.cell_w       # 셀 오프셋 (px)
+                _off_px_y = (r - r_center) * self.cell_h
+                # 이동 방향 수직 성분: perp = (-dy, dx)
+                # cross_px = |offset · perp| = |off_x * (-dy) + off_y * dx|
+                _cross_px = abs(-_cf_dy * _off_px_x + _cf_dx * _off_px_y)
+                _avg_cell = (self.cell_w + self.cell_h) * 0.5  # 셀 크기 평균
+                if _cross_px / _avg_cell > self._max_cross_flow:
+                    continue                                    # 횡방향 초과 → 스킵
 
             existing = self.flow[r, c]
             emag = np.linalg.norm(existing)

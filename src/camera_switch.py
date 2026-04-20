@@ -72,8 +72,8 @@ class CameraSwitchDetector:
             if avg_diff > 2.0 and adj_diff / (avg_diff + 1e-6) > 5.0:
                 triggered = True
 
-        # 2) 기준 프레임과의 차이가 매우 크면(>35), 장면 자체가 완전히 바뀌었다고 판단
-        if ref_diff > 35:
+        # 2) 기준 프레임과의 차이가 매우 크면(>30), 장면 자체가 완전히 바뀌었다고 판단
+        if ref_diff > 30:
             triggered = True
 
         if triggered:

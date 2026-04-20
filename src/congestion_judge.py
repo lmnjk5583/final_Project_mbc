@@ -37,10 +37,11 @@ def compute_jam_score_fallback(x_t: dict) -> float:
     정상 차량(빠른 통과): ema 낮게 유지 → cds 낮음
     정체 차량(같은 셀 오래 머묾): ema 서서히 누적 → cds 높음
 
-    설계 목표 (smooth<0.25, slow<0.55, jam≥0.55):
-      - 원활 (cds=0.05, occ=0.05): jam≈0.030 → SMOOTH
-      - 서행 (cds=0.20, occ=0.15): jam≈0.180 → SLOW
-      - 정체 (cds=0.60, occ=0.35): jam≈0.490 → JAM
+    설계 목표 (smooth<0.30, slow<0.60, jam≥0.60):
+      - 원활 (cds=0.05, occ=0.05, valid=80, count_ref=8): jam≈0.030 → SMOOTH
+      - 서행 (cds=0.20, occ=0.15, valid=80, count_ref=8): jam≈0.320 → SLOW
+      - 정체 (cds=0.48, occ=0.19, valid=80, count_ref=8): jam≈0.680 → JAM
+    ※ occ_gate 포화점: count_ref/valid_cell_count+0.04 ≈ 0.14 (valid=80 기준)
 
     Args:
         x_t: feature 벡터 dict.
@@ -71,7 +72,11 @@ def compute_jam_score_fallback(x_t: dict) -> float:
     # occ_gate  : flow_occ 0.06 이하=0.0, 0.26 이상=1.0 — 빈 도로에서 cds 억제
     # scale_gate: 두 조건 모두 충족해야 체류 신호를 최대 반영
     count_gate = _clip((known_cnt - 2) / 10.0, 0.0, 1.0)     # 2대 이하는 0, 12대면 1.0 (13→10: 6fps 저감지 환경 보정)
-    occ_gate   = _clip((flow_occ - 0.06) / 0.30, 0.0, 1.0)   # 점유율 낮으면 0, 0.36 이상이면 1.0 (0.20→0.30: 서행 밀도에서 gate 조기 개방 방지)
+    _count_ref_val  = float(x_t.get("count_ref", 8.0))        # config.count_ref (기준 차량 수, 기본 8)
+    _valid_cnt      = max(int(x_t.get("valid_cell_count", 400)), 1)  # 방향별 유효 셀 수 (기본 400 → 80으로 실측 시 자동 반영)
+    _occ_gate_lo    = 0.04                                     # 최소 점유율 하한 (4셀 미만 완전 억제)
+    _occ_gate_range = max(0.05, _count_ref_val / _valid_cnt)   # count_ref/valid_cell_count: 기준 밀도 도달 시 포화 (고정 0.30 제거)
+    occ_gate   = _clip((flow_occ - _occ_gate_lo) / _occ_gate_range, 0.0, 1.0)  # 기준 밀도 이상이면 1.0 (valid=80, count_ref=8 → 포화점 occ≈0.14)
     scale_gate = count_gate * occ_gate                         # 두 게이트의 곱 (AND 조건)
 
     # ── 3) 핵심 jam 계산 ─────────────────────────────────────────────

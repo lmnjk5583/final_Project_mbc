@@ -72,6 +72,10 @@ class DetectorConfig:
     # dist=0: alpha×1.0 / dist=1: alpha×decay / dist=2: alpha×decay² / ...
     bbox_alpha_decay: float = 0.5       # 거리 1셀당 alpha 감쇠율 (0.5 → 2셀 거리에서 alpha/4)
     bbox_gating_alpha_ratio: float = 0.3  # 이 비율(decay^dist) 미만이면 방향 게이팅·count 증가 비적용
+    max_cross_flow_cells: float = 1.2    # 횡방향(차선 횡단) 최대 확산 셀 수 (이동 방향에 수직)
+                                         # 1.2 = 수직 방향 1셀 + 약간의 여유 (대각선 허용)
+                                         # 이동 방향과 평행(전후방)은 무제한 → 차선 내 커버리지 유지
+                                         # 중앙선 annotation 없이 반대 차선 오염 구조 차단
 
     # ── 프레임 freeze 감지 (끊김 재연결 감지) ────────────────────────────
     # adj_diff(인접 프레임 차이)가 rolling_avg × 10% 이하로 min_freeze_frames 이상 지속되면

@@ -470,4 +470,7 @@ class FeatureExtractor:
             "valid_cell_count":      valid_cell_count,   # 유효 셀 수 (분모 기준)
 
             "rule_jam_score":        0.0,                    # jam_score (CJ 채움)
+            "count_ref":             float(getattr(self.cfg, "count_ref", 8.0)),
+            # occ_gate 정규화용 — compute_jam_score_fallback이 fixed 분모(0.30) 대신
+            # count_ref/valid_cell_count 기반 밀도로 포화점을 조정할 수 있도록 전달
         }
