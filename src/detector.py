@@ -43,6 +43,7 @@ class Detector:
             cfg.grid_size, cfg.alpha, cfg.min_samples,
             bbox_alpha_decay=getattr(cfg, "bbox_alpha_decay", 0.5),
             bbox_gating_alpha_ratio=getattr(cfg, "bbox_gating_alpha_ratio", 0.3),
+            edge_margin=getattr(cfg, "flow_map_edge_margin", 1),
         )
         self.tracker = YoloTracker(cfg.model_path, cfg.conf, cfg.target_classes,
                                    night_enhance=getattr(cfg, "night_enhance", True))  # YOLO+ByteTrack
@@ -82,6 +83,15 @@ class Detector:
                     )
                 self.flow.speed_ref[:] = 0                          # 이전 세션 오염 방지 — 항상 리셋
                 self.state.is_learning = False                      # 로드 성공 → 학습 모드 해제
+                # ── 119차: v3 이하 npy 로드 후 양방향 채널 재구성 ──────────
+                # v4 이상이면 load()에서 이미 채널 복원됨.
+                # v3 이하(채널 없음)도 기존 global flow로부터 채널을 즉시 구성해
+                # 중앙선 오염 방지·contamination-aware fallback을 활성화한다.
+                self._compute_ref_direction()                       # 기준 방향 계산 (최다 샘플 셀)
+                if self._ref_direction is not None:                 # 기준 방향이 있으면
+                    self.flow.build_directional_channels(           # 양방향 채널 구성
+                        *self._ref_direction
+                    )
         else:                                                       # flow_map_path가 None
             if cfg.detect_only:                                     # 탐지 전용인데 경로 자체가 없음
                 raise ValueError(                                   # 설정 오류 → 예외
@@ -363,6 +373,9 @@ class Detector:
         _last_frame_time    = time.time()                           # 직전 프레임 처리 완료 시각
         _base_jump_px       = getattr(cfg, "frame_skip_jump_px", 80.0)  # 30fps 기준 jump 임계값
         _jump_thr_dynamic   = _base_jump_px                         # 실측 fps 반영 동적 임계값
+        _freeze_frame_count = 0                                      # 연속 정지 프레임 수 (끊김 감지용)
+        _adj_diff_history   = []                                     # adj_diff 롤링 평균용 (최근 90프레임)
+        _prev_fleet_cos     = None                                   # 직전 프레임 fleet 평균 코사인 (함대 끊김 감지용)
 
         while cap.isOpened():                                       # 비디오 스트림이 열려 있는 동안
             # ── max_seconds 초과 시 루프 종료 (url_refresh_interval 미사용 시 fallback) ──
@@ -477,6 +490,8 @@ class Detector:
                 # 마지막 점만 바꿔도 나머지 점(jump 전)이 남아 다음 프레임에서도
                 # "순간이동 벡터"가 계산되어 역주행 오탐이 이어짐.
                 # → 궤적 전체를 현재 위치로 덮어써서 velocity 계산 기점을 초기화.
+                st.post_reconnect_frame = st.frame_num              # 재연결 이벤트 기록 (새 차량 포함 보호)
+                _freeze_frame_count = 0                             # 끊김 카운터 초기화
                 for _t in tracks:
                     _tid = _t["id"]
                     if st.trajectories[_tid]:                       # 기존 궤적 있으면
@@ -618,6 +633,49 @@ class Detector:
                         if self.gru_module_b is not None:
                             self.gru_module_b.reset()
 
+            # ── 프레임 freeze 감지 (끊김 재연결 감지) ─────────────────────────
+            # adj_diff ≈ 0 이 연속되면 카메라 freeze → 이후 정상 복귀 시 재연결 이벤트.
+            # _is_frame_skip(차량 displacement 기반)이 미탐지하는 짧은 끊김(1~10초)을 포착.
+            # switch.check()는 탐지 모드(not is_learning/relearning/waiting_stable)에서만 호출됨.
+            # → same 조건에서만 freeze 카운터를 업데이트해 일관성 유지.
+            #
+            # ★ 임계값: 상대값 사용 (고정값 사용 시 정체 구간 저속 diff를 freeze로 오감지)
+            #   - 정상 흐름:  avg≈5.0 → freeze 임계 = 0.50  (5.0 × 10%)
+            #   - 정체 구간:  avg≈0.5 → freeze 임계 = 0.05  (0.5 × 10%)
+            #   - 진짜 freeze: adj≈0.00 → 어느 환경에서도 임계 이하
+            if not st.is_learning and not st.relearning and not st.waiting_stable:
+                _adj_diff_now = self.switch.last_adj_diff           # switch.check()에서 방금 갱신됨
+
+                # 롤링 평균 계산 (최근 90프레임 — camera_switch diff_history와 동일 윈도우)
+                _adj_diff_history.append(_adj_diff_now)
+                if len(_adj_diff_history) > 90:
+                    _adj_diff_history.pop(0)
+                _avg_adj = sum(_adj_diff_history) / max(len(_adj_diff_history), 1)
+
+                # 동적 임계값: 평균의 10%, 최소 0.05 (noise floor)
+                _freeze_thr  = max(_avg_adj * 0.10, 0.05)
+                _min_freeze  = getattr(cfg, "min_freeze_frames", 10)  # 기본 10프레임
+
+                if _adj_diff_now < _freeze_thr:                     # 정지 프레임 (adj ≈ 0)
+                    _freeze_frame_count += 1
+                else:
+                    if _freeze_frame_count >= _min_freeze:          # freeze 구간 종료 = 재연결
+                        print(f"[F:{st.frame_num}] 📡 끊김 재연결 감지 "
+                              f"({_freeze_frame_count}프레임 정지, avg={_avg_adj:.2f}, "
+                              f"thr={_freeze_thr:.3f}) → 역주행 판정 차단 시작")
+                        st.post_reconnect_frame = st.frame_num      # 재연결 이벤트 기록
+                        # 모든 차량 궤적 초기화 (_is_frame_skip과 동일 처리)
+                        for _t in tracks:
+                            _tid = _t["id"]
+                            if st.trajectories[_tid]:
+                                _cur_pos = (_t["cx"], _t["cy"])
+                                st.trajectories[_tid] = [_cur_pos] * len(st.trajectories[_tid])
+                            st.last_velocity.pop(_tid, None)
+                            st.wrong_way_count[_tid] = 0
+                            st.direction_change_frame[_tid] = st.frame_num
+                            st.wrong_way_ids.discard(_tid)
+                    _freeze_frame_count = 0                         # 정상 프레임 → 카운터 초기화
+
             # ── 초기 학습 완료 처리 ──
             if st.is_learning:                                      # 학습 모드일 때만 체크
                 # 학습 완료 조건: learning_frames 도달 또는 최대 프레임 강제 종료
@@ -634,6 +692,9 @@ class Detector:
                     self.flow.apply_spatial_smoothing()            # ④ 재채움 (중앙선 불가침)
                     self._compute_ref_direction()                   # 기준 방향 벡터 계산
                     self._compute_direction_cell_counts()           # 방향별 셀 수 계산 → TA 주입
+                    # ── 양방향 채널 구축 (117차) ─────────────────────────────
+                    if self._ref_direction is not None:
+                        self.flow.build_directional_channels(*self._ref_direction)
                     if cfg.flow_map_path:                           # 저장 경로 있으면
                         self.flow.save(cfg.flow_map_path)           # flow_map만 저장
                         # ref_frame 저장 — 다음 실행 시 자동 매칭에 사용
@@ -665,6 +726,9 @@ class Detector:
                     self.flow.apply_spatial_smoothing()            # ④ 재채움 (중앙선 불가침)
                     self._compute_ref_direction()                   # 기준 방향 벡터 재계산
                     self._compute_direction_cell_counts()           # 방향별 셀 수 재계산 → TA 주입
+                    # ── 양방향 채널 재구축 (117차) ────────────────────────────
+                    if self._ref_direction is not None:
+                        self.flow.build_directional_channels(*self._ref_direction)
                     if cfg.flow_map_path:                           # 저장 경로 있으면
                         self.flow.save(cfg.flow_map_path)           # flow_map만 저장 (baseline 미포함)
                         # ref_frame 갱신 — 카메라 전환 후 새 화면으로 매칭 기준 교체
@@ -676,6 +740,68 @@ class Detector:
                     print("재학습 완료! 쿨다운 시작")
                     self._gru_pretrain_pending_a = True             # A방향 GRU pretrain 예약
                     self._gru_pretrain_pending_b = True             # B방향 GRU pretrain 예약
+
+            # ── 전차량 fleet cosine 선제 계산 (끊김 감지) ──────────────────────
+            # 정상 주행 시: 모든 차량이 flow_map 방향과 cos > 0 → fleet 평균 양수
+            # 화면 끊김 후: 차량 위치가 순간이동 → 속도 벡터가 무작위 방향 → fleet cos 급락
+            # 이 이벤트를 _is_frame_skip(displacement 기반)과 독립적으로 포착
+            #
+            # 발동 조건: (1) fleet 평균 < 0.0  (대다수가 역방향 벡터)
+            #            (2) 이전 프레임 대비 0.5 이상 급락
+            #            (3) 유효 차량 수 >= 3  (소수 샘플 오탐 방지)
+            _is_fleet_skip = False
+            if not st.is_learning and not st.relearning and not st.waiting_stable:
+                _fleet_cos_vals = []
+                for _ft in tracks:
+                    _ftid  = _ft["id"]
+                    _ftraj = st.trajectories[_ftid]
+                    if not _ftraj or len(_ftraj) < cfg.velocity_window:
+                        continue                                     # 궤적 부족 → 건너뜀
+                    _fw   = cfg.velocity_window
+                    _fsi  = len(_ftraj) - _fw
+                    _fpfx = [_ftraj[_fsi+i+1][0] - _ftraj[_fsi+i][0] for i in range(_fw-1)]
+                    _fpfy = [_ftraj[_fsi+i+1][1] - _ftraj[_fsi+i][1] for i in range(_fw-1)]
+                    _fvdx = float(np.median(_fpfx)) * (_fw - 1)
+                    _fvdy = float(np.median(_fpfy)) * (_fw - 1)
+                    _fmag = np.sqrt(_fvdx ** 2 + _fvdy ** 2)
+                    _fbh  = max(_ft["y2"] - _ft["y1"], 1)
+                    if _fmag / _fbh > cfg.norm_learn_threshold and _fmag > 1.0:
+                        _fndx, _fndy = _fvdx / _fmag, _fvdy / _fmag
+                        _ffv = self.flow.get_interpolated(_ft["cx"], _ft["cy"])
+                        if _ffv is not None:
+                            _fleet_cos_vals.append(              # cos(vehicle_vel, flow_map)
+                                _fndx * _ffv[0] + _fndy * _ffv[1]
+                            )
+
+                if len(_fleet_cos_vals) >= 5:                       # 유효 차량 5대 이상 (소수 오탐 방지)
+                    _fleet_cos_avg = sum(_fleet_cos_vals) / len(_fleet_cos_vals)
+                    # ① 절대 조건: fleet 평균이 음수 (이전 값 무관 — 재건 중에도 감지 가능)
+                    # ② 상대 조건: 직전 안정값 대비 급락 (첫 번째 이벤트용)
+                    _fleet_drop    = ((_prev_fleet_cos - _fleet_cos_avg)
+                                      if _prev_fleet_cos is not None else 0.0)
+                    _fleet_trigger = (
+                        (_fleet_cos_avg < -0.1)                     # ① 절대: 대다수 역방향 벡터
+                        or (_fleet_drop >= 0.5 and _fleet_cos_avg < 0.2)  # ② 상대: 급락+아직 낮음
+                    )
+                    if _fleet_trigger:
+                        _is_fleet_skip = True
+                        _prev_str = f"{_prev_fleet_cos:.2f}" if _prev_fleet_cos is not None else "N/A"
+                        print(f"[F:{st.frame_num}] 🚨 fleet cos 급락 "
+                              f"({_prev_str} → {_fleet_cos_avg:.2f}, "
+                              f"n={len(_fleet_cos_vals)}) → 전차량 궤적 초기화")
+                        st.post_reconnect_frame = st.frame_num      # 판정 차단 시작
+                        for _ft2 in tracks:
+                            _ftid2 = _ft2["id"]
+                            if st.trajectories[_ftid2]:
+                                _cur = (_ft2["cx"], _ft2["cy"])
+                                st.trajectories[_ftid2] = [_cur] * len(st.trajectories[_ftid2])
+                            st.last_velocity.pop(_ftid2, None)
+                            st.wrong_way_count[_ftid2] = 0
+                            st.direction_change_frame[_ftid2] = st.frame_num
+                            st.wrong_way_ids.discard(_ftid2)
+                        _prev_fleet_cos = None                      # 리셋: 다음 이벤트가 fresh start
+                    else:
+                        _prev_fleet_cos = _fleet_cos_avg            # 정상 프레임만 갱신
 
             # ── 차량별 속도 딕셔너리 초기화 ──
             speeds = {}                                             # {tid: mag} — traffic_analyzer용
@@ -768,9 +894,17 @@ class Detector:
 
                 # 궤적 길이가 velocity_window 이상일 때만 속도/방향 계산
                 if len(traj) >= cfg.velocity_window:                # 충분한 궤적 있으면
-                    vdx = traj[-1][0] - traj[-cfg.velocity_window][0]  # x 이동량
-                    vdy = traj[-1][1] - traj[-cfg.velocity_window][1]  # y 이동량
-                    mag = np.sqrt(vdx ** 2 + vdy ** 2)              # 속도 크기 (픽셀)
+                    # ── 중앙값 속도 벡터 (117차) ─────────────────────────────
+                    # endpoint-to-endpoint 대신 프레임별 변위의 중앙값 사용.
+                    # 단일 프레임 끊김·순간이동(신호 지연 등)이 있어도 중앙값에는
+                    # 영향 없음 → fleet_cos/solo_jump 의존 없이 방향 벡터가 견고해짐.
+                    _w   = cfg.velocity_window
+                    _si  = len(traj) - _w
+                    _pfx = [traj[_si+i+1][0] - traj[_si+i][0] for i in range(_w-1)]
+                    _pfy = [traj[_si+i+1][1] - traj[_si+i][1] for i in range(_w-1)]
+                    vdx  = float(np.median(_pfx)) * (_w - 1)        # 중앙값 × 창 크기 (mag 단위 유지)
+                    vdy  = float(np.median(_pfy)) * (_w - 1)
+                    mag  = np.sqrt(vdx ** 2 + vdy ** 2)             # 속도 크기 (픽셀)
 
                     # 프레임당 평균 이동거리 계산 (떨림 필터)
                     avg_move = mag / cfg.velocity_window             # 프레임당 평균 이동
@@ -806,7 +940,7 @@ class Detector:
                         speeds[tid] = speed                         # 속도 딕셔너리 갱신 (이미 mag이나 명시적 유지)
 
                         _learn_min_mag = max(1.0, _bh * cfg.norm_learn_threshold)  # nm 역산 최소 mag (학습·온라인 공용)
-                        if _is_frame_skip or _solo_jump:            # 프레임 스킵·단독 jump → 학습/판정 스킵
+                        if _is_frame_skip or _solo_jump or _is_fleet_skip:  # 프레임 스킵·단독 jump·fleet cos 급락 → 학습/판정 스킵
                             pass
                         elif st.is_learning or st.relearning:       # 학습/재학습 모드
                             # 궤적 전체 방향 계산 (traj[0] → 현재 위치)
@@ -819,11 +953,21 @@ class Detector:
                                 if _tmag >= cfg.min_move_distance:  # 충분히 이동한 경우만
                                     _traj_ndx = _tx / _tmag         # 궤적 단위 방향 x
                                     _traj_ndy = _ty / _tmag         # 궤적 단위 방향 y
-                            self.flow.learn_step(                   # 흐름장 업데이트 (bbox 전체 셀)
+
+                            # ── bbox 수평 폭 클리핑 (중앙선 침범 방지) ────────
+                            # max 반폭 = bbox_h × ratio → 차선 폭 범위 내로 제한
+                            # 실제 bbox가 더 좁으면 클리핑 없음 (min으로 자연 처리)
+                            _bh_learn = max(y2 - y1, 1)
+                            _bcx_learn = (x1 + x2) / 2
+                            _hw_limit = _bh_learn * getattr(cfg, 'bbox_learn_w_ratio', 0.8)
+                            _x1_learn = max(x1, _bcx_learn - _hw_limit)
+                            _x2_learn = min(x2, _bcx_learn + _hw_limit)
+
+                            self.flow.learn_step(                   # 흐름장 업데이트
                                 traj[-cfg.velocity_window][0],
                                 traj[-cfg.velocity_window][1],
                                 fx, fy, _learn_min_mag,
-                                bbox=(x1, y1, x2, y2),             # bbox 전체 셀 갱신 + 반대방향 겹침 추적
+                                bbox=(_x1_learn, y1, _x2_learn, y2),  # 폭 제한된 bbox
                                 traj_ndx=_traj_ndx,                # 궤적 방향 (중앙점 학습용)
                                 traj_ndy=_traj_ndy
                             )
@@ -831,8 +975,49 @@ class Detector:
                             # 역주행 여부 판단 (bbox_h 전달 — nm 기반 속도 게이트용)
                             _bbox_h = max(y2 - y1, 1)               # bbox 높이 (원근 정규화용)
                             is_wrong, _, debug_info = self.judge.check(
-                                tid, traj, ndx, ndy, mag, cy, _bbox_h
+                                tid, traj, ndx, ndy, mag, cy, _bbox_h,
+                                track_dir=self._track_direction.get(tid)
                             )
+
+                            # ── 이웃 차량 방향 일치 확인 (118차 — neighbor_agreement_guard) ──
+                            # 진짜 역주행: 이 차량만 반대 방향, 같은 분류 이웃은 정방향
+                            # 오탐(flow map 오류·오염): 같은 분류 이웃 차량들도 같은 방향으로 이동 중
+                            # → 이웃 N대 이상이 같은 방향이면 flow map이 틀린 것으로 판단 → 취소
+                            _nbr_min   = getattr(cfg, "neighbor_guard_min_total", 3)
+                            _nbr_agree = getattr(cfg, "neighbor_guard_agree",     2)
+                            _sus_dir   = self._track_direction.get(tid)
+                            if is_wrong and (ndx != 0.0 or ndy != 0.0) and _sus_dir is not None:
+                                _same_dir  = 0
+                                _total_nbr = 0
+                                for _ov, _ovv in st.last_velocity.items():
+                                    if _ov == tid or _ov in st.wrong_way_ids:
+                                        continue
+                                    if self._track_direction.get(_ov) != _sus_dir:
+                                        continue            # 같은 방향 분류 차량만 비교
+                                    _total_nbr += 1
+                                    if float(ndx * _ovv[0] + ndy * _ovv[1]) > 0.5:
+                                        _same_dir += 1
+                                if _total_nbr >= _nbr_min and _same_dir >= _nbr_agree:
+                                    st.wrong_way_ids.discard(tid)
+                                    st.wrong_way_count[tid] = 0
+                                    st.first_suspect_frame.pop(tid, None)
+                                    is_wrong = False
+                                    print(f"   ✅ ID:{tid} 이웃 {_same_dir}/{_total_nbr}대 "
+                                          f"동방향 → 역주행 취소 (flow map 오탐 추정)")
+                                    # ── 119차 cascade reset ────────────────────────────────
+                                    # 이웃 중 의심 누적 중인 같은 방향 차량도 함께 초기화
+                                    # 이유: W1 취소 직후 W2·W3이 연속 확정되는 패턴 방지
+                                    for _ov2, _ovv2 in list(st.last_velocity.items()):
+                                        if _ov2 == tid or _ov2 in st.wrong_way_ids:
+                                            continue
+                                        if self._track_direction.get(_ov2) != _sus_dir:
+                                            continue
+                                        if float(ndx * _ovv2[0] + ndy * _ovv2[1]) > 0.5:
+                                            if st.wrong_way_count.get(_ov2, 0) > 0:
+                                                st.wrong_way_count[_ov2] = 0
+                                                st.first_suspect_frame.pop(_ov2, None)
+                                                print(f"   ↩️  ID:{_ov2} 연쇄 의심 초기화 "
+                                                      f"(cascade from ID:{tid})")
 
                             # 역주행 확정 시 라벨 부여
                             if is_wrong and tid in st.wrong_way_ids:

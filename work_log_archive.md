@@ -4,6 +4,328 @@
 
 ---
 
+## 2026-04-18 (119차 — v3 npy 채널 자동 재구성 + 이웃 가드 임계값 완화 + cascade reset) [대원]
+
+### 오늘 한 작업
+
+**118차 가드가 W1-W4 오탐 시 발동되지 않는 문제 수정**
+
+**원인 분석:**
+1. `neighbor_guard_min_total=3` 인데 W1 확정 시 이웃(W2, W3)이 2대뿐 → 가드 미발동
+2. 기존 flow_map.npy가 v3 형식이면 `_ref_dx=None` → 채널 미구축 → 117/118차 효과 없음
+
+---
+
+#### ① v3 npy 로드 후 채널 자동 재구성 (`detector.py`)
+
+```python
+# detect_only 로드 직후
+self._compute_ref_direction()
+if self._ref_direction is not None:
+    self.flow.build_directional_channels(*self._ref_direction)
+```
+
+v4 미만 파일을 로드해도 즉시 양방향 채널을 재구성 → npy 삭제 불필요.
+
+---
+
+#### ② 이웃 가드 임계값 완화 (`config.py`)
+
+```
+neighbor_guard_min_total: 3 → 2   # W2+W3 2대만 있어도 발동
+neighbor_guard_agree:     2 → 1   # 1대만 동방향이어도 취소
+```
+
+---
+
+#### ③ cascade reset — 연쇄 확정 방지 (`detector.py`)
+
+W1 가드 취소 시, 의심 누적 중인 이웃(W2·W3)도 `wrong_way_count=0` 리셋.
+→ W1 취소 직후 W2·W3이 연속 확정되는 패턴 차단.
+
+```python
+for _ov2 in (same-dir neighbors with wrong_way_count > 0 going same direction):
+    st.wrong_way_count[_ov2] = 0
+    st.first_suspect_frame.pop(_ov2, None)
+```
+
+### 수정 파일
+`src/detector.py`, `src/config.py`
+
+### 주의사항
+- 기존 npy 삭제 불필요 — 로드 직후 자동 채널 재구성
+- cascade reset은 이미 `wrong_way_ids`에 있는 확정 차량은 건드리지 않음
+
+---
+
+## 2026-04-18 (118차 — 오염-인식 글로벌 fallback + 이웃 차량 방향 가드) [대원]
+
+### 오늘 한 작업
+
+**39f/19f 균일 오탐 패턴 근본 수정**
+
+**문제 패턴 분석:**
+```
+W1 │  39f (1.30s) │  19f (0.63s)   ← 의심 시작 = age gate 해제 순간(20f)
+W3 │  39f (1.30s) │  19f (0.63s)   ← wrong_count가 20프레임 연속 누적 → 확정
+```
+normal path 확정: age gate 해제 직후부터 **단 한 프레임도 agree 없이** 20f 연속 disagree.
+= flow map이 해당 차량의 진행 경로에서 반대 방향을 가리키고 있음.
+
+---
+
+#### ① 오염-인식 글로벌 fallback (`flow_map.py`)
+
+**기존 문제:**
+양방향 채널 구축 후, 채널에 데이터 없는 셀은 글로벌 맵으로 fallback.
+글로벌 맵이 반대 차선 오염 벡터면 그대로 사용 → 오탐 유발.
+
+**수정:**
+채널 데이터 없는 셀에서 글로벌 방향이 쿼리 방향과 반대이면 `None` 반환.
+```
+A차량 → flow_a 조회 → 없음 → 글로벌=B방향(오염) → None → vote skip
+A차량 → flow_a 조회 → 없음 → 글로벌=A방향(clean) → 반환 → vote 참여
+```
+`_ref_dx, _ref_dy` 를 FlowMap에 저장, `build_directional_channels` 시 세팅.
+
+---
+
+#### ② 이웃 차량 방향 일치 가드 (`detector.py` + `config.py`)
+
+**기존 문제:**
+flow map 오류 시 해당 구역의 모든 정상 차량이 일괄 flagging됨.
+flow map에만 의존하므로 "현재 프레임에서 무슨 일이 벌어지는지" 모름.
+
+**수정:**
+역주행 확정 직전, 같은 방향분류(A/B) 이웃 차량 중 같은 방향으로 이동 중인 차량 수 확인.
+```
+진짜 역주행: 이 차량만 반대방향 → 같은방향 이웃 0~1대 → 가드 비발동
+flow map 오류: 여러 정상차량 일괄 flagging → 이웃도 같은방향 → 취소
+```
+
+```python
+for _ov, _ovv in st.last_velocity.items():
+    if track_direction[_ov] != _sus_dir: continue  # 같은 분류만
+    if cos(ndx,ndy, _ovv) > 0.5: _same_dir += 1
+
+if _total_nbr >= 3 and _same_dir >= 2:
+    wrong_way_ids.discard(tid)  # 역주행 취소
+```
+
+**config 추가:**
+- `neighbor_guard_min_total: int = 3`
+- `neighbor_guard_agree: int = 2`
+
+### 수정 파일
+`src/flow_map.py`, `src/detector.py`, `src/config.py`
+
+---
+
+## 2026-04-18 (117차 — 중앙값 속도 벡터 + 양방향 flow map) [대원]
+
+### 오늘 한 작업
+
+**수치 조정 없는 근본 해결 2종 동시 적용**
+
+---
+
+#### ① 중앙값(Median) 속도 벡터 (`detector.py`, `judge.py`)
+
+**기존 방식 문제:**
+```
+velocity = traj[-1] - traj[-velocity_window]  # endpoint-to-endpoint
+```
+velocity_window(10f) 안에 신호 끊김·서버 지연이 1프레임이라도 있으면
+시작점 또는 끝점이 오염 → 전체 방향 벡터가 뒤집힘.
+
+**수정:**
+```python
+_pfx = [traj[si+i+1][0] - traj[si+i][0] for i in range(w-1)]
+_pfy = [traj[si+i+1][1] - traj[si+i][1] for i in range(w-1)]
+vdx = median(_pfx) * (w-1)
+vdy = median(_pfy) * (w-1)
+```
+
+10프레임 중 1~2프레임이 끊겨도 중앙값에는 영향 없음.
+
+#### ② 양방향(Dual-Channel) flow map (`flow_map.py`, `detector.py`, `judge.py`)
+
+학습 완료 후 A/B 채널 분리. A차량은 flow_a만, B차량은 flow_b만 조회 → 중앙선 오염 구조적 차단.
+
+### 수정 파일
+`src/flow_map.py`, `src/detector.py`, `src/judge.py`
+
+---
+
+## 2026-04-15 (116차 — 서행→가속 fast-track 오탐 방지) [대원]
+
+서행 구간(nm<0.15) 중 lcf 미갱신 → 가속 직후 fast-track 즉시 확정 오탐 수정.
+이중 방어: ① 서행 중에도 방향 일치 시 lcf 갱신 / ② post_slow_guard_frames=30 추가.
+
+### 수정 파일
+`src/config.py`, `src/judge.py`
+
+---
+
+## 2026-04-15 (115차 — fast-track 최소 나이 요건 추가) [대원]
+
+fast-track 오탐 방지용 `fast_confirm_min_age=45` 추가. 새 씬·오염 셀에서 정상 차량 28f만에 확정되는 패턴 차단.
+
+### 수정 파일
+`src/config.py`, `src/judge.py`
+
+---
+
+## 2026-04-15 (114차 — bbox 수평 폭 제한 + dist≥2 게이팅 추가) [대원]
+
+bbox 학습 폭을 `bbox_height × 0.8`로 제한해 중앙선 침범 방지. dist≥2 셀 게이팅 추가.
+
+### 수정 파일
+`src/detector.py`, `src/flow_map.py`, `src/config.py`
+
+---
+
+## 2026-04-15 (113차 — fleet cos 재감지 버그 수정 + 중앙선 침범 방지 강화) [대원]
+
+fleet cos 재감지 안 되는 버그(prev=-0.02 고정) 수정. dist=1 게이팅 임계값 강화(-0.4→-0.2).
+
+### 수정 파일
+`src/detector.py`, `src/flow_map.py`
+
+---
+
+## 2026-04-15 (112차 — fleet cosine 기반 끊김 감지 추가) [대원]
+
+전차량 fleet cosine 급락 감지 3번째 끊김 감지 계층 추가. 발동 조건: 유효 차량 ≥5, avg<-0.1 또는 0.5 급락.
+
+### 수정 파일
+`src/detector.py`
+
+---
+
+## 2026-04-15 (111차 — freeze 감지 임계값 상대값으로 교체) [대원]
+
+freeze 감지 고정 임계값 → 상대값(avg × 10%) 교체. 정체 구간 adj≈0.4 오감지 방지.
+- `_adj_diff_history` 90프레임 롤링 평균, 임계값 `max(avg×0.10, 0.05)`
+- `config.py`: `freeze_diff_threshold` 제거, `min_freeze_frames` 3→10
+- `judge.py`: normal-path `_reconnect_guard` 제거 (direction_change_frame + min_age로 충분)
+
+수정 파일: `src/detector.py`, `src/judge.py`, `src/config.py`
+
+---
+
+## 2026-04-15 (110차 — 프레임 freeze 기반 끊김 재연결 감지) [대원]
+
+프레임 내용(adj_diff) 기반 끊김 재연결 감지 추가.
+- `state.py`: `post_reconnect_frame = 0` 추가
+- `config.py`: `freeze_diff_threshold=0.5`, `min_freeze_frames=3` 추가
+- `detector.py`: freeze 카운터, 재연결 이벤트 시 전차량 궤적 초기화 + direction_change_frame
+- `judge.py`: fast-track 조건에 `not _reconnect_guard` 추가
+
+수정 파일: `src/state.py`, `src/config.py`, `src/detector.py`, `src/judge.py`
+
+---
+
+## 2026-04-15 (109차 — fast-track 궤적 일관성 체크 + FlowMap 가장자리 마진) [대원]
+
+- `judge.py`: fast-track에서 traj[0]→[-1] 전체방향 vs traj[-window]→[-1] 최근방향 cos < 0.5 → 차단
+- `config.py`: `flow_map_edge_margin: int = 1` 추가
+- `flow_map.py` + `detector.py`: 그리드 외곽 1줄 학습 제외
+
+수정 파일: `src/judge.py`, `src/flow_map.py`, `src/config.py`, `src/detector.py`
+
+---
+
+## 2026-04-15 (108차 — dist==0 trajectory 기반 게이팅 복원) [대원]
+
+dist==0 게이팅을 velocity_window 방향 → trajectory 방향으로 교체. `continue` 추가(EMA 갱신 거부 핵심). `count -= 1 → count -= 2` (2배 빠른 잠금 해제).
+
+수정 파일: `src/flow_map.py`
+
+---
+
+## 2026-04-15 (107차 — FlowMap apply_direction_repair 추가) [대원]
+
+학습 완료 후 셀 방향 교정: 이웃 일관성 충분 + 해당 셀만 반대(cos<-0.3) → 이웃 평균으로 교정.
+처리 순서: ①smoothing → ②overlap_erosion → ③direction_repair → ④smoothing
+
+수정 파일: `src/flow_map.py`, `src/detector.py`
+
+---
+
+## 2026-04-15 (106차 — FlowMap 중앙점 즉시 덮어씌움 + 궤적 방향 학습) [대원]
+
+learn_step 전면 재설계. dist=0 게이팅 제거(항상 갱신) + traj 방향 우선. `_bbox_contra_count`를 dist=0에서만 추적.
+⚠️ 106차 자체가 역효과(오염 심화) → 108차에서 게이팅 복원.
+
+수정 파일: `src/flow_map.py`, `src/detector.py`
+
+---
+
+## 2026-04-15 (105차 — FlowMap count 감소 범위 수정) [대원]
+
+count 감소를 dist==0에만 제한 (dist=1 count 감소 제거 → 상행선 하단 셀 공백 해소).
+
+수정 파일: `src/flow_map.py`
+
+---
+
+## 2026-04-14 (104차 — FlowMap 침식 과다 + 중앙점 방향 전환 불가 수정) [대원]
+
+`bbox_contra_threshold` 3→8. dist=0 게이팅 차단 시 `count = max(0, count-1)` 추가 (영구 잠금 해제).
+
+수정 파일: `src/config.py`, `src/flow_map.py`
+
+---
+
+## 2026-04-15 (103차 — FlowMap bbox 거리 기반 alpha 감쇠 학습) [대원]
+
+`bbox_alpha_decay=0.5`, `bbox_gating_alpha_ratio=0.3` 도입. dist당 alpha 감쇠, dist≥2는 soft 유지.
+
+수정 파일: `src/config.py`, `src/flow_map.py`, `src/detector.py`
+
+---
+
+## 2026-04-15 (102차 — global trajectory bypass 버그 수정) [대원]
+
+`_ft_ok = True` → `False`, `global_ok = True` → `False` (flow 없으면 확정 불가). 이동 부족 시만 True.
+
+수정 파일: `src/judge.py`
+
+---
+
+## 2026-04-15 (101차 — velocity_window 전환 노이즈 기반 경계값 수정) [대원]
+
+fast-track `_lcf_ft <= _age_gate_end_ft` 경계: `first_seen + min_age + velocity_window` 공식 적용. `wrong_count_threshold` 12→20.
+
+수정 파일: `src/judge.py`, `src/config.py`
+
+---
+
+## 2026-04-14 (100차 — sudden_change_rejected 무한 리셋 근본 수정) [대원]
+
+SCR 체크 경계: `lcf > 0` → `lcf > _age_gate_end`. fast-track: `lcf == 0` → `lcf <= _age_gate_end`.
+
+수정 파일: `src/judge.py`
+
+---
+
+## 2026-04-14 (99차 — 역주행 탐지 속도 파라미터 3종 조정) [대원]
+
+`min_wrongway_track_age` 45→20, `fast_confirm_speed` 0.40→0.20, `wrong_count_threshold` 25→12.
+
+수정 파일: `src/config.py`
+
+---
+
+## 2026-04-14 (98차 — FlowMap bbox 풋프린트 학습 + 겹침 기반 경계 제거) [대원]
+
+`learn_step()` bbox 모드 추가 (bbox 전체 셀 EMA). `apply_overlap_erosion()` 추가 (contra_count≥3 → eroded). `apply_boundary_erosion` 대체.
+
+수정 파일: `src/flow_map.py`, `src/detector.py`, `src/config.py`
+
+---
+
 ## 2026-04-06 (73~76차 — normal mode 제거 + jam_score 밀도 보정 + 방향 분류 nearest-neighbor) [대원]
 
 ### 오늘 한 작업 [대원] — 추가

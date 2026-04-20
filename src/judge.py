@@ -68,7 +68,8 @@ class WrongWayJudge:
         threshold = self._get_cos_threshold(px, py, level="short")  # 단기 레벨 threshold
         return cos < threshold                            # 완화된/원본 임계값 기준 판정
 
-    def check(self, track_id, traj, ndx, ndy, speed, cy, bbox_h: float = 30.0):
+    def check(self, track_id, traj, ndx, ndy, speed, cy, bbox_h: float = 30.0,
+              track_dir=None):
         """한 차량에 대해 flow_map과 방향 비교, 투표 방식으로 역주행 여부 판정.
 
         Args:
@@ -105,7 +106,7 @@ class WrongWayJudge:
             _bh_c = max(bbox_h, cfg.min_bbox_h)                     # bbox_h 클램프
             _nm   = speed / _bh_c                                   # 정규화 속도
             if _nm >= cfg.norm_speed_gate_threshold and traj:       # 속도 충분 + 궤적 있으면
-                _fv = self.flow.get_interpolated(traj[-1][0], traj[-1][1])  # 현재 위치 flow 조회
+                _fv = self.flow.get_interpolated(traj[-1][0], traj[-1][1], direction=track_dir)  # 현재 위치 flow 조회
                 if _fv is not None:
                     _cos = float(ndx * _fv[0] + ndy * _fv[1])      # 방향 코사인
                     if _cos >= cfg.cos_threshold:                   # 정방향 확인 (threshold 이상)
@@ -120,6 +121,16 @@ class WrongWayJudge:
         _bh_clamped = max(bbox_h, cfg.min_bbox_h)     # bbox_h 클램프 (min_bbox_h=30 기준)
         nm_speed = speed / _bh_clamped                # bbox_h 기반 정규화 속도
         if nm_speed < cfg.norm_speed_gate_threshold:  # nm 기준 속도 부족 → 방향 불명확
+            # ── 서행 구간에서도 정방향이면 lcf 갱신 (가속 직후 fast-track 오탐 방지) ──
+            # ID:1327 패턴: ~150f 서행(nm<0.15) → judge가 lcf를 전혀 갱신 안 함
+            #               → 가속 순간 lcf=0으로 인식 → fast-track 즉시 발동 (오탐)
+            # 서행 중에도 방향이 flow_map과 일치(cos >= cos_threshold)하면 lcf 갱신 → 가드 활성화
+            if (ndx != 0.0 or ndy != 0.0) and traj:
+                _fv_slow = self.flow.get_interpolated(traj[-1][0], traj[-1][1], direction=track_dir)
+                if _fv_slow is not None:
+                    _slow_cos = float(ndx * _fv_slow[0] + ndy * _fv_slow[1])
+                    if _slow_cos >= cfg.cos_threshold:
+                        st.last_correct_frame[track_id] = st.frame_num
             return False, 0, {"status": "slow", "cos_values": []}
 
         # ── 방향 급변 필터 (CCTV 글자/오클루전 오탐 차단) ──────────────
@@ -176,7 +187,7 @@ class WrongWayJudge:
 
         for idx in range(0, len(traj), step):          # 샘플 포인트 순회
             px, py = traj[idx]                         # 궤적 포인트 좌표
-            flow_v = self.flow.get_interpolated(px, py)  # 해당 위치 flow 벡터
+            flow_v = self.flow.get_interpolated(px, py, direction=track_dir)  # 해당 위치 flow 벡터
 
             if flow_v is None:                         # 유효한 flow 없으면
                 skip += 1
@@ -236,17 +247,22 @@ class WrongWayJudge:
         long_suspect = True                            # 기본값: 패스 (궤적 부족 시 생략)
 
         if len(traj) >= long_window:                   # 장기 궤적이 쌓인 경우만 검사
-            lvdx = traj[-1][0] - traj[-long_window][0]  # 장기 x 이동량
-            lvdy = traj[-1][1] - traj[-long_window][1]  # 장기 y 이동량
+            # 장기 윈도우도 중앙값 벡터 사용 (117차 — 끊김 내성)
+            _lw  = long_window
+            _lsi = len(traj) - _lw
+            _lpfx = [traj[_lsi+i+1][0] - traj[_lsi+i][0] for i in range(_lw-1)]
+            _lpfy = [traj[_lsi+i+1][1] - traj[_lsi+i][1] for i in range(_lw-1)]
+            lvdx = float(np.median(_lpfx)) * (_lw - 1)
+            lvdy = float(np.median(_lpfy)) * (_lw - 1)
             lmag = np.sqrt(lvdx**2 + lvdy**2)           # 장기 이동 크기 (픽셀)
-            avg_lmove = lmag / long_window               # 장기 프레임당 평균 이동
+            avg_lmove = lmag / _lw                       # 장기 프레임당 평균 이동
 
             if (lmag > cfg.min_move_distance            # 누적 이동 충분
                     and avg_lmove > cfg.min_move_per_frame):  # 프레임당 이동 충분
                 lndx = lvdx / lmag                      # 장기 단위 x 방향
                 lndy = lvdy / lmag                      # 장기 단위 y 방향
                 cx_last, cy_last = traj[-1]             # 현재 위치 (flow 조회용)
-                flow_v_long = self.flow.get_interpolated(cx_last, cy_last)
+                flow_v_long = self.flow.get_interpolated(cx_last, cy_last, direction=track_dir)
 
                 if flow_v_long is not None:             # flow 유효하면
                     long_cos = float(                   # 장기 방향 코사인
@@ -281,9 +297,40 @@ class WrongWayJudge:
         # age_gate_end + velocity_window 이내의 lcf는 전환 노이즈로 간주하고 fast-track 허용.
         _age_gate_end_ft = (st.first_seen_frame.get(track_id, 0)
                             + _min_age + cfg.velocity_window)
+        # ── 끊김 재연결 가드 확인 ────────────────────────────────────────────
+        # 프레임 freeze 후 재연결 감지 시 post_reconnect_frame이 설정됨.
+        # direction_change_guard_frames 동안 fast-track + 최종 확정 차단.
+        # 기존 차량: direction_change_frame도 설정돼 있지만, 재연결 직후 등장한 새 차량은
+        # direction_change_frame이 없으므로 post_reconnect_frame으로 추가 보호.
+        _post_rec = getattr(st, "post_reconnect_frame", 0)
+        _reconnect_guard = (_post_rec > 0
+                            and (st.frame_num - _post_rec)
+                            <= cfg.direction_change_guard_frames)
+
+        _cur_age    = st.frame_num - st.first_seen_frame.get(track_id, st.frame_num)
+        _ft_min_age = getattr(cfg, "fast_confirm_min_age", 45)
+
+        # ── 서행 후 가속 fast-track 가드 ────────────────────────────────────
+        # ID:1327 패턴: 오랜 서행(nm<0.15) → judge 미실행 → lcf 갱신 안 됨 → lcf=0
+        #               → 가속 직후 의심 시작 → 3f 만에 fast-track 확정 (오탐)
+        # 수정: first_suspect_frame 이전 구간에서 서행이 충분히 길었으면,
+        #        fast-track 발동 전 최소 post_slow_guard_frames 동안 의심을 유지해야 함.
+        # (slow 구간 lcf 갱신 수정과 이중 방어 — lcf 갱신이 안 된 이전 영상에도 대응)
+        _fsf_guard = st.first_suspect_frame.get(track_id, st.frame_num)
+        # _age_gate_end_ft 이후 ~ 의심 시작 전 사이가 slow 구간으로 채워진 기간
+        _pre_suspect_slow = max(0, _fsf_guard - _age_gate_end_ft)
+        _suspect_elapsed  = st.frame_num - _fsf_guard
+        _psg_frames = getattr(cfg, "post_slow_guard_frames", 30)
+        # slow 구간이 guard 이상 길었고 아직 의심 지속이 짧으면 fast-track 차단
+        _post_slow_guard = (_pre_suspect_slow >= _psg_frames
+                            and _suspect_elapsed < _psg_frames)
+
         if (disagree_ratio >= cfg.fast_confirm_ratio    # 투표 압도적 역방향
                 and nm_speed >= cfg.fast_confirm_speed  # 중속 이상 (서행 오탐 방지)
-                and _lcf_ft <= _age_gate_end_ft):       # velocity_window 안정화 이후 정방향 없었음
+                and _lcf_ft <= _age_gate_end_ft         # velocity_window 안정화 이후 정방향 없었음
+                and not _reconnect_guard                # 끊김 재연결 이후 가드 기간 아님
+                and _cur_age >= _ft_min_age             # 최소 관찰 나이 — 새 씬·오염 셀 오탐 방지
+                and not _post_slow_guard):              # 서행 후 가속 즉시 fast-track 차단
             # 전체 궤적 방향 검증 (일반 경로와 동일)
             # flow를 한 곳도 못 찾으면 확정 불가 (_ft_ok=False) — bypass 금지
             _ft_ok = False
@@ -293,14 +340,49 @@ class WrongWayJudge:
                 _gmag = np.sqrt(_gvdx**2 + _gvdy**2)
                 if _gmag > cfg.min_move_distance:
                     _gndx, _gndy = _gvdx / _gmag, _gvdy / _gmag
-                    for _ti in [-1, 0, len(traj) // 2]:
-                        _fv = self.flow.get_interpolated(traj[_ti][0], traj[_ti][1])
-                        if _fv is not None:
-                            _gc = float(_gndx * _fv[0] + _gndy * _fv[1])
-                            _ft_ok = (_gc < self._get_cos_threshold(
-                                traj[_ti][0], traj[_ti][1], level="global"))
-                            debug_info["global_cos"] = round(_gc, 4)
-                            break
+
+                    # ── 궤적 일관성 검사: 전체 방향 vs 최근 방향 ───────────
+                    # 프레임 스킵·ID 재할당으로 궤적이 뒤섞인 경우 fast-track 차단.
+                    # traj[0]이 순간이동 전 좌표이면 global 방향이 반전돼 오탐 발생.
+                    # 최근 velocity_window 구간 방향이 global과 다르면 궤적 불신뢰.
+                    _traj_consistent = True                # 일관성 통과 기본값
+                    if len(traj) >= cfg.velocity_window * 2:
+                        _rv_w  = cfg.velocity_window
+                        _rv_si = len(traj) - _rv_w
+                        _rv_pfx = [traj[_rv_si+i+1][0] - traj[_rv_si+i][0] for i in range(_rv_w-1)]
+                        _rv_pfy = [traj[_rv_si+i+1][1] - traj[_rv_si+i][1] for i in range(_rv_w-1)]
+                        _rv_dx = float(np.median(_rv_pfx)) * (_rv_w - 1)
+                        _rv_dy = float(np.median(_rv_pfy)) * (_rv_w - 1)
+                        _rmag  = np.sqrt(_rv_dx ** 2 + _rv_dy ** 2)
+                        if _rmag > cfg.min_move_distance:
+                            _rndx, _rndy = _rv_dx / _rmag, _rv_dy / _rmag
+                            _cons_cos = float(_gndx * _rndx + _gndy * _rndy)
+                            debug_info["traj_consistency"] = round(_cons_cos, 3)
+                            if _cons_cos < 0.5:            # 전체 vs 최근 방향 72° 이상 불일치
+                                _traj_consistent = False   # fast-track 차단
+                    # ──────────────────────────────────────────────────────
+
+                    if _traj_consistent:                   # 궤적 일관성 통과 시에만 global_cos 검증
+                        for _ti in [-1, 0, len(traj) // 2]:
+                            _fv = self.flow.get_interpolated(traj[_ti][0], traj[_ti][1],
+                                                             direction=track_dir)
+                            if _fv is not None:
+                                _gc = float(_gndx * _fv[0] + _gndy * _fv[1])
+                                _ft_ok = (_gc < self._get_cos_threshold(
+                                    traj[_ti][0], traj[_ti][1], level="global"))
+                                debug_info["global_cos"] = round(_gc, 4)
+                                break
+            # ── 122차: fast-track도 궤적 방향 vs 기준 방향 직접 비교 ─────
+            if (_ft_ok
+                    and self.flow._ref_dx is not None):
+                _ft_traj_ref_cos = float(
+                    _gndx * self.flow._ref_dx + _gndy * self.flow._ref_dy
+                )
+                debug_info["traj_ref_cos"] = round(_ft_traj_ref_cos, 4)
+                if _ft_traj_ref_cos > -0.3:            # 궤적이 정방향 → 오탐
+                    _ft_ok = False
+                    debug_info["status"] = "ft_traj_vs_ref_normal"
+
             if _ft_ok:
                 st.wrong_way_ids.add(track_id)
                 debug_info["status"] = "FAST_CONFIRMED"
@@ -378,7 +460,40 @@ class WrongWayJudge:
                         global_ok = (global_cos < global_threshold)  # 역방향이어야 확정
                     # flow_v_global=None: 3곳 모두 flow 없음 → global_ok=False (확정 불가)
 
+            # ── 122차: 궤적 방향 vs 기준 방향 직접 비교 ────────────────────
+            # flow map 오염·채널 오분류 시 정상 차량도 global_cos < threshold 통과 가능.
+            # 최종 안전망: 차량의 실제 궤적 방향(gndx, gndy)이 기준 방향(_ref_dx)과
+            # cos > -0.3 이면 정상 방향 주행 → 역주행 취소.
+            # 진짜 역주행: cos ≈ -1.0 (완전 역방향) → -0.3 미만 → 확정 허용
+            # flow map 오탐: cos ≈ +1.0 (정방향) → -0.3 초과 → 취소 ✓
+            if (global_ok
+                    and gmag > cfg.min_move_distance    # 이동이 충분해야 궤적 방향 신뢰
+                    and self.flow._ref_dx is not None): # 기준 방향이 설정돼 있어야 비교 가능
+                _traj_ref_cos = float(
+                    gndx * self.flow._ref_dx + gndy * self.flow._ref_dy
+                )
+                debug_info["traj_ref_cos"] = round(_traj_ref_cos, 4)
+                if _traj_ref_cos > -0.3:               # 궤적이 정방향에 가까움 → 오탐
+                    global_ok = False
+                    debug_info["status"] = "traj_vs_ref_normal"
+
             if global_ok:                              # 전체 궤적도 역방향 → 최종 확정
+                # normal-path는 direction_change_frame(기존 차량) + min_age(새 차량)로 이미 보호됨.
+                # post_reconnect_guard는 fast-track에만 적용 (wrong_count가 충분히 쌓인 확정은 허용).
+                # ── 진단 출력 (121차 — 오탐 분석용) ───────────────────────────────
+                _ref_status = (f"ref_dx={self.flow._ref_dx:.3f}" if self.flow._ref_dx is not None
+                               else "ref_dx=None(채널비활성)")
+                _cur_fv_dir = self.flow.get_interpolated(
+                    traj[-1][0], traj[-1][1], direction=track_dir)
+                _cur_fv_str = (f"({_cur_fv_dir[0]:.3f},{_cur_fv_dir[1]:.3f})"
+                               if _cur_fv_dir is not None else "None")
+                print(f"   🚨 [normal] ID:{track_id} "
+                      f"track_dir={track_dir} {_ref_status} "
+                      f"vel=({ndx:.3f},{ndy:.3f}) "
+                      f"flow_at_pos={_cur_fv_str} "
+                      f"global_cos={debug_info.get('global_cos','?')} "
+                      f"traj_ref_cos={debug_info.get('traj_ref_cos','?')} "
+                      f"disagree={disagree_ratio:.2f}")
                 st.wrong_way_ids.add(track_id)         # 역주행 차량으로 등록
                 debug_info["status"] = "CONFIRMED"
                 return True, disagree_ratio, debug_info
