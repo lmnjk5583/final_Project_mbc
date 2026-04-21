@@ -208,10 +208,27 @@ class TrafficAnalyzer:
             if pred is not None:
                 self._last_future_pred = pred
 
-            # Direct 예측 (장기 — 1·3·5분 후)
+            # Direct 예측 (장기 — 5분 후)
             direct = self._gru_module.predict_direct()
             if direct is not None:                    # 학습 완료 후에만 결과 있음
-                self._last_direct_pred = direct
+                # ── 현재 상태 앵커링 ──────────────────────────────────────
+                # 정체는 자기상관이 높음 (현재 JAM → 5분 후도 JAM/SLOW 가능성 높음).
+                # 모델이 JAM 학습 데이터 부족 시 SMOOTH를 낮은 신뢰도로 출력.
+                # → 현재 레벨이 JAM/SLOW 인데 모델 신뢰도 < 0.65이면 현재 레벨로 보정.
+                # 단, 모델이 SMOOTH를 65% 이상 확신하면 개선 신호로 신뢰.
+                _cur_level = level                    # 방금 확정된 현재 레벨
+                _anchored = []
+                for _p in direct:
+                    if (_cur_level in ("JAM", "SLOW")
+                            and _p.get("predicted_level") == "SMOOTH"
+                            and _p.get("confidence", 1.0) < 0.65):
+                        _p2 = dict(_p)
+                        _p2["predicted_level"] = _cur_level   # 현재 레벨로 덮어씀
+                        _p2["confidence"] = 0.50              # 중간 신뢰도 (앵커링 표시)
+                        _anchored.append(_p2)
+                    else:
+                        _anchored.append(_p)
+                self._last_direct_pred = _anchored
 
         # ── feature 저장 (detector.py에서 GRU online_step용 레벨 확인에 사용) ─
         self._last_feature = x_t                      # 마지막 feature 벡터 저장

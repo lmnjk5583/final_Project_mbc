@@ -206,7 +206,7 @@ class DetectorConfig:
     gru_log_interval: int = 3                         # feature 로그 저장 주기 (프레임)
                                                       # 매 프레임 저장 시 I/O 과부하 → 3프레임마다 1개 저장
                                                       # 10fps × 1/3 ≈ 3.3개/초 → 1시간 ≈ 12,000개
-    gru_retrain_interval_sec: float = 3600.0          # 누적 데이터 증가 후 재학습 주기 (초)
+    gru_retrain_interval_sec: float = 1200.0          # 누적 데이터 증가 후 재학습 주기 (초) — 3600→1200: JAM 등 새 패턴 20분 내 반영
                                                       # 1시간마다 새 데이터 반영해 재학습
 
     # ==================== 화면 표시 설정 ====================
