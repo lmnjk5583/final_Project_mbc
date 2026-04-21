@@ -184,7 +184,7 @@ class DetectorConfig:
     # ==================== Phase 2 GRU 파라미터 ====================
     gru_hidden: int = 64                    # GRU hidden state 크기
     gru_layers: int = 2                     # GRU 레이어 수
-    gru_seq_len: int = 30                   # 입력 시퀀스 길이 (프레임)
+    gru_seq_len: int = 90                   # 입력 시퀀스 길이 (프레임) — 30→90: 5분 예측에 5초(30f) 창은 부족, 15초(90f) 창으로 확대
     gru_blend_ratio: float = 0.0           # GRU 기여 비율 (1 - 이 값 = rule 비율)
                                            # 0.0 = rule 100% (GRU 비활성) — 클래스 불균형·레이블 오염 해결 전까지 비활성
                                            # 재활성 조건: retrain 후 precision/recall 검증 완료 시 0.10~0.20으로 점진 증가
