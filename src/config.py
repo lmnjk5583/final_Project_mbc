@@ -197,7 +197,7 @@ class DetectorConfig:
     # ==================== Direct 미래 예측 파라미터 ====================
     # 자기회귀 롤아웃 대신 "현재 관측 → N분 후 상태" 를 직접 예측하는 헤드
     # 오차 누적 없음 — 각 헤드가 독립적으로 해당 시점의 레벨을 학습
-    gru_predict_horizons_sec: tuple = (60, 180, 300)  # 예측 목표: 1분·3분·5분 후
+    gru_predict_horizons_sec: tuple = (300,)           # 예측 목표: 5분 후 단일 예측
     gru_pretrain_min_sec: float = 120.0               # pretrain 시작 최소 데이터 (초)
                                                       # 실제 수집 속도 = 실fps ÷ log_interval(3) → 명목fps 기준 임계값이
                                                       # 실수집 속도 대비 5배 과대 책정되는 문제 보정

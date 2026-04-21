@@ -603,7 +603,7 @@ class Visualizer:
     # ==================== 미래 예측 패널 (하단 중앙) ====================
     def draw_prediction_panel(self, frame, pred_a: list | None, pred_b: list | None,
                                label_a: str = "UP"):
-        """화면 하단 중앙에 1·3·5분 후 예측 패널을 그린다.
+        """화면 하단 중앙에 5분 후 예측 패널을 그린다.
 
         Args:
             frame:   BGR 이미지 프레임.
@@ -623,13 +623,13 @@ class Visualizer:
         }
 
         # ── 패널 크기·위치 계산 ───────────────────────────────────────
-        horizons = [1, 3, 5]                               # 예측 horizon (분)
-        col_w    = 70                                      # horizon 열 너비
-        row_h    = 18                                      # 방향 행 높이
+        col_w    = 110                                     # 단일 열 너비 (1·3·5분 때 70 → 110)
+        row_h    = 20                                      # 방향 행 높이
         pad      = 8                                       # 내부 여백
         header_h = 16                                      # 상단 헤더 높이
         n_rows   = 2                                       # 방향 수 (Down, Up)
-        panel_w  = pad + len(horizons) * col_w + pad       # 전체 패널 너비
+        dir_lbl_w = 30                                     # 방향 레이블 고정 너비
+        panel_w  = pad + dir_lbl_w + col_w + pad          # 전체 패널 너비
         panel_h  = pad + header_h + n_rows * row_h + pad  # 전체 패널 높이
 
         px = (fw - panel_w) // 2                          # 화면 가로 중앙
@@ -641,12 +641,11 @@ class Visualizer:
         cv2.addWeighted(overlay, 0.78, frame, 0.22, 0, frame)
         cv2.rectangle(frame, (px, py), (px + panel_w, py + panel_h), (100, 100, 100), 1)
 
-        # ── 헤더 (1분후 / 3분후 / 5분후) ──────────────────────────────
-        for i, h in enumerate(horizons):
-            hx = px + pad + i * col_w + col_w // 2
-            cv2.putText(frame, f"{h}min",
-                        (hx - 14, py + pad + 11),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.38, (180, 180, 180), 1, cv2.LINE_AA)
+        # ── 헤더 (5분후) ──────────────────────────────────────────────
+        hx = px + pad + dir_lbl_w + col_w // 2
+        cv2.putText(frame, "5min after",
+                    (hx - 28, py + pad + 11),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, (180, 180, 180), 1, cv2.LINE_AA)
 
         # ── 방향별 예측 행 ─────────────────────────────────────────────
         dirs = []
@@ -657,33 +656,32 @@ class Visualizer:
 
         for r, (dir_label, pred) in enumerate(dirs):
             ry = py + pad + header_h + r * row_h          # 행 y 위치
+            cx_ = px + pad + dir_lbl_w + col_w // 2       # 열 중앙 x
+
             # 방향 레이블
             cv2.putText(frame, dir_label,
-                        (px + 4, ry + 13),
+                        (px + 4, ry + 14),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.33, (160, 160, 160), 1, cv2.LINE_AA)
 
             if pred is None:                              # 학습 중 — 점선 표시
                 cv2.putText(frame, "Training...",
-                            (px + pad + 2, ry + 13),
+                            (cx_ - 28, ry + 14),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.33, (120, 120, 120), 1, cv2.LINE_AA)
                 continue
 
-            # horizon별 예측 셀 표시
+            # 5분 후 예측 셀 표시
             pred_by_min = {p["horizon_min"]: p for p in pred}
-            for i, h in enumerate(horizons):
-                p   = pred_by_min.get(h)
-                cx_ = px + pad + i * col_w + col_w // 2
-                if p is None:
-                    continue
+            p = pred_by_min.get(5)
+            if p is not None:
                 lv    = p["predicted_level"]
                 conf  = p["confidence"]
                 color = _lv_colors.get(lv, (180, 180, 180))
                 text  = _lv_kr.get(lv, lv)
                 # 예측 레벨 텍스트
                 cv2.putText(frame, text,
-                            (cx_ - 13, ry + 13),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.38, color, 1, cv2.LINE_AA)
+                            (cx_ - 18, ry + 14),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.42, color, 1, cv2.LINE_AA)
                 # 신뢰도 (작은 글씨)
                 cv2.putText(frame, f"{int(conf*100)}%",
-                            (cx_ - 9, ry + 13 + 10),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.28, (130, 130, 130), 1, cv2.LINE_AA)
+                            (cx_ + 22, ry + 14),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.30, (130, 130, 130), 1, cv2.LINE_AA)
