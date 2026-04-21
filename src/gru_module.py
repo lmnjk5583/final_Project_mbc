@@ -137,10 +137,16 @@ class GRUModule:
         self._horizon_frames = [max(1, int(s * fps)) for s in _horizons_sec]  # 초→프레임
         self._horizon_secs = list(_horizons_sec)       # 초 단위 저장 (결과 반환용)
 
-        # pretrain 최소 데이터: 최소 10분치 feature 쌓인 후 시작
+        # pretrain 최소 데이터: direct head 학습 window가 충분히 생긴 후 시작
+        # 버그 방지: seq_len+horizon 만큼만 있으면 유효 window = 0
+        #   → direct head가 샘플 0개로 학습 → 랜덤 가중치로 예측
+        # 해결: 최소 _min_direct_windows 개의 학습 window 보장
         _pretrain_min_sec = getattr(cfg, "gru_pretrain_min_sec", 600.0)
+        _min_direct_windows = 500                      # direct head 최소 학습 샘플 수
         self._pretrain_min_frames = max(              # pretrain 트리거 최소 프레임 수
-            cfg.gru_seq_len + max(self._horizon_frames),  # 최소: seq_len + 최대 horizon
+            cfg.gru_seq_len + max(self._horizon_frames) + _min_direct_windows,
+            # seq_len + horizon + 500 = 90 + 1800 + 500 = 2390
+            # 6fps, log_interval=3 기준: 2390 ÷ 2 = 1195초 ≈ 20분
             int(_pretrain_min_sec * fps)              # 설정값 (기본 10분)
         )
 
