@@ -214,7 +214,14 @@ class FeatureExtractor:
                 else:                                  # 셀이 바뀜 → 체류 리셋
                     self._dwell_state[_tid] = (_cr, _cc, frame_num)
             else:                                      # 첫 등장 → 체류 시작 기록
-                self._dwell_state[_tid] = (_cr, _cc, frame_num)
+                # 재연결 후 혼잡 셀에 진입하는 신규 tid는 체류 시간 소급 부여
+                # cell_dwell_ema는 ID 독립 → 재연결 이후에도 이전 혼잡도 보존
+                _ema_at_cell = (float(self._cell_dwell_ema[_cr, _cc])
+                                if self._cell_dwell_ema is not None else 0.0)
+                if _ema_at_cell > 0.3:                 # 이전에 혼잡했던 셀 → 즉시 체류 인정
+                    self._dwell_state[_tid] = (_cr, _cc, frame_num - self._dwell_thr_frames)
+                else:
+                    self._dwell_state[_tid] = (_cr, _cc, frame_num)
 
         # 이번 프레임에 없는 tid 체류 기록 삭제 (메모리 누수 방지)
         for _old in list(self._dwell_state.keys()):

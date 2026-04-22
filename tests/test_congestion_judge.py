@@ -1,301 +1,305 @@
 # 파일 경로: C:\final_pj\tests\test_congestion_judge.py
-# 역할: CongestionJudge 단위 테스트 (TDD — 구현 전 작성)
-# 실행: pytest tests/test_congestion_judge.py -v  (프로젝트 루트에서)
-# TC  : CJ-01 ~ CJ-10
+# 역할: CongestionJudge + compute_jam_score_fallback 단위 테스트 (125차 이후 공식 기준)
+# 실행: pytest tests/test_congestion_judge.py -v
+# TC  : CJ-01 ~ CJ-11
 
-import sys                                             # 모듈 검색 경로 조작용
-import os                                              # 경로 처리용
-import pytest                                          # pytest 프레임워크
+import sys
+import os
+import pytest
 
-# src/ 폴더를 파이썬 모듈 검색 경로 최우선에 추가
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
-from congestion_judge import CongestionJudge           # 테스트 대상 (Step 6에서 구현)
-from baseline_stats import BaselineStats               # 기준선 통계 데이터 클래스
+from congestion_judge import CongestionJudge, compute_jam_score_fallback
 
 
 # ======================================================================
-# Mock 헬퍼 클래스
+# Mock 설정 클래스
 # ======================================================================
 
 class _MockCfg:
-    """테스트용 DetectorConfig 대역 — CongestionJudge 관련 파라미터만 포함"""
-    smooth_jam_threshold      = 0.25   # jam_score < 이 값 → SMOOTH
-    slow_jam_threshold        = 0.55   # jam_score < 이 값 → SLOW, 이상 → CONGESTED
+    """테스트용 DetectorConfig 대역 — CongestionJudge 관련 파라미터만 포함.
+
+    125차 이후 기준:
+      smooth_jam_threshold = 0.30 (SMOOTH 상한)
+      slow_jam_threshold   = 0.60 (SLOW 상한, JAM 하한)
+    """
+    smooth_jam_threshold      = 0.30   # SMOOTH 상한 임계값
+    slow_jam_threshold        = 0.60   # SLOW 상한 / JAM 하한 임계값
     congestion_hysteresis_sec = 15.0   # 레벨 전환 유지 시간 (초)
-    stop_mag_threshold        = 3.0    # 정지 판단 mag 임계값
+    jam_ema_alpha_up          = 0.15   # 악화(상승) 방향 EMA 속도
+    jam_ema_alpha_down        = 0.04   # 호전(하강) 방향 EMA 속도
+    initial_confirm_sec       = 5.0    # 초기 확정 구간 (초)
+    initial_hysteresis_sec    = 2.0    # 초기 히스테리시스 (초)
 
 
-def _make_baseline(lcs: float = 0.1,
-                   is_fallback: bool = False) -> BaselineStats:
-    """테스트용 BaselineStats 생성 헬퍼"""
-    return BaselineStats(                              # 기준선 객체 생성
-        free_flow_dwell=30.0,                          # 자유 흐름 체류 시간
-        typical_dwell=50.0,                            # 일반 체류 시간
-        norm_speed_ref=0.3,                            # 정상 속도 기준
-        count_ref=5.0,                                 # 정상 차량 수 기준
-        bbox_slope=0.05,                               # bbox 회귀 기울기
-        bbox_intercept=30.0,                           # bbox 회귀 절편
-        lcs=lcs,                                       # 학습 품질 점수
-        quality_warning=False,                         # 품질 경고 없음
-        passage_count=10,                              # 유효 passage 수
-        is_fallback=is_fallback,                       # fallback 여부
-    )
+def _make_judge(fps: float = 6.0) -> CongestionJudge:
+    """테스트용 CongestionJudge 인스턴스를 생성하고 baseline을 설정한다."""
+    j = CongestionJudge(_MockCfg(), fps=fps)
+    j.set_baseline()
+    return j
 
 
-def _normal_x_t() -> dict:
-    """정상 상태 feature 벡터 (모든 ratio ≈ 1.0, stop_ratio ≈ 0)"""
+# ======================================================================
+# feature 벡터 헬퍼
+# ======================================================================
+
+def _smooth_xt() -> dict:
+    """원활 시나리오: cds 낮음, dwell=0, flow_occ 낮음
+    예상 jam_score < 0.30 (SMOOTH).
+    """
     return {
-        "norm_speed_ratio": 1.0,   # 속도 정상
-        "count_ratio":      1.0,   # 차량 수 정상
-        "stop_ratio":       0.0,   # 정지 차량 없음
-        "exit_rate_ratio":  1.0,   # 유출 정상
-        "dwell_ratio":      1.0,   # 체류시간 정상
-        "density_score":    0.1,   # 밀도 낮음
-        "rule_jam_score":   0.0,   # jam_score 초기값
+        "cell_dwell_score":    0.05,
+        "flow_occupancy":      0.08,
+        "cell_persistence":    0.0,
+        "dwell_cell_ratio":    0.0,
+        "known_vehicle_count": 5,
+        "occupied_cell_count": 4,
+        "count_ref":           8.0,
+        "valid_cell_count":    75,
     }
 
 
-def _worst_x_t() -> dict:
-    """최악 상태 feature 벡터 (모든 지표 최악)"""
+def _jam_xt() -> dict:
+    """정체 시나리오: dwell 높음, cds 높음, flow_occ 충분
+    예상 jam_score >= 0.60 (JAM).
+
+    계산 검증 (valid=75, count_ref=8):
+      count_gate = clip((18-2)/10, 0, 1) = 1.0
+      occ_gate_range = max(0.05, 8/75) = 0.1067
+      occ_gate = clip((0.22-0.04)/0.1067, 0, 1) = 1.0
+      scale_gate = 1.0
+      core = 0.55×0.65 + 0.20×0.80 + 1.00×0.08 = 0.3575+0.16+0.08 = 0.5975
+      jam = 0.5975 + 0.12×sqrt(0.22) = 0.5975+0.0563 = 0.654 ≥ 0.60 ✓
+    """
     return {
-        "norm_speed_ratio": 0.0,   # 속도 0 (완전 정지)
-        "count_ratio":      3.0,   # 차량 수 3배 (포화)
-        "stop_ratio":       1.0,   # 모든 차량 정지
-        "exit_rate_ratio":  0.0,   # 유출 없음
-        "dwell_ratio":      0.0,   # 체류 최대 (자유흐름 대비 0)
-        "density_score":    1.0,   # 밀도 최대
-        "rule_jam_score":   0.0,   # jam_score 초기값
+        "cell_dwell_score":    0.65,
+        "flow_occupancy":      0.22,
+        "cell_persistence":    0.80,
+        "dwell_cell_ratio":    0.08,
+        "known_vehicle_count": 18,
+        "occupied_cell_count": 15,
+        "count_ref":           8.0,
+        "valid_cell_count":    75,
+    }
+
+
+def _highway_flowing_xt() -> dict:
+    """고속도로 원활 시나리오: 차량 많고 cds 높지만 dwell=0
+    → 15f+ 체류 차량 없음 → 진짜 정체 아님 → jam_score < 0.60.
+
+    계산 검증:
+      core = 0.55×0.70 + 0.20×0.30 + 1.00×0.0 = 0.385+0.06 = 0.445
+      jam = 0.445×1.0 + 0.12×sqrt(0.25) = 0.445+0.06 = 0.505 < 0.60 ✓
+    """
+    return {
+        "cell_dwell_score":    0.70,
+        "flow_occupancy":      0.25,
+        "cell_persistence":    0.30,
+        "dwell_cell_ratio":    0.0,   # 체류 차량 없음 → 정체 아님
+        "known_vehicle_count": 15,
+        "occupied_cell_count": 12,
+        "count_ref":           8.0,
+        "valid_cell_count":    75,
     }
 
 
 # ======================================================================
-# pytest 픽스처
+# CJ-01: compute_jam_score_fallback 반환값 범위 0.0~1.0
 # ======================================================================
 
-@pytest.fixture
-def judge():
-    """기본 CongestionJudge 인스턴스 (baseline 없음)"""
-    return CongestionJudge(_MockCfg(), fps=30.0)       # fps=30 기준
-
-
-@pytest.fixture
-def judge_with_baseline():
-    """baseline이 설정된 CongestionJudge 인스턴스 (LCS=0.1 정상)"""
-    j = CongestionJudge(_MockCfg(), fps=30.0)          # 인스턴스 생성
-    j.set_baseline(_make_baseline(lcs=0.1))            # 기준선 설정
-    return j                                            # 반환
+def test_cj01_jam_score_range():
+    """compute_jam_score_fallback 반환값은 항상 0.0~1.0 범위여야 한다."""
+    for x_t in [_smooth_xt(), _jam_xt(), _highway_flowing_xt()]:
+        score = compute_jam_score_fallback(x_t)
+        assert 0.0 <= score <= 1.0, f"범위 초과: {score:.4f}"
 
 
 # ======================================================================
-# CJ-01: baseline 없이 update() 호출 → fallback jam_score 반환, None 아님
+# CJ-02: 저규모 가드 — known_vehicle_count <= 2 → jam_score <= 0.10
 # ======================================================================
 
-def test_cj01_no_baseline_returns_fallback_score(judge):
-    """CJ-01: baseline 미설정 상태에서 update() → jam_score float 반환 (None 아님)"""
-    x_t = _normal_x_t()                               # 정상 feature 벡터
+def test_cj02_low_vehicle_guard():
+    """known_vehicle_count=1이면 저규모 가드 적용 → jam_score <= 0.10.
 
-    level, jam_score = judge.update(x_t, frame_num=1) # baseline 없이 호출
-
-    assert jam_score is not None                       # None이 아님
-    assert isinstance(jam_score, float)                # float 타입
-    assert 0.0 <= jam_score <= 1.0                     # 0~1 범위 내
-
-
-# ======================================================================
-# CJ-02: x_t 모두 정상(ratio=1.0) → jam_score ≈ 0.0
-# ======================================================================
-
-def test_cj02_normal_input_low_jam_score(judge_with_baseline):
-    """CJ-02: 모든 feature ratio=1.0(정상) → jam_score ≈ 0.0
-
-    speed_score   = clip(1 - 1.0, 0, 1) = 0.0
-    dwell_score   = clip(1 - 1.0, 0, 1) = 0.0
-    density_score = clip((1.0 - 1) / 2, 0, 1) = 0.0
-    bonus(exit>1.3): 0.0, bonus(stop<0.05): +0.05, bonus(speed>1.2): 0.0
-    jam = 0 - 0.05 → max(0, -0.05) = 0.0
+    최악 신호로 설정해도 차량 1대이면 오탐 방지로 상한 0.10 제한.
     """
-    x_t = _normal_x_t()                               # 정상 feature 벡터
-
-    _, jam_score = judge_with_baseline.update(x_t, frame_num=1)
-
-    assert jam_score < 0.1, f"정상 입력 jam_score는 0.1 미만이어야 함 (실제={jam_score:.4f})"
+    x_t = dict(_jam_xt())
+    x_t["known_vehicle_count"] = 1    # 극소 차량
+    score = compute_jam_score_fallback(x_t)
+    assert score <= 0.10, f"저규모 가드 위반: jam_score={score:.4f}"
 
 
 # ======================================================================
-# CJ-03: x_t 모두 최악(ratio=0.0) → jam_score ≈ 1.0
+# CJ-03: 저규모 가드 — flow_occupancy < 0.06 → jam_score <= 0.10
 # ======================================================================
 
-def test_cj03_worst_input_high_jam_score(judge_with_baseline):
-    """CJ-03: 모든 feature 최악 → jam_score ≈ 1.0
+def test_cj03_low_flow_occ_guard():
+    """flow_occupancy < 0.06이면 저규모 가드 적용 → jam_score <= 0.10.
 
-    speed_score   = clip(1 - 0.0, 0, 1) = 1.0
-    dwell_score   = clip(1 - 0.0, 0, 1) = 1.0
-    density_score = clip((3.0 - 1) / 2, 0, 1) = 1.0
-    jam = 0.50*1 + 0.30*1 + 0.20*1 = 1.0 (bonus=0)
+    빈 도로(occ=0.03)에서는 cds/dwell 신호와 무관하게 최대 0.10 제한.
     """
-    x_t = _worst_x_t()                                # 최악 feature 벡터
-
-    _, jam_score = judge_with_baseline.update(x_t, frame_num=1)
-
-    assert jam_score >= 0.9, f"최악 입력 jam_score는 0.9 이상이어야 함 (실제={jam_score:.4f})"
-
-
-# ======================================================================
-# CJ-04: jam_score < 0.25 → level = "SMOOTH"
-# ======================================================================
-
-def test_cj04_low_jam_score_is_smooth(judge_with_baseline):
-    """CJ-04: jam_score < 0.25 → get_level() == 'SMOOTH'"""
-    x_t = _normal_x_t()                               # 정상 입력 → jam_score 낮음
-
-    level, jam_score = judge_with_baseline.update(x_t, frame_num=1)
-
-    assert jam_score < 0.25                            # 낮은 jam_score 확인
-    assert level == "SMOOTH"                           # SMOOTH 레벨 확인
-    assert judge_with_baseline.get_level() == "SMOOTH" # get_level()도 일치
+    x_t = dict(_jam_xt())
+    x_t["flow_occupancy"] = 0.03    # 거의 빈 도로
+    score = compute_jam_score_fallback(x_t)
+    assert score <= 0.10, f"low_occ 가드 위반: jam_score={score:.4f}"
 
 
 # ======================================================================
-# CJ-05: 0.25 ≤ jam_score < 0.55 → level = "SLOW"
+# CJ-04: 원활 시나리오 → jam_score < 0.30 (SMOOTH 임계값 미만)
 # ======================================================================
 
-def test_cj05_mid_jam_score_is_slow(judge_with_baseline):
-    """CJ-05: jam_score가 SLOW 범위(0.25~0.55)면 히스테리시스 통과 후 'SLOW'
+def test_cj04_smooth_scenario():
+    """원활 시나리오: jam_score < 0.30 (SMOOTH 판정 기준)."""
+    score = compute_jam_score_fallback(_smooth_xt())
+    assert score < 0.30, f"원활인데 jam_score={score:.4f} >= 0.30"
 
-    히스테리시스 450프레임(15초×30fps)을 넘겨야 레벨 전환 확정.
-    speed_score=0.5, dwell_score=0.5, density_score=0 → jam=0.40
-    bonus: stop_ratio=0 → +0.05 → jam=0.35 (SLOW 범위)
+
+# ======================================================================
+# CJ-05: 정체 시나리오 → jam_score >= 0.60 (JAM 임계값 이상)
+# ======================================================================
+
+def test_cj05_jam_scenario():
+    """정체 시나리오(dwell 높음): jam_score >= 0.60 (JAM 판정 기준)."""
+    score = compute_jam_score_fallback(_jam_xt())
+    assert score >= 0.60, f"정체인데 jam_score={score:.4f} < 0.60"
+
+
+# ======================================================================
+# CJ-06: 고속도로 빠른 통과 — dwell=0이면 cds 높아도 JAM 아님
+# ======================================================================
+
+def test_cj06_highway_no_dwell_not_jam():
+    """dwell_cell_ratio=0(체류 없음)이면 cds 높아도 jam_score < 0.60.
+
+    4차선 고속도로에서 차량이 빠르게 통과 → cds 높지만 정체 아님.
+    dwell=0이면 core의 정체 주 신호(1.00×dwell)가 0 → JAM 방지.
     """
-    x_t = {
-        "norm_speed_ratio": 0.5,   # 속도 절반
-        "count_ratio":      1.0,   # 차량 수 정상
-        "stop_ratio":       0.0,   # 정지 없음 (bonus +0.05)
-        "exit_rate_ratio":  0.5,   # 유출 절반
-        "dwell_ratio":      0.5,   # 체류 절반
-        "density_score":    0.2,   # 밀도 낮음
-        "rule_jam_score":   0.0,   # 초기값
+    score = compute_jam_score_fallback(_highway_flowing_xt())
+    assert score < 0.60, (
+        f"dwell=0 고속도로인데 jam_score={score:.4f} >= 0.60 (오탐)"
+    )
+
+
+# ======================================================================
+# CJ-07: dynamic occ_gate — valid_cell_count 변화 시 occ_gate 포화점 이동
+# ======================================================================
+
+def test_cj07_dynamic_occ_gate_saturation():
+    """count_ref/valid_cell_count로 occ_gate 포화점이 결정된다.
+
+    valid=75, count_ref=8 → 포화점 = 8/75+0.04 ≈ 0.147
+    flow_occ=0.20이면 occ_gate = 1.0 (포화)
+    두 경우 모두 양수인지 확인 (공식 정상 동작 검증).
+    """
+    base = {
+        "cell_dwell_score":    0.50,
+        "flow_occupancy":      0.20,
+        "cell_persistence":    0.30,
+        "dwell_cell_ratio":    0.06,
+        "known_vehicle_count": 14,
+        "occupied_cell_count": 10,
+        "count_ref":           8.0,
+        "valid_cell_count":    75,     # 포화점 ≈ 8/75 + 0.04 = 0.147
     }
+    score_v75 = compute_jam_score_fallback(dict(base))
 
-    hysteresis = int(15.0 * 30.0) + 2                  # 히스테리시스 + 여유 프레임
-    for frame in range(1, hysteresis + 1):             # 히스테리시스 통과까지 반복
-        level, jam_score = judge_with_baseline.update(dict(x_t), frame_num=frame)
+    base2 = dict(base)
+    base2["valid_cell_count"] = 400   # 포화점 ≈ 8/400 + 0.04 = 0.060
+    score_v400 = compute_jam_score_fallback(base2)
 
-    assert 0.25 <= jam_score < 0.55, f"SLOW 범위(0.25~0.55)여야 함 (실제={jam_score:.4f})"
-    assert level == "SLOW", f"레벨은 SLOW여야 함 (실제={level})"
-
-
-# ======================================================================
-# CJ-06: jam_score ≥ 0.55 → level = "CONGESTED"
-# ======================================================================
-
-def test_cj06_high_jam_score_is_congested(judge_with_baseline):
-    """CJ-06: jam_score ≥ 0.55 → 히스테리시스 통과 후 'CONGESTED'"""
-    x_t = _worst_x_t()                                # 최악 입력 → jam_score 높음
-
-    hysteresis = int(15.0 * 30.0) + 2                  # 히스테리시스 + 여유 프레임
-    for frame in range(1, hysteresis + 1):             # 히스테리시스 통과까지 반복
-        level, jam_score = judge_with_baseline.update(dict(x_t), frame_num=frame)
-
-    assert jam_score >= 0.55                           # 높은 jam_score 확인
-    assert level == "CONGESTED"                        # CONGESTED 레벨 확인
+    # 두 경우 모두 의미 있는 값이어야 함 (공식이 작동하는 범위)
+    assert score_v75 > 0.0, f"valid=75 결과 0: {score_v75}"
+    assert score_v400 > 0.0, f"valid=400 결과 0: {score_v400}"
 
 
 # ======================================================================
-# CJ-07: CONGESTED → 즉시 SMOOTH 입력 → 15초(fps×15프레임) 동안 CONGESTED 유지
+# CJ-08: update() → (level, jam_score) 튜플 반환
 # ======================================================================
 
-def test_cj07_hysteresis_keeps_congested(judge_with_baseline):
-    """CJ-07: CONGESTED 진입 후 즉시 SMOOTH 입력해도 히스테리시스 동안 CONGESTED 유지
+def test_cj08_update_returns_valid_tuple():
+    """update()는 (level: str, jam_score: float) 튜플을 반환해야 한다."""
+    judge = _make_judge()
+    result = judge.update(_smooth_xt(), frame_num=1)
 
-    설정: congestion_hysteresis_sec=15.0, fps=30.0 → 450프레임 유지
-    단계: (1) 450프레임 최악 입력 → CONGESTED 확정
-         (2) 즉시 정상 입력으로 전환 → 450프레임 이내 CONGESTED 유지 확인
+    assert isinstance(result, tuple), "update() 반환 타입은 tuple"
+    level, score = result
+    assert level in ("SMOOTH", "SLOW", "JAM"), f"유효하지 않은 level: {level}"
+    assert isinstance(score, float), "jam_score는 float"
+    assert 0.0 <= score <= 1.0, f"jam_score 범위 초과: {score:.4f}"
+
+
+# ======================================================================
+# CJ-09: 히스테리시스 — JAM 진입 후 즉시 SMOOTH 입력해도 JAM 유지
+# ======================================================================
+
+def test_cj09_hysteresis_keeps_jam():
+    """JAM 진입 후 즉시 SMOOTH 입력해도 히스테리시스 프레임 동안 JAM 유지."""
+    fps = 6.0
+    judge = CongestionJudge(_MockCfg(), fps=fps)
+    judge.set_baseline()
+
+    hysteresis_frames = int(15.0 * fps)   # 90프레임
+
+    # ── Phase 1: JAM 상태 진입 (히스테리시스 통과) ───────────────────
+    for f in range(1, hysteresis_frames + 2):
+        level, _ = judge.update(dict(_jam_xt()), frame_num=f)
+    assert level == "JAM", f"JAM 진입 실패: level={level}"
+
+    # ── Phase 2: 즉시 SMOOTH 입력 → 히스테리시스 내에서 JAM 유지 ────
+    base = hysteresis_frames + 2
+    check_n = hysteresis_frames - 2
+    for f in range(base, base + check_n):
+        level, _ = judge.update(dict(_smooth_xt()), frame_num=f)
+    assert level == "JAM", (
+        f"히스테리시스 {hysteresis_frames}프레임 이내에서 JAM 유지 실패: level={level}"
+    )
+
+
+# ======================================================================
+# CJ-10: 비대칭 EMA — 악화(상승) 방향이 호전(하강) 방향보다 빠름
+# ======================================================================
+
+def test_cj10_asymmetric_ema():
+    """alpha_up > alpha_down이므로 악화 방향 EMA 변화가 호전 방향보다 크다.
+
+    _MockCfg: alpha_up=0.15, alpha_down=0.04
+    악화: delta = 0.15×1.0 = 0.15
+    호전: delta = 0.04×1.0 = 0.04
     """
-    fps = 30.0                                         # FPS
-    hysteresis_frames = int(15.0 * fps)                # 450프레임
+    fps = 6.0
 
-    # ── Phase 1: CONGESTED 상태 진입 (히스테리시스 통과) ──────────────
-    x_congested = _worst_x_t()                        # 최악 입력
-    for frame in range(1, hysteresis_frames + 2):      # 히스테리시스 + 여유
-        level, _ = judge_with_baseline.update(dict(x_congested), frame_num=frame)
-    assert level == "CONGESTED"                        # CONGESTED 진입 확인
+    # ── 악화 방향: 0.0 → 1.0 ──────────────────────────────────────────
+    j_up = CongestionJudge(_MockCfg(), fps=fps)
+    j_up.set_baseline()
+    _, score_a = j_up.apply_level(0.0, frame_num=1)   # 초기 0.0
+    _, score_b = j_up.apply_level(1.0, frame_num=2)   # 갑자기 1.0
+    delta_up = score_b - score_a
 
-    # ── Phase 2: 즉시 SMOOTH 입력 → 히스테리시스 동안 CONGESTED 유지 ──
-    base_frame = hysteresis_frames + 2                 # Phase 2 시작 프레임
-    x_smooth = _normal_x_t()                          # 정상 입력
-    check_count = hysteresis_frames - 2                # 히스테리시스 미만 구간
-    for frame in range(base_frame, base_frame + check_count):  # 히스테리시스 내
-        level, _ = judge_with_baseline.update(dict(x_smooth), frame_num=frame)
+    # ── 호전 방향: 1.0 → 0.0 ──────────────────────────────────────────
+    j_dn = CongestionJudge(_MockCfg(), fps=fps)
+    j_dn.set_baseline()
+    for _f in range(1, 60):                            # EMA를 충분히 1.0에 가깝게 올림
+        j_dn.apply_level(1.0, frame_num=_f)
+    _, score_c = j_dn.apply_level(1.0, frame_num=60)  # 안정화된 높은 EMA
+    _, score_d = j_dn.apply_level(0.0, frame_num=61)  # 갑자기 0.0
+    delta_down = score_c - score_d
 
-    assert level == "CONGESTED", (                     # 아직 CONGESTED 유지
-        f"히스테리시스 {hysteresis_frames}프레임 이내에는 CONGESTED 유지되어야 함 (실제={level})"
+    assert delta_up > delta_down, (
+        f"비대칭 EMA 실패: 악화 delta={delta_up:.4f}, 호전 delta={delta_down:.4f}"
     )
 
 
 # ======================================================================
-# CJ-08: LCS=0.8 → threshold 완화 → smooth_threshold < 0.25
+# CJ-11: update() 100회 반복 호출 — 예외 없음
 # ======================================================================
 
-def test_cj08_high_lcs_lowers_smooth_threshold():
-    """CJ-08: LCS=0.8 → smooth_threshold = 0.25×(1-0.8×0.40) = 0.17 < 0.25"""
-    cfg = _MockCfg()                                   # 설정 Mock
-    judge = CongestionJudge(cfg, fps=30.0)             # 인스턴스 생성
-    judge.set_baseline(_make_baseline(lcs=0.8))        # LCS=0.8 고오염 기준선
-
-    # LCS=0.8이면 smooth_threshold = 0.25 * (1 - 0.8*0.40) = 0.25 * 0.68 = 0.17
-    expected_smooth_thr = cfg.smooth_jam_threshold * (1 - 0.8 * 0.40)
-
-    actual_thr = judge.get_smooth_threshold()          # threshold 조회 메서드
-
-    assert actual_thr < cfg.smooth_jam_threshold, (    # 기본값 0.25보다 낮아야 함
-        f"LCS=0.8이면 smooth_threshold < 0.25여야 함 (실제={actual_thr:.4f})"
-    )
-    assert abs(actual_thr - expected_smooth_thr) < 0.01  # 계산값과 일치
-
-
-# ======================================================================
-# CJ-09: exit_rate_ratio > 1.3 → bonus 적용 → jam_score 감소
-# ======================================================================
-
-def test_cj09_high_exit_rate_reduces_jam(judge_with_baseline):
-    """CJ-09: exit_rate_ratio > 1.3 → +0.08 bonus → jam_score 감소"""
-    # 기본 feature (중간 jam_score 예상)
-    x_base = {
-        "norm_speed_ratio": 0.5,   # 속도 절반
-        "count_ratio":      1.5,   # 차량 약간 많음
-        "stop_ratio":       0.2,   # 일부 정지
-        "exit_rate_ratio":  0.5,   # 유출 낮음 (bonus 없음)
-        "dwell_ratio":      0.5,   # 체류 높음
-        "density_score":    0.3,   # 밀도 보통
-        "rule_jam_score":   0.0,   # 초기값
-    }
-    # exit_rate_ratio를 1.5로 올린 버전 (bonus +0.08)
-    x_high_exit = dict(x_base)                        # 복사
-    x_high_exit["exit_rate_ratio"] = 1.5              # 유출 증가 (> 1.3 → bonus)
-
-    _, jam_no_bonus  = judge_with_baseline.update(dict(x_base),       frame_num=1)
-    _, jam_with_bonus = judge_with_baseline.update(dict(x_high_exit), frame_num=2)
-
-    assert jam_with_bonus < jam_no_bonus, (            # bonus 적용 시 jam_score 낮아야 함
-        f"exit_rate_ratio>1.3이면 jam_score 감소해야 함 "
-        f"(bonus={jam_no_bonus:.4f} → {jam_with_bonus:.4f})"
-    )
-
-
-# ======================================================================
-# CJ-10: update() 100회 연속 호출 → 예외 없음
-# ======================================================================
-
-def test_cj10_repeated_update_no_exception(judge_with_baseline):
-    """CJ-10: update() 100회 연속 호출해도 예외 없이 정상 동작"""
-    x_t = _normal_x_t()                               # 정상 feature 벡터
-
-    for frame in range(1, 101):                        # 100회 반복
-        try:                                           # 예외 발생 여부 확인
-            level, jam_score = judge_with_baseline.update(x_t, frame_num=frame)
-            assert isinstance(level, str)              # level은 문자열
-            assert isinstance(jam_score, float)        # jam_score는 float
-            assert level in ("SMOOTH", "SLOW", "CONGESTED")  # 유효한 레벨
-        except Exception as e:                         # 예외 발생 시 실패
-            pytest.fail(f"frame {frame}에서 예외 발생: {e}")
+def test_cj11_repeated_update_no_exception():
+    """update() 100회 연속 호출해도 예외 없이 정상 동작."""
+    judge = _make_judge()
+    for f in range(1, 101):
+        try:
+            level, score = judge.update(_smooth_xt(), frame_num=f)
+            assert level in ("SMOOTH", "SLOW", "JAM")
+            assert 0.0 <= score <= 1.0
+        except Exception as e:
+            pytest.fail(f"frame {f}에서 예외 발생: {e}")

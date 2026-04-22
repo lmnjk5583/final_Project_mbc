@@ -404,6 +404,17 @@ class WrongWayJudge:
         # ── 의심 횟수 임계값 도달 → 확정 전 다단계 검증 ─────────────────
         if st.wrong_way_count[track_id] >= cfg.wrong_count_threshold:
 
+            # ── ★ normal-path 최소 나이 가드 ────────────────────────────
+            # fast-track은 fast_confirm_min_age(45f)로 보호되지만 normal-path는 그 보호가 없음.
+            # min_wrongway_track_age=20으로 낮춘 뒤 진입로·합류로 차량이
+            # age gate 해제 직후(frame 39~44)에 확정되는 오탐 패턴 발생.
+            # fast_confirm_min_age 기준을 normal-path에도 동일 적용 → 비대칭 해소.
+            _normal_min_age = getattr(cfg, "fast_confirm_min_age", 45)
+            if _cur_age < _normal_min_age:
+                # 아직 나이 부족 — 카운트 유지, 다음 프레임에서 재평가
+                debug_info["status"] = "normal_path_too_young"
+                return False, disagree_ratio, debug_info
+
             # ── ★ 방향 급변 필터 ────────────────────────────────────────
             # 정상 주행 중인 차량이 갑자기 역방향으로 바뀌면 CCTV 글자/오클루전 가능.
             # [수정] age gate 기간 중 기록된 lcf는 방향 벡터 노이즈이므로 무시.

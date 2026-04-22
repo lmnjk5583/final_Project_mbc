@@ -181,34 +181,6 @@ class DetectorConfig:
     # ==================== 학습 연장 ====================
     max_learning_extension:  float = 1.5    # learning_frames × 이 값 = 최대 학습 프레임 수
 
-    # ==================== Phase 2 GRU 파라미터 ====================
-    gru_hidden: int = 64                    # GRU hidden state 크기
-    gru_layers: int = 2                     # GRU 레이어 수
-    gru_seq_len: int = 90                   # 입력 시퀀스 길이 (프레임) — 30→90: 5분 예측에 5초(30f) 창은 부족, 15초(90f) 창으로 확대
-    gru_blend_ratio: float = 0.0           # GRU 기여 비율 (1 - 이 값 = rule 비율)
-                                           # 0.0 = rule 100% (GRU 비활성) — 클래스 불균형·레이블 오염 해결 전까지 비활성
-                                           # 재활성 조건: retrain 후 precision/recall 검증 완료 시 0.10~0.20으로 점진 증가
-    gru_warmup_frames: int = 30             # camera_switch 후 GRU 사용 금지 프레임
-    gru_replay_size: int = 200              # replay_buffer 최대 크기
-    gru_online_interval: int = 10           # 온라인 학습 gradient step 주기 (프레임)
-    gru_lr: float = 1e-3                    # Adam optimizer 학습률
-    gru_forecast_steps: int = 150           # 미래 예측 자기회귀 스텝 수 (150프레임 ≈ 5초@30fps)
-
-    # ==================== Direct 미래 예측 파라미터 ====================
-    # 자기회귀 롤아웃 대신 "현재 관측 → N분 후 상태" 를 직접 예측하는 헤드
-    # 오차 누적 없음 — 각 헤드가 독립적으로 해당 시점의 레벨을 학습
-    gru_predict_horizons_sec: tuple = (300,)           # 예측 목표: 5분 후 단일 예측
-    gru_pretrain_min_sec: float = 120.0               # pretrain 시작 최소 데이터 (초)
-                                                      # 실제 수집 속도 = 실fps ÷ log_interval(3) → 명목fps 기준 임계값이
-                                                      # 실수집 속도 대비 5배 과대 책정되는 문제 보정
-                                                      # 120초(2분치) → 실 6fps 환경에서 ~10분 후 pretrain 시작
-    gru_direct_epochs: int = 10                       # direct head 학습 epoch 수
-    gru_log_interval: int = 3                         # feature 로그 저장 주기 (프레임)
-                                                      # 매 프레임 저장 시 I/O 과부하 → 3프레임마다 1개 저장
-                                                      # 10fps × 1/3 ≈ 3.3개/초 → 1시간 ≈ 12,000개
-    gru_retrain_interval_sec: float = 1200.0          # 누적 데이터 증가 후 재학습 주기 (초) — 3600→1200: JAM 등 새 패턴 20분 내 반영
-                                                      # 1시간마다 새 데이터 반영해 재학습
-
     # ==================== 화면 표시 설정 ====================
     display_width: int = 1280              # 화면 출력 창 너비 (픽셀). 0이면 원본 해상도 그대로
     display_height: int = 720              # 화면 출력 창 높이 (픽셀). 0이면 원본 해상도 그대로
@@ -219,14 +191,9 @@ class DetectorConfig:
                                          # 6fps 기준 정상 고속차 120km/h≈30px/f → 80px 초과는 이상
     frame_skip_ratio:      float = 0.5   # 전체 추적 차량 중 이 비율 이상이 jump면 스킵 프레임 확정
                                          # 0.5 = 절반 이상 동시 jump → 신호 끊김으로 판단
-
-    # ==================== GRU 학습 신뢰도 필터 ====================
-    gru_min_vehicles_for_log: int = 3      # GRU 로그 수집 최소 차량 수
-                                           # 이 미만이면 탐지 부족으로 판단 → feature 로그 스킵
-                                           # 야간·안개 등 탐지율 저하 시 오학습 방지
-    gru_min_brightness_for_log: float = 0.0  # 이 밝기(0~255 평균) 미만이면 로그 스킵
-                                              # 0.0 = 밝기 필터 비활성 (기본)
-                                              # 야간 탐지 불가 환경이면 50~70 설정 권장
+    post_skip_grace_frames: int  = 30    # 프레임 스킵 감지 후 TA 업데이트 추가 차단 프레임
+                                         # 재연결 직후 속도 이력 미구성 차량이 jam_score를 낮추는 것을 방지
+                                         # 6fps 기준 30프레임 = 5초 (IDManager 속도 이력 재구성 시간)
 
     # ==================== 정체 탐지 slow_ratio 파라미터 ====================
     slow_upper_nm: float = 0.70            # 서행 판정 상한 nm (nm < 이 값 → 서행) — 0.50→0.70: EMA smoothing 도입 후 원거리 정상차량 nm 0.5~0.7 범위 오판 방지

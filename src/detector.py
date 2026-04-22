@@ -5,6 +5,7 @@ import cv2                                          # OpenCV — 영상 입출�
 import numpy as np                                  # 수치 계산
 import time                                         # FPS 측정용 타이머
 import threading                                    # URL 선제 갱신용 백그라운드 스레드
+from datetime import datetime                       # HistoricalPredictor 시각 슬롯용
 
 from .config import DetectorConfig                  # 모든 파라미터가 담긴 설정 클래스
 from .state import DetectorState                    # 프레임 번호·궤적·역주행 카운트 등 런타임 상태
@@ -16,13 +17,7 @@ from .camera_switch import CameraSwitchDetector     # 장면/카메라 전환 �
 from .visualizer import Visualizer                  # 시각화(박스/궤적/패널/디버그)
 from .logger import CSVLogger                       # 프레임/트랙/이벤트 CSV 로그 저장
 from .traffic_analyzer import TrafficAnalyzer, CongestionPredictor  # 정체 탐지 + 단기 예측
-
-# GRUModule: PyTorch 없는 환경에서도 동작하도록 try/except
-try:
-    from gru_module import GRUModule                # Phase 2 GRU 예측 모듈
-    _GRU_AVAILABLE = True                           # GRU 사용 가능 플래그
-except ImportError:                                 # gru_module.py 없거나 torch 없으면
-    _GRU_AVAILABLE = False                          # fallback 모드
+from .historical_predictor import HistoricalPredictor               # 시각별 과거 jam 이력 예측
 
 try:
     from flow_map_matcher import FlowMapMatcher, save_ref_frame  # flow_map 자동 매칭
@@ -53,11 +48,9 @@ class Detector:
         self.switch = CameraSwitchDetector(cfg)                     # 카메라 전환 감지기
         self.vis = Visualizer(cfg, self.state, self.flow)           # 시각화 모듈
         self.logger = CSVLogger(cfg.log_dir) if cfg.log_dir else None  # CSV 로거 (log_dir 없으면 None)
-        # ── 방향별 GRU/TrafficAnalyzer/Predictor (run()에서 초기화) ──
+        # ── 방향별 TrafficAnalyzer/Predictor (run()에서 초기화) ──────
         # frame 크기(fw, fh)와 fps는 run()에서 영상을 열어야 확정되므로
         # __init__ 시점에서는 None으로 두고 run() 진입 직후 초기화한다.
-        self.gru_module_a = None                                    # A방향 GRU (run()에서 초기화)
-        self.gru_module_b = None                                    # B방향 GRU (run()에서 초기화)
         self.traffic_analyzer_a = None                              # A방향 정체 탐지 (run()에서 초기화)
         self.traffic_analyzer_b = None                              # B방향 정체 탐지 (run()에서 초기화)
         self.predictor_a = None                                     # A방향 정체 예측 (run()에서 초기화)
@@ -66,6 +59,7 @@ class Detector:
         # ── 방향 분류 기준 벡터 + 차량별 방향 매핑 ────────────────────
         self._ref_direction = None                                  # 전역 기준 방향 벡터 (학습 완료 시 계산)
         self._track_direction = {}                                  # {tid: 'a' or 'b'} 차량별 방향
+        self._wrongway_stable_until = 0                             # 재학습 후 역주행 판정 유예 종료 프레임
         self._dir_label_a = "상행"                                  # A방향 표시 레이블 (기본값)
         self._dir_label_b = "하행"                                  # B방향 표시 레이블 (기본값)
         self._valid_cells_a: int = 1                                # A방향 유효 셀 수 (bbox_coverage 원근 보정용)
@@ -249,40 +243,41 @@ class Detector:
         st.frame_w, st.frame_h, st.video_fps = fw, fh, fps         # state에 저장
         self.flow.init_grid(fw, fh)                                 # 그리드 초기화
 
-        # ── 방향별 GRUModule 초기화 (Phase 2 — PyTorch 없으면 None 유지) ──
-        if _GRU_AVAILABLE:                                          # PyTorch·gru_module 사용 가능이면
-            self.gru_module_a = GRUModule(cfg, fps=fps)             # A방향 GRU — fps로 horizon 프레임 계산
-            self.gru_module_b = GRUModule(cfg, fps=fps)             # B방향 GRU
-            # ── 저장된 weights 로드 (flow_map 같은 폴더) ──────────────
-            if cfg.flow_map_path:
-                _gru_a_path = cfg.flow_map_path.parent / "gru_a.pt"
-                _gru_b_path = cfg.flow_map_path.parent / "gru_b.pt"
-                if _gru_a_path.exists() and self.gru_module_a.load(_gru_a_path):
-                    print(f"🧠 GRU-A weights 로드 완료: {_gru_a_path}")
-                if _gru_b_path.exists() and self.gru_module_b.load(_gru_b_path):
-                    print(f"🧠 GRU-B weights 로드 완료: {_gru_b_path}")
-            print("🧠 GRUModule ×2 초기화 완료 (방향별 Phase 2 모드)")
-        else:                                                       # 없으면 Phase 1 모드로 동작
-            print("ℹ️  GRUModule 없음 → Phase 1 모드로 동작")
-
         # ── 방향별 TrafficAnalyzer 초기화 ─────────────────────────────
         self.traffic_analyzer_a = TrafficAnalyzer(                  # A방향 정체 탐지
             cfg, frame_w=fw, frame_h=fh, fps=fps,
             flow_map=self.flow,                                     # flow_map 주입 (bbox_coverage 계산용)
-            gru_module=self.gru_module_a                            # A방향 GRU 연결
         )
         self.traffic_analyzer_a.set_state(self.state)               # state 주입
 
         self.traffic_analyzer_b = TrafficAnalyzer(                  # B방향 정체 탐지
             cfg, frame_w=fw, frame_h=fh, fps=fps,
             flow_map=self.flow,                                     # flow_map 주입 (bbox_coverage 계산용)
-            gru_module=self.gru_module_b                            # B방향 GRU 연결
         )
         self.traffic_analyzer_b.set_state(self.state)               # state 주입
 
         # ── 방향별 CongestionPredictor 초기화 ─────────────────────────
         self.predictor_a = CongestionPredictor(cfg, fps=fps)        # A방향 정체 예측
         self.predictor_b = CongestionPredictor(cfg, fps=fps)        # B방향 정체 예측
+
+        # ── 방향별 HistoricalPredictor 초기화 (시각별 jam 이력 기반 예측) ─
+        _hist_dir = cfg.flow_map_path.parent if cfg.flow_map_path else None
+        if _hist_dir is not None:
+            self._hist_pred_a = HistoricalPredictor(
+                csv_path=_hist_dir / "hist_jam_a.csv",
+                smooth_threshold=cfg.smooth_jam_threshold,
+                slow_threshold=cfg.slow_jam_threshold,
+            )
+            self._hist_pred_b = HistoricalPredictor(
+                csv_path=_hist_dir / "hist_jam_b.csv",
+                smooth_threshold=cfg.smooth_jam_threshold,
+                slow_threshold=cfg.slow_jam_threshold,
+            )
+            print(f"📊 HistoricalPredictor ×2 초기화 완료 → {_hist_dir}")
+        else:
+            self._hist_pred_a = None                                # flow_map_path 없으면 비활성
+            self._hist_pred_b = None
+            print("ℹ️  HistoricalPredictor 비활성 (flow_map_path 없음)")
 
         # ── 정체 탐지 활성화 ──────────────────────────────────────────────
         self.traffic_analyzer_a.set_baseline()                     # A방향 FE+CJ 활성화
@@ -306,35 +301,8 @@ class Detector:
         # ── 프레임 간 상태 추적용 변수 ──────────────────────────────
         prev_active_ids: set = set()                                # 이전 프레임 활성 ID 집합 (퇴장 감지용)
         last_footpoints: dict = {}                                  # {track_id: (fx, fy)} 마지막 footpoint
-        self._gru_pretrain_pending_a = False                         # A방향 GRU pretrain 예약 플래그
-        self._gru_pretrain_pending_b = False                         # B방향 GRU pretrain 예약 플래그
-        self._gru_feature_history_a = []                             # A방향 GRU pretrain용 feature 누적
-        self._gru_feature_history_b = []                             # B방향 GRU pretrain용 feature 누적
-
-        # ── 누적 로그 경로 (flow_map과 같은 폴더) ─────────────────────
-        self._log_path_a = (cfg.flow_map_path.parent / "feature_log_a.pkl"
-                            if cfg.flow_map_path else None)          # A방향 누적 로그
-        self._log_path_b = (cfg.flow_map_path.parent / "feature_log_b.pkl"
-                            if cfg.flow_map_path else None)          # B방향 누적 로그
-        self._log_interval = getattr(cfg, "gru_log_interval", 3)     # 저장 주기 (프레임)
-
-        # ── 재학습 주기 추적 ──────────────────────────────────────────
-        _retrain_sec = getattr(cfg, "gru_retrain_interval_sec", 3600.0)
-        self._retrain_interval_frames = int(_retrain_sec * fps)      # 초→프레임
-        self._last_retrain_frame = 0                                 # 마지막 재학습 프레임
-
-        # ── detect_only 모드: 기존 로그로 즉시 재학습 시도 ────────────
-        if cfg.detect_only and _GRU_AVAILABLE:
-            for gru_m, log_p, tag in [
-                (self.gru_module_a, self._log_path_a, "A"),
-                (self.gru_module_b, self._log_path_b, "B"),
-            ]:
-                if gru_m is not None and log_p is not None and not gru_m._is_direct_trained:
-                    if gru_m.retrain_from_log(log_p):               # 로그에서 재학습
-                        if cfg.flow_map_path:                        # weights 저장
-                            _pt = cfg.flow_map_path.parent / f"gru_{tag.lower()}.pt"
-                            if gru_m.save(_pt):
-                                print(f"💾 GRU-{tag} 재학습 weights 저장: {_pt}")
+        _last_skip_frame: int = -9999                               # 마지막 프레임 스킵 감지 프레임 번호
+        _post_skip_grace = getattr(cfg, "post_skip_grace_frames", 30)  # 재연결 후 차단 프레임 수
 
         # ── 학습 연장 상한 계산 ──────────────────────────────────────
         max_learning_frames = int(                                  # 최대 학습 프레임 수
@@ -522,6 +490,7 @@ class Detector:
                 and _jump_count / _jump_total >= _jump_ratio        # 절반 이상 jump
             )
             if _is_frame_skip:
+                _last_skip_frame = st.frame_num                     # grace period 타이머 갱신
                 print(f"[F:{st.frame_num}] ⚠️ 프레임 스킵 감지 ({_jump_count}/{_jump_total}대 jump) → 이 프레임 스킵")
                 # 스킵 후 궤적 전체를 현재 위치로 채움
                 # velocity 계산: traj[-velocity_window] → traj[-1] 구간을 사용하므로
@@ -547,6 +516,7 @@ class Detector:
             # 궤적을 초기화하여 갭 구간의 변위가 velocity 계산에 개입하는 것을 차단.
             # _is_frame_skip과 달리 wrong_way_ids는 유지 (이미 확정된 역주행은 취소 불필요).
             if _is_time_gap and not _is_frame_skip:
+                _last_skip_frame = st.frame_num                     # grace period 타이머 갱신
                 st.post_reconnect_frame = st.frame_num              # 재연결 이벤트 기록
                 for _t in tracks:
                     _tid = _t["id"]
@@ -592,8 +562,7 @@ class Detector:
                 # worst-of-both 방향의 rule_jam / gru_score 선택 (jam 기준)
                 _src = (self.traffic_analyzer_a                     # jam 높은 쪽 analyzer
                         if _jam_a >= _jam_b else self.traffic_analyzer_b)
-                _rule_jam = _src.get_rule_jam_score() if _src else 0.0  # rule_jam (블렌딩 전)
-                _gru_score = _src.get_gru_score() if _src else None     # gru_score (None 허용)
+                _rule_jam = _src.get_rule_jam_score() if _src else 0.0  # rule_jam (로그용)
                 self.logger.log_frame(                              # 프레임 로그 기록
                     frame_num=st.frame_num,
                     time_sec=time_sec,
@@ -604,8 +573,7 @@ class Detector:
                     mode="DETECTING",
                     jam_score=_worst_jam,                           # worst-of-both jam_score
                     congestion_level=_worst_lvl,                    # worst-of-both 레벨
-                    rule_jam_score=_rule_jam,                       # rule 기반 jam (블렌딩 전)
-                    gru_score=_gru_score                            # GRU 예측값 (warmup 중 None)
+                    rule_jam_score=_rule_jam,                       # rule 기반 jam
                 )
 
             # ── 카메라 전환 감지 및 안정 대기 상태 머신 ─────────────────
@@ -624,11 +592,6 @@ class Detector:
                         print("📷 카메라 전환 감지 → 화면 안정 대기 중...")
                         st.waiting_stable = True
                         st.stable_since_frame = st.frame_num       # 안정 타이머 시작
-                        # GRU만 즉시 리셋 (flow_map은 안정 후 재학습 시작 시 초기화)
-                        if self.gru_module_a is not None:
-                            self.gru_module_a.reset()
-                        if self.gru_module_b is not None:
-                            self.gru_module_b.reset()
                         self._track_direction.clear()
 
                 # ── (B) 안정 대기 중: diff 모니터링 ────────────────────────
@@ -651,17 +614,6 @@ class Detector:
                             self.flow.reset()                      # flow_map 초기화
                             self.traffic_analyzer_a.congestion_judge.reset()
                             self.traffic_analyzer_b.congestion_judge.reset()
-                            # 메모리 history를 pkl에 먼저 저장 — 전환 전 데이터도 보존
-                            if self._log_path_a and self._gru_feature_history_a:
-                                self.gru_module_a.append_feature_log(
-                                    self._gru_feature_history_a, self._log_path_a)
-                            if self._log_path_b and self._gru_feature_history_b:
-                                self.gru_module_b.append_feature_log(
-                                    self._gru_feature_history_b, self._log_path_b)
-                            self._gru_feature_history_a = []
-                            self._gru_feature_history_b = []
-                            self._gru_pretrain_pending_a = False
-                            self._gru_pretrain_pending_b = False
                             self._ref_direction = None
                             _relearn_smoothed_80 = False
                             _relearn_smoothed_95 = False
@@ -678,15 +630,6 @@ class Detector:
                         self.flow.reset()                          # 오염된 flow_map 초기화
                         _relearn_smoothed_80 = False
                         _relearn_smoothed_95 = False
-                        # GRU feature 이력도 초기화 — 재학습 중 수집된 오염 데이터 제거
-                        self._gru_feature_history_a = []
-                        self._gru_feature_history_b = []
-                        self._gru_pretrain_pending_a = False
-                        self._gru_pretrain_pending_b = False
-                        if self.gru_module_a is not None:
-                            self.gru_module_a.reset()
-                        if self.gru_module_b is not None:
-                            self.gru_module_b.reset()
 
             # ── 프레임 freeze 감지 (끊김 재연결 감지) ─────────────────────────
             # adj_diff ≈ 0 이 연속되면 카메라 freeze → 이후 정상 복귀 시 재연결 이벤트.
@@ -718,6 +661,7 @@ class Detector:
                         print(f"[F:{st.frame_num}] 📡 끊김 재연결 감지 "
                               f"({_freeze_frame_count}프레임 정지, avg={_avg_adj:.2f}, "
                               f"thr={_freeze_thr:.3f}) → 역주행 판정 차단 시작")
+                        _last_skip_frame = st.frame_num             # grace period 타이머 갱신
                         st.post_reconnect_frame = st.frame_num      # 재연결 이벤트 기록
                         # 모든 차량 궤적 초기화 (_is_frame_skip과 동일 처리)
                         for _t in tracks:
@@ -757,10 +701,6 @@ class Detector:
                             save_ref_frame(frame, cfg.flow_map_path.parent)
                     st.is_learning = False                          # 학습 모드 종료
                     print(f"학습 완료! (frame={st.frame_num})")
-                    # GRU pretrain: 버퍼에 쌓인 feature로 자기지도 사전학습
-                    # (학습 완료 후 feature가 아직 없으므로 push()가 충분히 쌓이면 호출)
-                    self._gru_pretrain_pending_a = True             # A방향 pretrain 예약
-                    self._gru_pretrain_pending_b = True             # B방향 pretrain 예약
 
             # ── 재학습 모드 처리 ──
             if st.relearning:                                       # 재학습 중이면
@@ -791,10 +731,16 @@ class Detector:
                             save_ref_frame(frame, cfg.flow_map_path.parent)
                     st.relearning = False                           # 재학습 모드 종료
                     st.cooldown_until = st.frame_num + cfg.cooldown_frames  # 쿨다운 설정
+                    # 역주행 판정 안정화 대기: 재학습 직후 _track_direction 미확정 차량이
+                    # judge.check()에 진입하지 않도록 별도 유예 프레임 설정
+                    # (cooldown_frames는 카메라 전환 감지 억제용 — 역주행 판정과 분리)
+                    self._wrongway_stable_until = (
+                        st.frame_num
+                        + getattr(cfg, "wrongway_relearn_grace_frames",
+                                  cfg.cooldown_frames)              # 기본값: cooldown_frames 재사용
+                    )
                     self.switch.set_reference(frame)                # 새 기준 프레임 설정
                     print("재학습 완료! 쿨다운 시작")
-                    self._gru_pretrain_pending_a = True             # A방향 GRU pretrain 예약
-                    self._gru_pretrain_pending_b = True             # B방향 GRU pretrain 예약
 
             # ── 전차량 fleet cosine 선제 계산 (끊김 감지) ──────────────────────
             # 정상 주행 시: 모든 차량이 flow_map 방향과 cos > 0 → fleet 평균 양수
@@ -1048,12 +994,24 @@ class Detector:
                                 traj_ndy=_traj_ndy
                             )
                         else:                                       # 감지 모드
-                            # 역주행 여부 판단 (bbox_h 전달 — nm 기반 속도 게이트용)
-                            _bbox_h = max(y2 - y1, 1)               # bbox 높이 (원근 정규화용)
-                            is_wrong, _, debug_info = self.judge.check(
-                                tid, traj, ndx, ndy, mag, cy, _bbox_h,
-                                track_dir=self._track_direction.get(tid)
+                            # ── 재학습 후 유예 기간 또는 track_dir 미확정 → 역주행 판정 차단 ──
+                            # ① 재학습 완료 직후: _track_direction이 재확정되기 전
+                            #    플로우맵이 막 완성된 상태에서 old 궤적 기반 오탐 방지
+                            # ② track_dir=None: _ref_direction=None 기간 중 방향 분류 스킵된 차량
+                            #    → flow 채널 특정 불가 + 이웃 가드(_sus_dir=None) 무력화
+                            _wrongway_blocked = (
+                                st.frame_num <= self._wrongway_stable_until
+                                or self._track_direction.get(tid) is None
                             )
+                            if _wrongway_blocked:
+                                debug_info = {"status": "dir_unclassified", "cos_values": []}
+                            else:
+                                # 역주행 여부 판단 (bbox_h 전달 — nm 기반 속도 게이트용)
+                                _bbox_h = max(y2 - y1, 1)           # bbox 높이 (원근 정규화용)
+                                is_wrong, _, debug_info = self.judge.check(
+                                    tid, traj, ndx, ndy, mag, cy, _bbox_h,
+                                    track_dir=self._track_direction.get(tid)
+                                )
 
                             # ── 이웃 차량 방향 일치 확인 (118차 — neighbor_agreement_guard) ──
                             # 진짜 역주행: 이 차량만 반대 방향, 같은 분류 이웃은 정방향
@@ -1251,10 +1209,12 @@ class Detector:
             # ── 이전 프레임 활성 ID 갱신 ─────────────────────────────────
             prev_active_ids = active_ids.copy()                     # 다음 프레임 비교용으로 저장
 
-            # ── 방향별 TrafficAnalyzer·GRU 갱신 ──────────────────────────
+            # ── 방향별 TrafficAnalyzer 갱신 ─────────────────────────────
+            _in_grace = (st.frame_num - _last_skip_frame) <= _post_skip_grace
             if (self.traffic_analyzer_a is not None                 # 초기화 완료 확인
                     and not st.is_learning and not st.relearning and not st.waiting_stable  # 탐지 모드일 때만
-                    and not _is_frame_skip):                        # 프레임 스킵(순간이동) 프레임은 jam_score 업데이트 차단
+                    and not _is_frame_skip                          # 프레임 스킵 프레임 차단
+                    and not _in_grace):                             # 재연결 후 grace period 차단 (속도 이력 재구성 대기)
                 # A방향 정체 탐지 갱신
                 self.traffic_analyzer_a.update(tracks_a, speeds_a, st.frame_num)
                 self.predictor_a.update(self.traffic_analyzer_a.get_avg_speed())
@@ -1262,108 +1222,16 @@ class Detector:
                 self.traffic_analyzer_b.update(tracks_b, speeds_b, st.frame_num)
                 self.predictor_b.update(self.traffic_analyzer_b.get_avg_speed())
 
-                # ── GRU 로그 수집 신뢰도 판단 ────────────────────────────
-                # 탐지 차량이 너무 적거나(야간·안개) 프레임이 너무 어두우면
-                # feature가 실제 교통 상황을 반영하지 못함 → 로그 스킵
-                _min_veh = getattr(cfg, "gru_min_vehicles_for_log", 3)
-                _min_bri = getattr(cfg, "gru_min_brightness_for_log", 0.0)
-                _total_tracks = len(tracks_a) + len(tracks_b)       # 전체 탐지 차량 수
-                _brightness_ok = True
-                if _min_bri > 0:                                    # 밝기 필터 활성 시
-                    import numpy as _np
-                    _gray_mean = float(_np.mean(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)))
-                    _brightness_ok = (_gray_mean >= _min_bri)
-                _feature_reliable = (_total_tracks >= _min_veh and _brightness_ok)
-
-                # ── feature 누적 (A방향) — pretrain·로그 공용 ─────────────
-                # 신뢰도 필터 통과 시에만 수집 — 오학습 방지
-                if self.gru_module_a is not None and st.frame_num % self._log_interval == 0:
-                    feat_a = self.traffic_analyzer_a.get_last_feature()
-                    if feat_a is not None and _feature_reliable:
-                        self._gru_feature_history_a.append(feat_a)  # pretrain용 메모리 누적
-
-                # ── feature 누적 (B방향) ──────────────────────────────────
-                if self.gru_module_b is not None and st.frame_num % self._log_interval == 0:
-                    feat_b = self.traffic_analyzer_b.get_last_feature()
-                    if feat_b is not None and _feature_reliable:
-                        self._gru_feature_history_b.append(feat_b)
-
-                # ── GRU pretrain / 재학습 (A방향) ────────────────────────
-                if self.gru_module_a is not None:
-                    _hist_len_a = len(self._gru_feature_history_a)
-                    _need_pretrain_a = (                             # 최초 pretrain 조건
-                        self._gru_pretrain_pending_a
-                        and _hist_len_a >= self.gru_module_a._pretrain_min_frames
+                # ── HistoricalPredictor: 현재 jam_score를 5분 창에 누적 ──
+                # 슬롯 경계(5분) 도달 시 중앙값 계산 후 CSV에 자동 flush
+                if self._hist_pred_a is not None:
+                    _now_dt = datetime.now()
+                    self._hist_pred_a.record(
+                        self.traffic_analyzer_a.get_jam_score(), dt=_now_dt
                     )
-                    _need_retrain_a = (                              # 주기적 재학습 조건
-                        self.gru_module_a._is_direct_trained         # 이미 한 번 학습됨
-                        and (st.frame_num - self._last_retrain_frame)
-                            >= self._retrain_interval_frames         # 재학습 주기 도달
-                        and self._log_path_a is not None
+                    self._hist_pred_b.record(
+                        self.traffic_analyzer_b.get_jam_score(), dt=_now_dt
                     )
-                    if _need_pretrain_a or _need_retrain_a:
-                        # 디스크 로그에 이번 세션 누적분 먼저 저장
-                        if self._log_path_a:
-                            total_a = self.gru_module_a.append_feature_log(
-                                self._gru_feature_history_a, self._log_path_a)
-                            print(f"[GRU-A] 로그 저장: 이번세션 {_hist_len_a}개 / 누적 {total_a}개 "
-                                  f"({total_a / max(fps, 1) / 60:.1f}분)")
-                            # 전체 누적 로그로 학습 (이번 세션 + 과거 세션)
-                            losses_a = self.gru_module_a.retrain_from_log(self._log_path_a)
-                        else:
-                            losses_a = self.gru_module_a.pretrain(self._gru_feature_history_a)
-                            if losses_a:
-                                print(f"🧠 GRU-A pretrain 완료: loss {losses_a[0]:.4f}→{losses_a[-1]:.4f}")
-                        self._gru_feature_history_a = []             # 메모리 비우기
-                        self._gru_pretrain_pending_a = False
-                        self._last_retrain_frame = st.frame_num      # 재학습 시각 갱신
-                        if cfg.flow_map_path:                        # weights 저장
-                            _save_a = cfg.flow_map_path.parent / "gru_a.pt"
-                            if self.gru_module_a.save(_save_a):
-                                print(f"💾 GRU-A weights 저장: {_save_a}")
-
-                # ── GRU pretrain / 재학습 (B방향) ────────────────────────
-                if self.gru_module_b is not None:
-                    _hist_len_b = len(self._gru_feature_history_b)
-                    _need_pretrain_b = (
-                        self._gru_pretrain_pending_b
-                        and _hist_len_b >= self.gru_module_b._pretrain_min_frames
-                    )
-                    _need_retrain_b = (
-                        self.gru_module_b._is_direct_trained
-                        and (st.frame_num - self._last_retrain_frame)
-                            >= self._retrain_interval_frames
-                        and self._log_path_b is not None
-                    )
-                    if _need_pretrain_b or _need_retrain_b:
-                        if self._log_path_b:
-                            total_b = self.gru_module_b.append_feature_log(
-                                self._gru_feature_history_b, self._log_path_b)
-                            print(f"[GRU-B] 로그 저장: 이번세션 {_hist_len_b}개 / 누적 {total_b}개 "
-                                  f"({total_b / max(fps, 1) / 60:.1f}분)")
-                            losses_b = self.gru_module_b.retrain_from_log(self._log_path_b)
-                        else:
-                            losses_b = self.gru_module_b.pretrain(self._gru_feature_history_b)
-                            if losses_b:
-                                print(f"🧠 GRU-B pretrain 완료: loss {losses_b[0]:.4f}→{losses_b[-1]:.4f}")
-                        self._gru_feature_history_b = []
-                        self._gru_pretrain_pending_b = False
-                        if cfg.flow_map_path:
-                            _save_b = cfg.flow_map_path.parent / "gru_b.pt"
-                            if self.gru_module_b.save(_save_b):
-                                print(f"💾 GRU-B weights 저장: {_save_b}")
-
-                # ── GRU online_step: 매 프레임 현재 레벨로 실시간 학습 ──────
-                # SMOOTH만 학습하던 방식 → 전체 레벨 학습으로 확장
-                # 이유: 하루종일 실행 시 아침 러시(JAM), 낮(SMOOTH), 저녁 러시(SLOW) 등
-                #       다양한 패턴을 실시간으로 반영해야 예측 정확도가 올라감
-                _level_map = {"SMOOTH": 0, "SLOW": 1, "JAM": 2}
-                if self.gru_module_a is not None and _feature_reliable:  # 신뢰 구간만 학습
-                    _lv_a = self.traffic_analyzer_a.get_congestion_level()
-                    self.gru_module_a.online_step(label=_level_map[_lv_a])
-                if self.gru_module_b is not None and _feature_reliable:  # 신뢰 구간만 학습
-                    _lv_b = self.traffic_analyzer_b.get_congestion_level()
-                    self.gru_module_b.online_step(label=_level_map[_lv_b])
 
                 # ── flow_map speed_ref 온라인 학습 (SMOOTH 구간만) ────────
                 # SMOOTH 구간의 nm을 셀별로 EMA 축적 → 위치별 정상속도 기준 확보
@@ -1443,12 +1311,17 @@ class Detector:
                         label_a=self._dir_label_a,                  # "UP" 또는 "DOWN"
                         label_b=self._dir_label_b                   # "DOWN" 또는 "UP"
                     )
-                    # ── 미래 예측 패널 (1·3·5분 후) ─────────────────────
-                    pred_a = self.traffic_analyzer_a.get_direct_prediction()
-                    pred_b = self.traffic_analyzer_b.get_direct_prediction()
+                    # ── 5분 후 예측 패널 — HistoricalPredictor ──────────────
+                    # 데이터 없으면 predict()=None → "Training..." 표시
+                    if self._hist_pred_a is not None:
+                        _pred_now = datetime.now()
+                        pred_a = self._hist_pred_a.predict(_pred_now)
+                        pred_b = self._hist_pred_b.predict(_pred_now)
+                    else:
+                        pred_a = pred_b = None
                     self.vis.draw_prediction_panel(
                         frame, pred_a, pred_b,
-                        label_a=self._dir_label_a                   # A방향 레이블로 Down/Up 자동 배치
+                        label_a=self._dir_label_a
                     )
 
             # FPS 계산 및 표시
@@ -1500,18 +1373,13 @@ class Detector:
         if not st.is_learning and cfg.flow_map_path:                # 학습 완료 상태이면
             self.flow.save(cfg.flow_map_path)                       # flow_map 저장 (baseline 없이)
 
-        # ── 세션 종료 시 미저장 feature 로그 flush ──────────────────
-        # 재학습 주기에 도달하지 않은 채 종료되더라도 이번 세션 데이터를 보존
-        for gru_m, hist, log_p, tag in [
-            (self.gru_module_a, self._gru_feature_history_a, self._log_path_a, "A"),
-            (self.gru_module_b, self._gru_feature_history_b, self._log_path_b, "B"),
-        ]:
-            if gru_m is not None and hist and log_p is not None:
-                total = gru_m.append_feature_log(hist, log_p)
-                print(f"[GRU-{tag}] 세션 종료 — "
-                      f"이번 {len(hist)}개 저장 / 누적 {total}개 "
-                      f"({total / max(fps, 1) / 60:.1f}분 / "
-                      f"{gru_m._pretrain_min_frames / max(fps, 1) / 60:.1f}분 필요)")
+        # ── HistoricalPredictor: 마지막 미완성 5분 창 flush + 통계 출력 ─
+        if self._hist_pred_a is not None:
+            self._hist_pred_a.flush_current()
+            self._hist_pred_b.flush_current()
+            print(f"📊 HistoricalPredictor 저장 완료"
+                  f" (A: {self._hist_pred_a.get_total_windows()}창"
+                  f" / B: {self._hist_pred_b.get_total_windows()}창)")
 
         self._print_final_stats(save_path)                          # 최종 통계 출력
 

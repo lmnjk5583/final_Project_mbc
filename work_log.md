@@ -4,66 +4,55 @@
 
 ---
 
-## 2026-04-19 (122차 — 궤적 방향 vs 기준 방향 직접 비교 최종 안전망) [대원]
+## 2026-04-22 (123차 — GRU 전면 제거 + HistoricalPredictor 도입 + 재연결 잼스코어 안정화) [대원]
 
 ### 오늘 한 작업
 
-**13만 프레임 5건 오탐 잔존 → 근본 원인 분석 및 수정**
+#### ① GRU 모듈 전면 제거
 
-**원인 분석:**
+**배경:** GRU는 90프레임(15초) 입력으로 5분 후를 예측 — 구조적 한계로 예측 품질 불신.  
+API 끊김으로 인한 jam_score 변동에도 GRU가 노이즈를 증폭하는 부작용 존재.
 
-flow_map 오염 or 채널 오분류로 정상 'a' 차량이 `track_dir='b'`로 잘못 분류될 경우:
-1. `flow_b` 채널 조회 → 역방향 벡터와 비교 → disagree 투표 20건 누적
-2. `global_ok` 검증(line 436)도 `direction=None`(글로벌 맵) → 오염된 'b'방향 벡터 → `global_cos < -0.75` → 확정!
-3. 이 경우 **차량의 실제 궤적(traj[0]→traj[-1])은 정상 방향**인데 확정됨
+- `src/gru_module.py` 삭제
+- `tests/test_gru_module.py` 삭제
+- `src/traffic_analyzer.py`: `gru_module` 파라미터 및 블렌딩 로직 제거, `final_jam = rule_jam` 직결
+- `src/detector.py`: GRU import, 초기화, 피처 수집, pretrain/online_step, 세션 flush 전부 제거
+- `src/config.py`: GRU 파라미터 섹션 전부 제거 (gru_hidden, gru_layers, gru_seq_len, gru_blend_ratio 등)
+- `tests/test_traffic_analyzer.py`: GRU Mock 클래스 및 TestAnchoring(TA-09/TA-10) 제거
 
-**최종 안전망 추가: 궤적 방향 vs ref_direction 직접 비교**
+#### ② HistoricalPredictor 신규 도입
 
-```
-_traj_ref_cos = gndx * _ref_dx + gndy * _ref_dy
+**설계:** 시각별(hour × 5분 슬롯) jam_score 이력을 CSV에 누적 → 5분 후 정체 수준 예측.
 
-정상 차량: cos ≈ +1.0 → > -0.3 → 취소 ✓
-진짜 역주행: cos ≈ -1.0 → < -0.3 → 확정 허용 ✓
-```
+- 288슬롯/일 (`slot_id = hour * 12 + minute // 5`)
+- 매 5분 창마다 jam_score 중앙값을 flush (API 순간 블립 내성)
+- `predict()` → 해당 슬롯 데이터 없으면 `None` → 패널 "Training..." 표시
+- CSV 저장 경로: `flow_map_path.parent/hist_jam_a.csv`, `hist_jam_b.csv`
+- 신뢰도: `min_conf_samples=14` (약 70분 누적 시 100%)
+- 종료 시 `flush_current()` 호출 → 마지막 미완성 창 저장
 
-어떤 flow map 오염·채널 오분류가 있어도, 차량이 실제로 역방향 궤적을 그리지 않으면 최종 확정 불가.
+#### ③ 재연결 후 잼스코어 안정화 (2단계)
 
-#### 수정 내용
+**문제:** API 끊김 → 재연결 시 jam_score가 순간 급락 (두 가지 원인).
 
-**`src/judge.py`:**
-- normal-path global_ok 이후: traj_ref_cos 체크 추가
-- fast-track _ft_ok 이후: 동일 체크 추가
-- diagnostic print에 `traj_ref_cos` 포함
+**1단계 — post_skip_grace_frames (TA 업데이트 차단):**
+- 재연결 직후 IDManager 속도 이력 미구성 → nm=0 차량이 stop_count 증가
+- `config.py`: `post_skip_grace_frames = 30` 추가 (6fps 기준 5초)
+- `detector.py`: displacement skip / timestamp gap / freeze reconnect 3개 지점에서 `_last_skip_frame` 갱신
+- `_in_grace` 조건 충족 시 `traffic_analyzer.update()` 차단
+
+**2단계 — 체류 시간 소급 부여 (dwell retroactive credit):**
+- grace 기간 후 새 tid가 등록될 때 `dwell_cell_ratio`가 0으로 리셋되는 문제
+- `feature_extractor.py`: 새 tid 첫 등장 시 해당 셀의 `cell_dwell_ema > 0.3`이면
+  `first_frame = frame_num - dwell_thr_frames`으로 소급 설정 → 즉시 체류 셀로 인정
+- `cell_dwell_ema`는 ID 무관 셀 기반 → 재연결 후에도 이전 혼잡도 보존됨
 
 ### 수정 파일
-`src/judge.py`
+`src/gru_module.py` (삭제), `tests/test_gru_module.py` (삭제),  
+`src/traffic_analyzer.py`, `src/detector.py`, `src/config.py`,  
+`src/feature_extractor.py`, `src/historical_predictor.py` (신규),  
+`tests/test_traffic_analyzer.py`
 
 ---
 
-## 2026-04-19 (121차 — 채널 2-cell 최소 요건 + 진단 출력 추가) [대원]
-
-### 오늘 한 작업
-- `flow_map.py` 채널 조회 시 4개 인접 셀 중 **2개 이상** 채널 데이터 있어야 채널 보간 사용 (기존: 1개)
-- `judge.py` normal-path 확정 시 `🚨 [normal]` 진단 출력 추가
-
-### 수정 파일
-`src/flow_map.py`, `src/judge.py`
-
----
-
-## 2026-04-19 (120차 — 구역 확정 쿨다운 wrong_zone_cooldown) [대원]
-
-### 오늘 한 작업
-
-**15만 프레임 테스트 후 잔존 FP 3건 근본 분석 및 수정**
-
-순차 통과 패턴(1대씩 서로 다른 시점) → 이웃 가드 미발동 → 구역 쿨다운으로 에코 차단.
-
-#### 수정 내용
-
-- `src/state.py`: `wrong_zone_confirmed: dict = {}` 추가
-- `src/config.py`: `wrong_zone_cooldown_frames: int = 900` 추가
-- `src/detector.py`: 이웃 가드 이후 구역 쿨다운 체크 삽입
-
-### 수정 파일
-`src/state.py`, `src/config.py`, `src/detector.py`
+> 이전 항목(120~122차 / 2026-04-19)은 `work_log_archive.md`로 이관됨.
