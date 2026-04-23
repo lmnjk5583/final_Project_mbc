@@ -18,8 +18,9 @@ class DetectorState:
         self.cooldown_until = 0         # 이 프레임까지 카메라 전환 감지 비활성 (쿨다운 끝나는 프레임)
         # waiting_stable: 전환 감지 후 화면이 안정될 때까지 대기하는 중간 상태
         # is_learning=False, relearning=False, waiting_stable=True → "대기 중"
-        self.waiting_stable = False     # 전환 감지 후 안정 대기 중 여부
-        self.stable_since_frame = 0     # 안정 시작 프레임 (연속 안정 카운트용)
+        self.waiting_stable = False           # 전환 감지 후 안정 대기 중 여부
+        self.stable_since_frame = 0           # 안정 시작 프레임 (연속 안정 카운트용)
+        self.waiting_stable_entered_frame = 0 # waiting_stable 최초 진입 프레임 (최대 대기 시간 계산용)
 
         # ==================== 상태 변수(트래킹/역주행 카운트) ====================
         self.trajectories = defaultdict(list)     # 각 ID별 궤적 저장 {track_id: [(cx, cy), ...]}

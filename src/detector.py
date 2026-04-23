@@ -592,6 +592,7 @@ class Detector:
                         print("📷 카메라 전환 감지 → 화면 안정 대기 중...")
                         st.waiting_stable = True
                         st.stable_since_frame = st.frame_num       # 안정 타이머 시작
+                        st.waiting_stable_entered_frame = st.frame_num  # 최초 진입 시점 기록
                         self._track_direction.clear()
 
                 # ── (B) 안정 대기 중: diff 모니터링 ────────────────────────
@@ -600,15 +601,28 @@ class Detector:
                     self.switch.check(frame, st.frame_num, st.cooldown_until)
                     _cur_diff = self.switch.last_adj_diff
 
-                    if _cur_diff > _stability_thr:                 # 아직 불안정 → 타이머 리셋
+                    _max_wait_frames = int(
+                        getattr(cfg, "waiting_stable_max_sec", 30.0) * fps
+                    )
+                    _total_waited = st.frame_num - st.waiting_stable_entered_frame
+                    _force_relearn = _total_waited >= _max_wait_frames
+
+                    if _force_relearn:
+                        # 최대 대기 시간 초과 — 불안정해도 강제 재학습
+                        print(f"⏱️ 안정 대기 최대 시간 초과 ({_total_waited}프레임) → 강제 재학습 시작")
+
+                    if _cur_diff > _stability_thr and not _force_relearn:
+                        # 아직 불안정 → 안정 타이머 리셋 (단, 최대 대기 미초과 시에만)
                         st.stable_since_frame = st.frame_num
                         if st.frame_num % 30 == 0:
-                            print(f"[대기] 아직 불안정 diff={_cur_diff:.1f} > {_stability_thr}")
+                            print(f"[대기] 아직 불안정 diff={_cur_diff:.1f} > {_stability_thr} "
+                                  f"(총 대기 {_total_waited}/{_max_wait_frames}프레임)")
                     else:
-                        # 안정 지속 중 — 충분히 유지됐으면 재학습 시작
+                        # 안정 지속 중 or 강제 재학습 — 충분히 유지됐으면 재학습 시작
                         stable_frames = st.frame_num - st.stable_since_frame
-                        if stable_frames >= _stability_required_frames:
-                            print(f"✅ 화면 안정 확인 ({stable_frames}프레임) → 재학습 시작")
+                        if stable_frames >= _stability_required_frames or _force_relearn:
+                            if not _force_relearn:
+                                print(f"✅ 화면 안정 확인 ({stable_frames}프레임) → 재학습 시작")
                             st.waiting_stable = False
                             st.reset_for_relearn()                 # 재학습 모드 진입
                             self.flow.reset()                      # flow_map 초기화
@@ -627,6 +641,7 @@ class Detector:
                         st.relearning = False
                         st.waiting_stable = True
                         st.stable_since_frame = st.frame_num
+                        st.waiting_stable_entered_frame = st.frame_num  # 최대 대기 타이머 재시작
                         self.flow.reset()                          # 오염된 flow_map 초기화
                         _relearn_smoothed_80 = False
                         _relearn_smoothed_95 = False

@@ -121,6 +121,9 @@ class DetectorConfig:
                                            # 8.0: 조명 변화/차량 움직임 허용, 카메라 이동 차단
     relearn_abort_diff:       float = 15.0 # 재학습 중 이 이상이면 불안정 → 재학습 중단 후 대기 복귀
                                            # stability_diff_threshold보다 높게 — 일시적 차량 오판 방지
+    waiting_stable_max_sec:  float = 30.0  # waiting_stable 최대 대기 시간 (초)
+                                           # 이 시간을 초과하면 불안정해도 강제 재학습 시작
+                                           # 새벽 API 끊김 반복으로 타이머가 무한 리셋되는 현상 방지
 
     # ==================== 경로 관련 ====================
     flow_map_path: Path = None        # flow_map 저장/로드 파일 경로

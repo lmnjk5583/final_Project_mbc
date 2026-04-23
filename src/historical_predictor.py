@@ -167,16 +167,86 @@ class HistoricalPredictor:
 
     # ==================== 예측 ====================
 
+    # ── 슬롯 평균 jam 조회 (내부 헬퍼) ──────────────────────────────
+    def _slot_avg(self, sid: int) -> float:
+        """슬롯 평균 jam_score 반환. 데이터 없으면 -1."""
+        s = self._slots.get(sid)
+        if s is None or s[0] == 0:
+            return -1.0
+        return s[1] / s[0]
+
+    def _slot_conf(self, sid: int) -> float:
+        """슬롯 신뢰도 반환 (0~1). 데이터 없으면 0."""
+        s = self._slots.get(sid)
+        if s is None or s[0] == 0:
+            return 0.0
+        return min(s[0] / max(self._min_conf, 1), 1.0)
+
+    # ── 빈 슬롯 보간 (최대 탐색 범위: ±_INTERP_MAX_GAP 슬롯) ────────
+    _INTERP_MAX_GAP: int = 12   # 60분 = 12슬롯 이내만 보간 (이 이상이면 신뢰 불가)
+
+    def _interpolate(self, target_sid: int) -> tuple[float, float] | None:
+        """target_sid가 비었을 때 양측 이웃 슬롯으로 선형 보간한다.
+
+        Returns
+        -------
+        (avg_jam, confidence) | None
+            보간 성공이면 (값, 신뢰도), 범위 내 데이터 없으면 None.
+        """
+        # ── 이전(prev) 슬롯 탐색 ──────────────────────────────────────
+        prev_sid, prev_dist = None, 0
+        for d in range(1, self._INTERP_MAX_GAP + 1):
+            sid = (target_sid - d) % 288
+            if self._slot_avg(sid) >= 0:
+                prev_sid, prev_dist = sid, d
+                break
+
+        # ── 이후(next) 슬롯 탐색 ──────────────────────────────────────
+        next_sid, next_dist = None, 0
+        for d in range(1, self._INTERP_MAX_GAP + 1):
+            sid = (target_sid + d) % 288
+            if self._slot_avg(sid) >= 0:
+                next_sid, next_dist = sid, d
+                break
+
+        if prev_sid is None and next_sid is None:
+            return None   # 전체 데이터 없음
+
+        # ── 한쪽만 있으면 그대로 사용 (최근접 이웃) ──────────────────
+        if prev_sid is None:
+            avg_jam = self._slot_avg(next_sid)
+            base_conf = self._slot_conf(next_sid)
+            gap = next_dist
+        elif next_sid is None:
+            avg_jam = self._slot_avg(prev_sid)
+            base_conf = self._slot_conf(prev_sid)
+            gap = prev_dist
+        else:
+            # ── 양측 선형 보간 ────────────────────────────────────────
+            total = prev_dist + next_dist          # 두 슬롯 간 전체 거리
+            t     = prev_dist / total              # 0=prev 위치, 1=next 위치
+            avg_jam   = self._slot_avg(prev_sid) * (1.0 - t) + self._slot_avg(next_sid) * t
+            base_conf = min(self._slot_conf(prev_sid), self._slot_conf(next_sid))
+            gap = total                            # 간격이 클수록 신뢰도 페널티
+
+        # ── 간격 페널티: 간격 1슬롯→거의 그대로, 12슬롯→절반 ─────────
+        gap_factor = max(0.0, 1.0 - gap / (self._INTERP_MAX_GAP * 2))
+        conf = base_conf * gap_factor
+
+        return float(avg_jam), float(conf)
+
     def predict(self, dt: datetime | None = None) -> list | None:
         """현재 시각 기준 5분 후 슬롯의 정체 수준을 예측한다.
+
+        해당 슬롯에 데이터가 없으면 양측 이웃 슬롯으로 선형 보간한다.
+        보간 범위(±60분) 내에도 데이터가 없으면 None ("Training..." 표시).
 
         Returns
         -------
         list[dict] | None
-            데이터 있으면 단일 dict 리스트:
             {"horizon_sec": 300, "horizon_min": 5,
-             "predicted_level": str, "confidence": float, "jam_score": float}
-            해당 슬롯 데이터가 없으면 None ("Training..." 표시).
+             "predicted_level": str, "confidence": float, "jam_score": float,
+             "interpolated": bool}
         """
         if dt is None:
             dt = datetime.now()
@@ -185,12 +255,20 @@ class HistoricalPredictor:
         target_sid = self._to_slot_id(future_dt)
 
         slot = self._slots.get(target_sid)
-        if slot is None or slot[0] == 0:
-            return None
+        if slot is not None and slot[0] > 0:
+            # ── 직접 데이터 ────────────────────────────────────────────
+            avg_jam = slot[1] / slot[0]
+            conf    = min(slot[0] / max(self._min_conf, 1), 1.0)
+            interp  = False
+        else:
+            # ── 보간 ───────────────────────────────────────────────────
+            result = self._interpolate(target_sid)
+            if result is None:
+                return None
+            avg_jam, conf = result
+            interp = True
 
-        avg_jam = slot[1] / slot[0]
-        conf    = min(slot[0] / max(self._min_conf, 1), 1.0)
-        level   = self._jam_to_level(avg_jam)
+        level = self._jam_to_level(avg_jam)
 
         return [{
             "horizon_sec":     300,
@@ -198,6 +276,7 @@ class HistoricalPredictor:
             "predicted_level": level,
             "confidence":      round(conf, 4),
             "jam_score":       round(avg_jam, 4),
+            "interpolated":    interp,
         }]
 
     # ==================== 내부 유틸 ====================
