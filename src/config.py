@@ -129,6 +129,9 @@ class DetectorConfig:
     flow_map_path: Path = None        # flow_map 저장/로드 파일 경로
     result_dir: Path = None           # 결과 영상 저장 폴더 경로
     data_dir: Path = None             # 입력 데이터(영상) 폴더 경로
+    camera_id: str = ""               # 카메라/위치 식별자 (예: "경부선_양재")
+                                      # 설정 시 flow_map_path.parent/camera_id/ 안에만
+                                      # 스냅샷 저장/매칭 → 다른 도로 스냅샷과 격리
     
     # ==================== 로깅/실행 모드 ====================
     detect_only: bool = True            # True면 flow_map 필수(학습 안 함)

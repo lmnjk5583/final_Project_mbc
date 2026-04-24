@@ -4,6 +4,61 @@
 
 ---
 
+## 2026-04-24 (130차 — 플로우맵 스냅샷 영속성 + 다중 도로 격리) [대원]
+
+### 오늘 한 작업
+
+#### ① 플로우맵 스냅샷 영속성 시스템 신규 구현
+
+**목적:** 학습을 마칠 때마다 타임스탬프 파일로 저장하고, 재실행 시 유사한 스냅샷을 자동 로드해 학습을 완전히 스킵.
+
+**`src/flow_map_matcher.py`:**
+- `save_flow_snapshot(frame, flow_map_obj, save_dir)` 추가
+  - `flow_map_YYYYMMDD_HHMMSS.npy` + `ref_frame_YYYYMMDD_HHMMSS.jpg` 쌍으로 저장
+  - 기존 `save_ref_frame()` + 단일 `flow_map.npy` 저장 방식 대체
+- `find_best_snapshot(current_frame, save_dir, min_score=0.35)` 추가
+  - 타임스탬프 쌍 + 레거시 단일 파일 모두 검색
+  - ORB(0.7) + 히스토그램(0.3) 혼합 유사도 비교 → 최고 점수 npy 경로 반환
+
+**`src/detector.py`:**
+- `run()` 시작 시 스냅샷 자동 매칭 블록 추가 (`init_grid` 직후)
+  - 첫 프레임 peek → `find_best_snapshot()` → 매칭 시 로드 + 학습 스킵
+  - 파일 입력이면 cap을 첫 프레임으로 되감기
+  - 스냅샷 없으면 기존 학습 경로로 진행
+- 초기 학습 / 재학습 완료 저장: `save_flow_snapshot()` 으로 교체
+
+#### ② camera_id 기반 스냅샷 격리
+
+**문제:** 다른 고속도로 CCTV가 동일 상위 폴더의 스냅샷을 오매칭하는 현상.
+
+**`src/config.py`:** `camera_id: str = ""` 필드 추가
+- 설정 시 `flow_map_path.parent/camera_id/` 서브폴더에만 저장·검색
+- 미설정 시 기존처럼 `flow_map_path.parent` 사용
+
+**`src/detector.py`:** `_snapshot_dir()` 헬퍼 메서드 추가
+- `camera_id` 유무에 따라 격리 디렉터리 반환
+- 저장·검색·출력 로그 모두 이 메서드 경유
+
+#### ③ `run_its_live.py` 구조 정리
+
+**기존 문제:** `_try_match_flow_map()` 이 `flow_maps/` 전체를 스캔해 다른 도로 npy를 복사 → 교차 오매칭 발생.
+
+**수정:**
+- `_try_match_flow_map()` 전면 제거 (Detector 내부 스냅샷 시스템으로 완전 대체)
+- `make_config(cctv_url)` → `make_config()`: URL 파라미터 불필요
+- `detect_only=False` 고정: 학습 스킵 여부는 Detector.run() 내부에서 결정
+- `FORCE_RELEARN=True` 시 타임스탬프 스냅샷(`flow_map_*.npy`, `ref_frame_*.jpg`)도 함께 삭제
+
+**다중 고속도로 동시 탐지 격리:**
+- 각 프로세스의 `ROAD_DIR = flow_maps/[경부선] 양재/` 처럼 이미 분리됨
+- `find_best_snapshot()` 가 해당 ROAD_DIR 안에서만 검색 → 교차 오매칭 원천 차단
+- 처음 학습하는 도로는 스냅샷 없음 → 즉시 학습 시작 (다른 도로 스냅샷 무시)
+
+### 수정 파일
+`src/flow_map_matcher.py`, `src/detector.py`, `src/config.py`, `run_its_live.py`
+
+---
+
 ## 2026-04-23 (125차 — waiting_stable 무한 대기 수정 + HistoricalPredictor 보간) [대원]
 
 ### 오늘 한 작업
@@ -39,55 +94,4 @@
 
 ---
 
-## 2026-04-22 (123차 — GRU 전면 제거 + HistoricalPredictor 도입 + 재연결 잼스코어 안정화) [대원]
-
-### 오늘 한 작업
-
-#### ① GRU 모듈 전면 제거
-
-**배경:** GRU는 90프레임(15초) 입력으로 5분 후를 예측 — 구조적 한계로 예측 품질 불신.  
-API 끊김으로 인한 jam_score 변동에도 GRU가 노이즈를 증폭하는 부작용 존재.
-
-- `src/gru_module.py` 삭제
-- `tests/test_gru_module.py` 삭제
-- `src/traffic_analyzer.py`: `gru_module` 파라미터 및 블렌딩 로직 제거, `final_jam = rule_jam` 직결
-- `src/detector.py`: GRU import, 초기화, 피처 수집, pretrain/online_step, 세션 flush 전부 제거
-- `src/config.py`: GRU 파라미터 섹션 전부 제거 (gru_hidden, gru_layers, gru_seq_len, gru_blend_ratio 등)
-- `tests/test_traffic_analyzer.py`: GRU Mock 클래스 및 TestAnchoring(TA-09/TA-10) 제거
-
-#### ② HistoricalPredictor 신규 도입
-
-**설계:** 시각별(hour × 5분 슬롯) jam_score 이력을 CSV에 누적 → 5분 후 정체 수준 예측.
-
-- 288슬롯/일 (`slot_id = hour * 12 + minute // 5`)
-- 매 5분 창마다 jam_score 중앙값을 flush (API 순간 블립 내성)
-- `predict()` → 해당 슬롯 데이터 없으면 `None` → 패널 "Training..." 표시
-- CSV 저장 경로: `flow_map_path.parent/hist_jam_a.csv`, `hist_jam_b.csv`
-- 신뢰도: `min_conf_samples=14` (약 70분 누적 시 100%)
-- 종료 시 `flush_current()` 호출 → 마지막 미완성 창 저장
-
-#### ③ 재연결 후 잼스코어 안정화 (2단계)
-
-**문제:** API 끊김 → 재연결 시 jam_score가 순간 급락 (두 가지 원인).
-
-**1단계 — post_skip_grace_frames (TA 업데이트 차단):**
-- 재연결 직후 IDManager 속도 이력 미구성 → nm=0 차량이 stop_count 증가
-- `config.py`: `post_skip_grace_frames = 30` 추가 (6fps 기준 5초)
-- `detector.py`: displacement skip / timestamp gap / freeze reconnect 3개 지점에서 `_last_skip_frame` 갱신
-- `_in_grace` 조건 충족 시 `traffic_analyzer.update()` 차단
-
-**2단계 — 체류 시간 소급 부여 (dwell retroactive credit):**
-- grace 기간 후 새 tid가 등록될 때 `dwell_cell_ratio`가 0으로 리셋되는 문제
-- `feature_extractor.py`: 새 tid 첫 등장 시 해당 셀의 `cell_dwell_ema > 0.3`이면
-  `first_frame = frame_num - dwell_thr_frames`으로 소급 설정 → 즉시 체류 셀로 인정
-- `cell_dwell_ema`는 ID 무관 셀 기반 → 재연결 후에도 이전 혼잡도 보존됨
-
-### 수정 파일
-`src/gru_module.py` (삭제), `tests/test_gru_module.py` (삭제),  
-`src/traffic_analyzer.py`, `src/detector.py`, `src/config.py`,  
-`src/feature_extractor.py`, `src/historical_predictor.py` (신규),  
-`tests/test_traffic_analyzer.py`
-
----
-
-> 이전 항목(120~122차 / 2026-04-19)은 `work_log_archive.md`로 이관됨.
+> 이전 항목(123차 / 2026-04-22)은 `work_log_archive.md`로 이관됨.

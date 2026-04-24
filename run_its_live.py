@@ -54,8 +54,9 @@ if not CCTV_NAME:
 DIRECT_STREAM_URL: str | None = os.getenv("DIRECT_STREAM_URL") or None
 
 # ── 강제 재학습 옵션 ─────────────────────────────────────────────────────
-# True로 바꾸면 기존 flow_map.npy·gru_a.pt·gru_b.pt를 삭제하고 처음부터 재학습
-# 학습 완료 후 자동으로 False로 돌려놓지 않으므로 재학습 후 다시 False로 변경할 것
+# True로 바꾸면 기존 스냅샷(flow_map_*.npy + ref_frame_*.jpg)을 모두 삭제하고
+# 처음부터 재학습한다. 학습 완료 후 자동으로 False로 돌려놓지 않으므로
+# 재학습 후 다시 False로 변경할 것
 FORCE_RELEARN: bool = False
 
 # flow_map / GRU 저장 폴더 — CCTV 이름별로 분리되어 서로 덮어쓰지 않음
@@ -152,111 +153,39 @@ def list_cctvs():
 
 
 # ======================================================================
-# ── flow_map 자동 매칭 ─────────────────────────────────────────────────
-# ======================================================================
-
-def _try_match_flow_map(cctv_url: str, target_flow_map_path: Path) -> bool:
-    """스트림 첫 프레임과 저장된 ref_frame들을 비교해 가장 유사한 flow_map을 복사한다.
-
-    Returns:
-        True  → 매칭 성공, target_flow_map_path에 flow_map.npy 복사 완료
-        False → 매칭 실패 (새 학습 필요)
-    """
-    try:
-        from flow_map_matcher import FlowMapMatcher
-        import cv2
-        import shutil
-    except ImportError:
-        return False
-
-    # ── 스트림 첫 프레임 읽기 ─────────────────────────────────────────
-    print("[매칭] 스트림 첫 프레임 읽는 중...")
-    cap = cv2.VideoCapture(cctv_url)
-    frame = None
-    for _ in range(30):                                # 최대 30프레임 시도
-        ret, f = cap.read()
-        if ret and f is not None:
-            frame = f
-            break
-    cap.release()
-
-    if frame is None:
-        print("[매칭] 프레임 읽기 실패 → 건너뜀")
-        return False
-
-    # ── 저장된 flow_map 폴더들과 비교 ────────────────────────────────
-    matcher = FlowMapMatcher(
-        flow_maps_root = PROJECT_ROOT / "flow_maps",
-        min_score      = 0.35,                         # 이 점수 미만이면 매칭 실패
-    )
-    best_dir, score = matcher.find_best(
-        current_frame = frame,
-        exclude_dir   = ROAD_DIR,                      # 자기 자신 제외
-    )
-
-    if best_dir is None:
-        return False
-
-    # ── flow_map.npy 복사 (gru_*.pt·pkl은 복사 안 함 — 도로별로 독립) ──
-    src_npy = best_dir / "flow_map.npy"
-    ROAD_DIR.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(str(src_npy), str(target_flow_map_path))
-    print(f"[매칭] flow_map 복사: {best_dir.name} → {ROAD_DIR.name} (score={score:.3f})")
-    return True
-
-
-# ======================================================================
 # ── Detector 설정 구성 ─────────────────────────────────────────────────
 # ======================================================================
 
-def make_config(cctv_url: str) -> DetectorConfig:
+def make_config() -> DetectorConfig:
     """DetectorConfig를 생성한다.
 
-    Args:
-        cctv_url: ITS 스트림 URL.
-
-    Returns:
-        DetectorConfig.
+    스냅샷 자동 매칭은 Detector.run() 내부에서 수행된다.
+    - ROAD_DIR 안의 ref_frame_*.jpg + flow_map_*.npy 쌍만 비교 (다른 도로와 격리)
+    - 유사한 스냅샷이 있으면 자동 로드 → 학습 스킵
+    - 없으면 새로 학습 후 ROAD_DIR에 스냅샷 저장
     """
-    flow_map_path = ROAD_DIR / "flow_map.npy"          # 도로별 flow_map 경로
+    flow_map_path = ROAD_DIR / "flow_map.npy"          # 기준 경로 (스냅샷은 ROAD_DIR에 별도 저장)
 
-    if FORCE_RELEARN:                                  # 강제 재학습: 기존 파일 삭제
-        for _f in [flow_map_path,
-                   ROAD_DIR / "gru_a.pt",
-                   ROAD_DIR / "gru_b.pt",
-                   ROAD_DIR / "feature_log_a.pkl",
-                   ROAD_DIR / "feature_log_b.pkl"]:
+    if FORCE_RELEARN:                                  # 강제 재학습: 스냅샷 전체 삭제
+        for _f in list(ROAD_DIR.glob("flow_map_*.npy")) + list(ROAD_DIR.glob("ref_frame_*.jpg")):
+            _f.unlink()
+            print(f"[재학습] 삭제: {_f.name}")
+        for _f in [flow_map_path,                      # 레거시 단일 파일도 삭제
+                   ROAD_DIR / "ref_frame.jpg"]:
             if _f.exists():
                 _f.unlink()
                 print(f"[재학습] 삭제: {_f.name}")
-        print("[재학습] 기존 데이터 초기화 완료 → 처음부터 학습 시작")
-
-    # ── flow_map 없으면 저장된 다른 폴더와 자동 매칭 시도 ──────────────
-    # cctv_url로 스트림 첫 프레임을 읽어 ref_frame들과 비교 →
-    # 유사한 flow_map 폴더가 있으면 복사해서 즉시 탐지 모드로 시작
-    if not flow_map_path.exists() and not FORCE_RELEARN:
-        _matched = _try_match_flow_map(cctv_url, flow_map_path)
-        if _matched:
-            print(f"[매칭] ✅ 기존 flow_map 재사용 → 학습 생략")
-        else:
-            print(f"[매칭] 매칭 실패 또는 건너뜀 → 새로 학습")
-
-    detect_only = flow_map_path.exists()               # 학습된 맵 있으면 탐지 전용 모드
-
-    if detect_only:
-        print(f"[설정] flow_map 존재 → detect_only=True (탐지 + GRU 누적 학습 모드)")
-    else:
-        print(f"[설정] flow_map 없음 → detect_only=False (flow_map 학습 후 탐지)")
+        print("[재학습] 스냅샷 초기화 완료 → 처음부터 학습 시작")
 
     return DetectorConfig(
         model_path=MODEL_PATH,                         # YOLO 모델
         conf=0.3,                                      # 검출 신뢰도
         grid_size=20,                                  # 20×20 flow_map 그리드
-        detect_only=detect_only,                       # 자동 판단
-        flow_map_path=flow_map_path,                   # 도로별 저장 경로
+        detect_only=False,                             # 스냅샷 자동 매칭으로 학습 스킵 결정
+        flow_map_path=flow_map_path,                   # 도로별 기준 경로 (parent=ROAD_DIR)
         learning_frames=1800,                          # flow_map 학습 프레임 수
         log_dir=ROAD_DIR / "logs",                     # CSV 로그 저장
-        night_enhance=False                             # CLAHE 야간 저조도 보정 
+        night_enhance=False,                           # CLAHE 야간 저조도 보정
     )
 
 
@@ -297,7 +226,7 @@ def main():
     if _init_url is None:
         print("[오류] 초기 URL 발급 실패 — 종료")
         return
-    cfg     = make_config(_init_url)
+    cfg      = make_config()
     detector = Detector(cfg)
 
     # ── URL 재발급 콜백 — 단절 감지 시 즉시 호출 ────────────────────

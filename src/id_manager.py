@@ -17,11 +17,20 @@ class IDManager:
 
     # ==================== 라벨 부여/승계 ====================
     def assign_label(self, track_id, matched_from=None):
-        """역주행 확정 시 표시 라벨 부여 또는 기존 라벨 승계"""
+        """역주행 확정 시 표시 라벨 부여 또는 기존 라벨 승계.
+
+        check_reappear에서 재매칭된 ID는 st.pending_label_from에 대기 상태로 등록됨.
+        judge가 실제 역주행을 확정(wrong_way_ids 추가 후 assign_label 호출)한 뒤에만
+        승계가 적용되므로 정상 차량에게 역주행 라벨이 전파되지 않는다.
+        """
         st = self.st
 
         if track_id in st.display_id_map:
             return  # 이미 라벨 있음
+
+        # check_reappear가 등록해 둔 pending 승계 확인
+        if matched_from is None:
+            matched_from = st.pending_label_from.pop(track_id, None)
 
         # 기존 역주행 차량으로부터 이어받는 경우
         if matched_from and matched_from in st.display_id_map:
@@ -113,10 +122,15 @@ class IDManager:
                 continue
 
             # 위 조건들을 모두 통과 → 과거 역주행 차량(old_id)이 새 ID(track_id)로 다시 잡힌 것으로 판단
-            # wrong_way_count를 threshold-1로 설정: judge.py가 다음 프레임에서 최종 확정
-            # (즉시 wrong_way_ids에 추가하지 않아 연쇄 확정 방지)
-            st.wrong_way_count[track_id] = cfg.wrong_count_threshold - 1
-            self.assign_label(track_id, matched_from=old_id)        # 기존 라벨(W1 등) 승계 예약
+            # wrong_way_count를 threshold//2로 설정: 즉시 확정 방지, 추가 투표 증거 요구
+            # (threshold-1 → 1 프레임만에 확정 → 정상 차량 오탐 문제로 완화)
+            boosted = max(st.wrong_way_count.get(track_id, 0),
+                          cfg.wrong_count_threshold // 2)
+            st.wrong_way_count[track_id] = boosted
+            # 라벨은 즉시 부여하지 않고 pending 등록 → judge 확정 후 assign_label에서 적용
+            # (정상 차량이 위치만 가까워서 재매칭되더라도 역주행 라벨 전파 방지)
+            st.pending_label_from[track_id] = old_id
+            print(f"   🔗 ID:{track_id} 재매칭 대기: ID:{old_id} 승계 예약 (count={boosted}, judge 확정 후 적용)")
             del st.wrong_way_last_pos[old_id]                       # 이전 기록 삭제
             return True
 
@@ -166,3 +180,9 @@ class IDManager:
                if st.frame_num - f > cfg.last_pos_expire]
         for k in old:
             del st.wrong_way_last_pos[k]
+
+        # pending_label_from 중 이미 사라진 ID(궤적 없음) 정리
+        stale_pending = [k for k in list(st.pending_label_from.keys())
+                         if k not in st.trajectories]
+        for k in stale_pending:
+            del st.pending_label_from[k]

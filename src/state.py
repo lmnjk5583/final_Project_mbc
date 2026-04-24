@@ -32,6 +32,7 @@ class DetectorState:
         self.wrong_way_last_pos = {}   # 역주행 차량 마지막 위치 {track_id: (cx, cy, frame_num)}
         self.display_id_map = {}       # 표시용 라벨 매핑 {현재 ID: 'W1' 같은 라벨}
         self.next_wrong_way_label = 1  # 새 역주행 차량에 부여할 다음 라벨 번호 (W1, W2, ...)
+        self.pending_label_from = {}   # {track_id: old_id} 라벨 승계 대기 (judge 확정 후 적용)
 
         # ==================== 탐지 소요시간 통계 ====================
         self.first_seen_frame = {}     # {track_id: 처음 등장한 프레임 번호}
@@ -74,6 +75,7 @@ class DetectorState:
         self.wrong_way_count.clear()        # 역주행 카운트 초기화
         self.wrong_way_last_pos.clear()     # 역주행 마지막 위치 초기화
         self.display_id_map.clear()         # 표시 라벨 매핑 초기화
+        self.pending_label_from.clear()     # 라벨 승계 대기 초기화
         self.trajectories.clear()           # 궤적 정보 초기화
         self.last_cos_values.clear()        # 내적값 히스토리 초기화
         self._stale_counter.clear()         # 스테일 카운터 초기화

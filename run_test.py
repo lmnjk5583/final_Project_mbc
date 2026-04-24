@@ -29,7 +29,7 @@ RESULT_DIR    = Path(r"N:\개인\대원&수빈\최종 프로젝트\임시\result
 # ── DetectorConfig 구성 ───────────────────────────────────────────
 cfg = DetectorConfig(
     model_path=MODEL_PATH,                              # YOLO 모델 경로
-    conf=0.4,                                           # 검출 신뢰도 임계값
+    conf=0.3,                                           # 검출 신뢰도 임계값
     grid_size=20,                                       # 20×20 Flow Map 그리드
     target_classes=None,                                # 모든 클래스 탐지
     detect_only=True,                                  # 학습 후 탐지 모드
