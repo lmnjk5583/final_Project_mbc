@@ -59,6 +59,7 @@ class Detector:
         # ── 방향 분류 기준 벡터 + 차량별 방향 매핑 ────────────────────
         self._ref_direction = None                                  # 전역 기준 방향 벡터 (학습 완료 시 계산)
         self._prev_ref_direction = None                             # 재학습 직전 방향 벡터 (방향 반전 감지용)
+        self._prev_dir_label_a = None                               # 재학습 직전 A방향 라벨 (Up/Down 반전 감지용)
         self._track_direction = {}                                  # {tid: 'a' or 'b'} 차량별 방향
         self._wrongway_stable_until = 0                             # 재학습 후 역주행 판정 유예 종료 프레임
         self._dir_label_a = "상행"                                  # A방향 표시 레이블 (기본값)
@@ -664,6 +665,7 @@ class Detector:
                                 print(f"✅ 화면 안정 확인 ({stable_frames}프레임) → 재학습 시작")
                             st.waiting_stable = False
                             self._prev_ref_direction = self._ref_direction  # 반전 감지용 저장
+                            self._prev_dir_label_a   = self._dir_label_a   # 라벨 반전 감지용 저장
                             st.reset_for_relearn()                 # 재학습 모드 진입
                             self.flow.reset()                      # flow_map 초기화
                             self.traffic_analyzer_a.congestion_judge.reset()
@@ -780,19 +782,21 @@ class Detector:
                     # ── 양방향 채널 재구축 (117차) ────────────────────────────
                     if self._ref_direction is not None:
                         self.flow.build_directional_channels(*self._ref_direction)
-                    # ── 방향 반전 감지 → HistoricalPredictor 슬롯 스왑 ────────
-                    # 재학습 전후 기준 방향 벡터 dot product < -0.5 → 카메라 180° 회전
-                    # a/b 예측기의 누적 데이터를 교환해 방향 레이블을 올바르게 유지
-                    if (self._prev_ref_direction is not None
-                            and self._ref_direction is not None
+                    # ── 방향 라벨 반전 감지 → HistoricalPredictor 슬롯 스왑 ────
+                    # 라벨(Up/Down)은 _ref_direction의 vy 부호만으로 결정되므로
+                    # dot product 비교보다 라벨 변화 감지가 더 정확하다.
+                    # 예) 재학습 전 a=Up → 재학습 후 a=Down: dot이 양수여도 라벨이 바뀜
+                    #     → 예측기 데이터를 교환하지 않으면 Up/Down 예측이 뒤집힘
+                    if (self._prev_dir_label_a is not None
+                            and self._dir_label_a != self._prev_dir_label_a
                             and hasattr(self, "_hist_pred_a")
                             and self._hist_pred_a is not None):
-                        _dot = (self._prev_ref_direction[0] * self._ref_direction[0]
-                                + self._prev_ref_direction[1] * self._ref_direction[1])
-                        if _dot < -0.5:
-                            print(f"🔄 방향 반전 감지 (dot={_dot:.3f}) → HistoricalPredictor 슬롯 스왑")
-                            self._hist_pred_a.swap_slots_with(self._hist_pred_b)
+                        print(f"🔄 방향 라벨 반전 감지 "
+                              f"(a: {self._prev_dir_label_a} → {self._dir_label_a}) "
+                              f"→ HistoricalPredictor 슬롯 스왑")
+                        self._hist_pred_a.swap_slots_with(self._hist_pred_b)
                     self._prev_ref_direction = None                 # 사용 후 초기화
+                    self._prev_dir_label_a   = None                 # 사용 후 초기화
                     _sdir = self._snapshot_dir()
                     if _sdir is not None:                           # 저장 경로 있으면
                         if _MATCHER_AVAILABLE:                      # 스냅샷으로 저장 (camera_id 서브폴더)
