@@ -603,43 +603,39 @@ class Visualizer:
     # ==================== 미래 예측 패널 (하단 중앙) ====================
     def draw_prediction_panel(self, frame, pred_a: list | None, pred_b: list | None,
                                label_a: str = "UP"):
-        """화면 하단 중앙에 5분 후 예측 패널을 그린다.
+        """화면 하단 중앙에 1h·2h·3h 후 예측 패널을 그린다.
 
         Args:
             frame:   BGR 이미지 프레임.
-            pred_a:  A방향 predict_direct() 결과 (None이면 학습 중 표시).
-            pred_b:  B방향 predict_direct() 결과.
+            pred_a:  A방향 predict() 결과 (None이면 학습 중 표시).
+            pred_b:  B방향 predict() 결과.
             label_a: A방향 레이블 ("UP" 또는 "DOWN"). B방향은 자동으로 반대 방향.
         """
         fh, fw = frame.shape[:2]
 
         _lv_colors = {
-            "SMOOTH":    (0, 200, 0),
-            "SLOW":      (0, 200, 255),
-            "JAM": (0, 0, 255),
-        }
-        _lv_kr = {
-            "SMOOTH": "SMOOTH", "SLOW": "SLOW", "JAM": "JAM",
+            "SMOOTH": (0, 200, 0),
+            "SLOW":   (0, 200, 255),
+            "JAM":    (0, 0, 255),
         }
 
         # ── 패널 크기·위치 계산 ───────────────────────────────────────
-        # 한 행 = "Dir  LEVEL  xx%"  →  고정 폭으로 겹침 방지
-        # dir(26) + level(52) + conf(30) + 내부여백 → panel_w=150 고정
+        # 열: Dir(28) | 1h(50) | 2h(50) | 3h(50) + 내부 여백
         row_h    = 22                                      # 행 높이
         pad      = 8                                       # 내부 여백
         header_h = 15                                      # 헤더 높이
         n_rows   = 2                                       # 방향 수
-        panel_w  = 150                                     # 고정 너비 — 겹침 방지
+        _dir_w   = 28                                      # 방향 레이블 열 폭
+        _col_w   = 50                                      # 각 시간대 열 폭
+        n_cols   = 3                                       # 1h / 2h / 3h
+        panel_w  = pad + _dir_w + n_cols * _col_w + pad   # 전체 너비
         panel_h  = pad + header_h + n_rows * row_h + pad  # 전체 높이
 
         px = (fw - panel_w) // 2                          # 화면 가로 중앙
         py = fh - panel_h - 8                             # 화면 하단
 
-        # x 기준점 (content 영역 시작)
-        _x0 = px + pad                                    # 왼쪽 여백 끝
-        _dir_w  = 26                                       # 방향 레이블 폭
-        _lv_x   = _x0 + _dir_w + 4                        # 레벨 텍스트 시작
-        _conf_x = px + panel_w - pad - 26                  # 신뢰도 텍스트 시작 (오른쪽 정렬)
+        _x0       = px + pad                              # 왼쪽 여백 끝
+        _col_xs   = [_x0 + _dir_w + i * _col_w for i in range(n_cols)]  # 각 열 시작 x
 
         # ── 반투명 배경 ────────────────────────────────────────────────
         overlay = frame.copy()
@@ -647,44 +643,46 @@ class Visualizer:
         cv2.addWeighted(overlay, 0.78, frame, 0.22, 0, frame)
         cv2.rectangle(frame, (px, py), (px + panel_w, py + panel_h), (100, 100, 100), 1)
 
-        # ── 헤더 ──────────────────────────────────────────────────────
-        cv2.putText(frame, "5min after",
-                    (_x0 + _dir_w, py + pad + 10),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.35, (160, 160, 160), 1, cv2.LINE_AA)
+        # ── 헤더: 시간대 레이블 ────────────────────────────────────────
+        header_y = py + pad + 10
+        for i, lbl in enumerate(("1h", "2h", "3h")):
+            cv2.putText(frame, lbl,
+                        (_col_xs[i] + 12, header_y),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.33, (160, 160, 160), 1, cv2.LINE_AA)
 
         # ── 방향별 예측 행 ─────────────────────────────────────────────
-        dirs = []
         if label_a == "DOWN":
             dirs = [("Down", pred_a), ("Up", pred_b)]
         else:
             dirs = [("Down", pred_b), ("Up", pred_a)]
 
+        _horizons = (60, 120, 180)
+
         for r, (dir_label, pred) in enumerate(dirs):
             ry = py + pad + header_h + r * row_h + 14     # 텍스트 기준선
 
-            # 방향 레이블 (고정 폭 _dir_w)
+            # 방향 레이블
             cv2.putText(frame, dir_label,
                         (_x0, ry),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.33, (160, 160, 160), 1, cv2.LINE_AA)
 
             if pred is None:                              # 학습 데이터 수집 중
                 cv2.putText(frame, "Training...",
-                            (_lv_x, ry),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.30, (120, 120, 120), 1, cv2.LINE_AA)
+                            (_col_xs[0], ry),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.28, (120, 120, 120), 1, cv2.LINE_AA)
                 continue
 
-            # 5분 후 예측 결과 표시
+            # 각 시간대 열에 레벨 표시
             pred_by_min = {p["horizon_min"]: p for p in pred}
-            p = pred_by_min.get(5)
-            if p is not None:
-                lv    = p["predicted_level"]
-                conf  = p["confidence"]
-                color = _lv_colors.get(lv, (180, 180, 180))
-                # 레벨 텍스트 (왼쪽 고정 위치)
-                cv2.putText(frame, _lv_kr.get(lv, lv),
-                            (_lv_x, ry),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.38, color, 1, cv2.LINE_AA)
-                # 신뢰도 (오른쪽 고정 위치 — 레벨 텍스트와 겹치지 않음)
-                cv2.putText(frame, f"{int(conf*100)}%",
-                            (_conf_x, ry),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.30, (130, 130, 130), 1, cv2.LINE_AA)
+            for i, hm in enumerate(_horizons):
+                p = pred_by_min.get(hm)
+                if p is None:
+                    cv2.putText(frame, "-",
+                                (_col_xs[i] + 18, ry),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.30, (80, 80, 80), 1, cv2.LINE_AA)
+                else:
+                    lv    = p["predicted_level"]
+                    color = _lv_colors.get(lv, (180, 180, 180))
+                    cv2.putText(frame, lv,
+                                (_col_xs[i] + 2, ry),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.32, color, 1, cv2.LINE_AA)

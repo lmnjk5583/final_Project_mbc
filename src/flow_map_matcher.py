@@ -50,10 +50,7 @@ def _score_orb(img_a: np.ndarray, img_b: np.ndarray) -> float:
 
 
 def _score_hist(img_a: np.ndarray, img_b: np.ndarray) -> float:
-    """히스토그램 상관 점수 (0~1, 높을수록 유사).
-
-    ORB 실패 시 fallback.
-    """
+    """전역 히스토그램 상관 점수 (0~1)."""
     hist_a = cv2.calcHist([img_a], [0], None, [64], [0, 256])
     hist_b = cv2.calcHist([img_b], [0], None, [64], [0, 256])
     cv2.normalize(hist_a, hist_a)
@@ -62,22 +59,90 @@ def _score_hist(img_a: np.ndarray, img_b: np.ndarray) -> float:
     return float(np.clip((score + 1.0) / 2.0, 0.0, 1.0))        # 0~1 정규화
 
 
+def _score_edge_structure(img_a: np.ndarray, img_b: np.ndarray,
+                           grid: int = 4) -> float:
+    """엣지 밀도 공간 분포 비교 (0~1) — 조명에 독립적인 도로 구조 유사도.
+
+    Canny 엣지 맵을 grid×grid 셀로 나눠 각 셀의 엣지 밀도 벡터를 구하고,
+    두 벡터의 피어슨 상관계수를 0~1로 정규화한다.
+    가드레일·차선·교각·건물 윤곽 등 도로 구조는 조명이 바뀌어도 동일 위치에 나타나므로
+    밝기·반사 변화에 강하다.
+    """
+    edges_a = cv2.Canny(img_a, 40, 120)
+    edges_b = cv2.Canny(img_b, 40, 120)
+    h, w = img_a.shape[:2]
+    ch, cw = h // grid, w // grid
+    dens_a, dens_b = [], []
+    for r in range(grid):
+        for c in range(grid):
+            ea = edges_a[r * ch:(r + 1) * ch, c * cw:(c + 1) * cw]
+            eb = edges_b[r * ch:(r + 1) * ch, c * cw:(c + 1) * cw]
+            if ea.size == 0:
+                continue
+            dens_a.append(float(ea.mean()))
+            dens_b.append(float(eb.mean()))
+    if not dens_a:
+        return 0.0
+    da = np.array(dens_a)
+    db = np.array(dens_b)
+    # 두 밀도 벡터가 거의 평탄(엣지 극소)하면 절대 차이로 유사도 판단
+    if da.std() < 1e-6 or db.std() < 1e-6:
+        denom = max(da.mean(), db.mean(), 1.0)
+        return float(np.clip(1.0 - abs(da.mean() - db.mean()) / denom, 0.0, 1.0))
+    corr = float(np.corrcoef(da, db)[0, 1])
+    return float(np.clip((corr + 1.0) / 2.0, 0.0, 1.0))
+
+
+def _score_spatial_hist(img_a: np.ndarray, img_b: np.ndarray,
+                        grid: int = 4) -> float:
+    """공간 분할 히스토그램 점수 (0~1).
+
+    이미지를 grid×grid 셀로 나눠 각 셀의 히스토그램을 비교한다.
+    전역 히스토그램보다 도로 구조(건물·차선·배경)를 더 잘 반영하고,
+    차량 대수 변화에 덜 민감하다.
+    """
+    h, w = img_a.shape[:2]
+    ch, cw = h // grid, w // grid
+    scores = []
+    for r in range(grid):
+        for c in range(grid):
+            cell_a = img_a[r*ch:(r+1)*ch, c*cw:(c+1)*cw]
+            cell_b = img_b[r*ch:(r+1)*ch, c*cw:(c+1)*cw]
+            if cell_a.size == 0 or cell_b.size == 0:
+                continue
+            ha = cv2.calcHist([cell_a], [0], None, [32], [0, 256])
+            hb = cv2.calcHist([cell_b], [0], None, [32], [0, 256])
+            cv2.normalize(ha, ha)
+            cv2.normalize(hb, hb)
+            s = cv2.compareHist(ha, hb, cv2.HISTCMP_CORREL)
+            scores.append(float(np.clip((s + 1.0) / 2.0, 0.0, 1.0)))
+    return float(np.mean(scores)) if scores else 0.0
+
+
 def score_frames(frame_a: np.ndarray, frame_b: np.ndarray) -> float:
     """두 BGR 프레임의 유사도를 0~1로 반환한다.
 
-    ORB(가중치 0.7) + 히스토그램(0.3) 혼합.
+    엣지 구조(0.35) + 공간 히스토그램(0.35) + 전역 히스토그램(0.20) + ORB(0.10) 혼합.
+    - CLAHE 정규화: 비교 전 두 이미지의 명도를 평탄화 → 밝기 변화·햇빛 반사에 강함
+    - 엣지 구조: 가드레일·차선·건물 윤곽 등 조명 불변 특징 비교
+    - 공간 히스토그램: 도로 구조·배경을 셀 단위로 비교 → 차량 변화에 강함
+    - ORB는 보조 역할만
     """
-    gray_a = cv2.cvtColor(
-        cv2.resize(frame_a, _MATCH_SIZE, interpolation=cv2.INTER_AREA),
-        cv2.COLOR_BGR2GRAY
-    )
-    gray_b = cv2.cvtColor(
-        cv2.resize(frame_b, _MATCH_SIZE, interpolation=cv2.INTER_AREA),
-        cv2.COLOR_BGR2GRAY
-    )
-    s_orb  = _score_orb(gray_a, gray_b)
-    s_hist = _score_hist(gray_a, gray_b)
-    return 0.7 * s_orb + 0.3 * s_hist
+    small_a = cv2.resize(frame_a, _MATCH_SIZE, interpolation=cv2.INTER_AREA)
+    small_b = cv2.resize(frame_b, _MATCH_SIZE, interpolation=cv2.INTER_AREA)
+    gray_a  = cv2.cvtColor(small_a, cv2.COLOR_BGR2GRAY)
+    gray_b  = cv2.cvtColor(small_b, cv2.COLOR_BGR2GRAY)
+
+    # ── CLAHE 정규화: 밝기 차이 제거 ────────────────────────────────
+    clahe  = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    norm_a = clahe.apply(gray_a)
+    norm_b = clahe.apply(gray_b)
+
+    s_edge    = _score_edge_structure(norm_a, norm_b, grid=4)
+    s_spatial = _score_spatial_hist(norm_a, norm_b, grid=4)
+    s_hist    = _score_hist(norm_a, norm_b)
+    s_orb     = _score_orb(norm_a, norm_b)
+    return 0.35 * s_edge + 0.35 * s_spatial + 0.20 * s_hist + 0.10 * s_orb
 
 
 class FlowMapMatcher:
@@ -194,7 +259,7 @@ def save_flow_snapshot(frame: np.ndarray, flow_map_obj, save_dir: Path) -> bool:
 
 
 def find_best_snapshot(current_frame: np.ndarray, save_dir: Path,
-                       min_score: float = 0.35) -> tuple:
+                       min_score: float = 0.25) -> tuple:
     """save_dir에서 current_frame과 가장 유사한 스냅샷 쌍을 찾는다.
 
     타임스탬프 파일(ref_frame_*.jpg + flow_map_*.npy)과

@@ -264,8 +264,16 @@ class Detector:
         _snap_dir = self._snapshot_dir()
         if (_snap_dir is not None and not cfg.detect_only
                 and st.is_learning and _MATCHER_AVAILABLE):
-            _ret_peek, _peek_frame = cap.read()
-            if _ret_peek:
+            # 스트림 첫 프레임은 버퍼링/I-frame 미수신으로 품질이 낮을 수 있음
+            # → 최대 10프레임 읽어 마지막으로 성공한 프레임을 매칭에 사용
+            _peek_frame = None
+            for _ in range(10):
+                _ret_peek, _f = cap.read()
+                if _ret_peek and _f is not None:
+                    _peek_frame = _f
+                else:
+                    break
+            if _peek_frame is not None:
                 _cam_label = getattr(cfg, "camera_id", "").strip() or _snap_dir.name
                 print(f"[스냅샷] 이전 학습 스냅샷 검색 중... (범위: {_cam_label})")
                 _best_npy, _snap_score = find_best_snapshot(_peek_frame, _snap_dir)
@@ -281,7 +289,7 @@ class Detector:
                 elif _best_npy is None:
                     print("[스냅샷] 저장된 스냅샷 없음 → 새로 학습 후 저장")
             if not is_stream:
-                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)                 # 파일이면 첫 프레임으로 되감기
+                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)                 # 파일이면 첫 프레임으로 되감기 (스트림은 이미 소비된 프레임 포기)
 
         # ── 방향별 TrafficAnalyzer 초기화 ─────────────────────────────
         self.traffic_analyzer_a = TrafficAnalyzer(                  # A방향 정체 탐지

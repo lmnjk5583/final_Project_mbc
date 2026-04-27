@@ -46,20 +46,24 @@ class HistoricalPredictor:
         smooth_threshold: float = 0.25,
         slow_threshold: float   = 0.60,
         min_conf_samples: int   = 14,
+        min_window_sec: float   = 150.0,
     ):
         self._csv_path      = str(csv_path)
         self._smooth_thr    = smooth_threshold
         self._slow_thr      = slow_threshold
         self._min_conf      = min_conf_samples
+        self._min_window_sec = min_window_sec  # 이 초 미만 버퍼는 flush 스킵 (기본 2.5분)
 
         # ── 슬롯 데이터: slot_id → [count, jam_sum] ──────────────────
         # slot_id = hour * 12 + minute // 5  (0 ~ 287)
         self._slots: dict[int, list] = {}
 
         # ── 현재 5분 창 버퍼 ──────────────────────────────────────────
-        self._buf_slot: int       = -1   # 현재 누적 중인 슬롯 ID (-1 = 미초기화)
-        self._buf_values: list    = []   # 이 슬롯에서 수집된 jam_score 리스트
-        self._dirty: bool         = False
+        self._buf_slot: int          = -1    # 현재 누적 중인 슬롯 ID (-1 = 미초기화)
+        self._buf_values: list       = []    # 이 슬롯에서 수집된 jam_score 리스트
+        self._buf_start_dt: datetime | None = None  # 버퍼 첫 record 시각
+        self._buf_last_dt:  datetime | None = None  # 버퍼 마지막 record 시각
+        self._dirty: bool            = False
 
         self._load()
 
@@ -130,15 +134,31 @@ class HistoricalPredictor:
         if cur_slot != self._buf_slot:
             if self._buf_values and self._buf_slot >= 0:
                 self._flush_buffer()
-            self._buf_slot   = cur_slot
-            self._buf_values = []
+            self._buf_slot    = cur_slot
+            self._buf_values  = []
+            self._buf_start_dt = dt
+            self._buf_last_dt  = None
 
+        self._buf_last_dt = dt
         self._buf_values.append(float(jam_score))
 
     def _flush_buffer(self) -> None:
-        """현재 버퍼의 중앙값을 슬롯에 누적하고 CSV에 저장한다."""
+        """현재 버퍼의 중앙값을 슬롯에 누적하고 CSV에 저장한다.
+
+        버퍼의 실제 시간 커버리지가 min_window_sec 미만이면 저장을 스킵한다.
+        - 즉시 종료: 30초짜리 버퍼가 5분 창과 동등한 count=1로 저장되는 오염 방지
+        - 카메라 전환: 학습/대기 구간 제외 후 2분치 데이터만 쌓인 창 오염 방지
+        """
         if not self._buf_values:
             return
+
+        # ── 최소 시간 커버리지 검사 ────────────────────────────────────
+        if (self._buf_start_dt is not None
+                and self._buf_last_dt is not None
+                and self._min_window_sec > 0):
+            elapsed = (self._buf_last_dt - self._buf_start_dt).total_seconds()
+            if elapsed < self._min_window_sec:
+                return   # 데이터 부족 → 이 창은 무시
 
         # ── 중앙값 계산 ────────────────────────────────────────────────
         sorted_v = sorted(self._buf_values)
@@ -236,48 +256,49 @@ class HistoricalPredictor:
         return float(avg_jam), float(conf)
 
     def predict(self, dt: datetime | None = None) -> list | None:
-        """현재 시각 기준 5분 후 슬롯의 정체 수준을 예측한다.
+        """현재 시각 기준 1시간·2시간·3시간 후 슬롯의 정체 수준을 예측한다.
 
-        해당 슬롯에 데이터가 없으면 양측 이웃 슬롯으로 선형 보간한다.
-        보간 범위(±60분) 내에도 데이터가 없으면 None ("Training..." 표시).
+        각 horizon에 대해 해당 슬롯 데이터가 없으면 양측 이웃 슬롯으로 선형 보간한다.
+        모든 horizon에서 보간 범위(±60분) 내에 데이터가 없으면 None ("Training..." 표시).
 
         Returns
         -------
         list[dict] | None
-            {"horizon_sec": 300, "horizon_min": 5,
-             "predicted_level": str, "confidence": float, "jam_score": float,
-             "interpolated": bool}
+            [{"horizon_sec": int, "horizon_min": int,
+              "predicted_level": str, "confidence": float, "jam_score": float,
+              "interpolated": bool}, ...]  — 3개 원소 (60/120/180분)
         """
         if dt is None:
             dt = datetime.now()
 
-        future_dt  = dt + timedelta(minutes=5)
-        target_sid = self._to_slot_id(future_dt)
+        results = []
+        for horizon_min in (60, 120, 180):
+            future_dt  = dt + timedelta(minutes=horizon_min)
+            target_sid = self._to_slot_id(future_dt)
 
-        slot = self._slots.get(target_sid)
-        if slot is not None and slot[0] > 0:
-            # ── 직접 데이터 ────────────────────────────────────────────
-            avg_jam = slot[1] / slot[0]
-            conf    = min(slot[0] / max(self._min_conf, 1), 1.0)
-            interp  = False
-        else:
-            # ── 보간 ───────────────────────────────────────────────────
-            result = self._interpolate(target_sid)
-            if result is None:
-                return None
-            avg_jam, conf = result
-            interp = True
+            slot = self._slots.get(target_sid)
+            if slot is not None and slot[0] > 0:
+                avg_jam = slot[1] / slot[0]
+                conf    = min(slot[0] / max(self._min_conf, 1), 1.0)
+                interp  = False
+            else:
+                result = self._interpolate(target_sid)
+                if result is None:
+                    continue   # 이 horizon은 데이터 없음 — 건너뜀
+                avg_jam, conf = result
+                interp = True
 
-        level = self._jam_to_level(avg_jam)
+            level = self._jam_to_level(avg_jam)
+            results.append({
+                "horizon_sec":     horizon_min * 60,
+                "horizon_min":     horizon_min,
+                "predicted_level": level,
+                "confidence":      round(conf, 4),
+                "jam_score":       round(avg_jam, 4),
+                "interpolated":    interp,
+            })
 
-        return [{
-            "horizon_sec":     300,
-            "horizon_min":     5,
-            "predicted_level": level,
-            "confidence":      round(conf, 4),
-            "jam_score":       round(avg_jam, 4),
-            "interpolated":    interp,
-        }]
+        return results if results else None
 
     # ==================== 내부 유틸 ====================
 
