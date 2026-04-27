@@ -20,7 +20,7 @@ from .traffic_analyzer import TrafficAnalyzer, CongestionPredictor  # 정체 탐
 from .historical_predictor import HistoricalPredictor               # 시각별 과거 jam 이력 예측
 
 try:
-    from flow_map_matcher import save_flow_snapshot, find_best_snapshot  # flow_map 스냅샷
+    from flow_map_matcher import save_flow_snapshot, find_best_snapshot, load_snapshot_meta  # flow_map 스냅샷
     _MATCHER_AVAILABLE = True
 except ImportError:
     _MATCHER_AVAILABLE = False
@@ -282,8 +282,19 @@ class Detector:
                     self.flow.apply_boundary_erosion()
                     self.flow.apply_spatial_smoothing()
                     self._compute_ref_direction()
+                    self._compute_direction_cell_counts()
                     if self._ref_direction is not None:
                         self.flow.build_directional_channels(*self._ref_direction)
+                    # ── 메타데이터로 방향 반전 감지 (시작 시점) ──────────────
+                    # 스냅샷 저장 당시의 dir_label_a 와 현재 계산된 값을 비교.
+                    # hist_pred 가 이미 초기화된 뒤이므로 CSV가 스왑 대상이 된다.
+                    _meta = load_snapshot_meta(_best_npy)
+                    _saved_label = _meta.get("dir_label_a", "")
+                    if (_saved_label and _saved_label != self._dir_label_a
+                            and self._hist_pred_a is not None):
+                        print(f"🔄 시작 스냅샷 방향 반전 감지 "
+                              f"(저장={_saved_label}, 현재={self._dir_label_a}) → 슬롯 스왑")
+                        self._hist_pred_a.swap_slots_with(self._hist_pred_b)
                     st.is_learning = False
                     print(f"✅ 스냅샷 로드: {_best_npy.name} (유사도={_snap_score:.3f}) → 학습 스킵")
                 elif _best_npy is None:
@@ -670,17 +681,61 @@ class Detector:
                         stable_frames = st.frame_num - st.stable_since_frame
                         if stable_frames >= _stability_required_frames or _force_relearn:
                             if not _force_relearn:
-                                print(f"✅ 화면 안정 확인 ({stable_frames}프레임) → 재학습 시작")
-                            st.waiting_stable = False
-                            self._prev_ref_direction = self._ref_direction  # 반전 감지용 저장
-                            self._prev_dir_label_a   = self._dir_label_a   # 라벨 반전 감지용 저장
-                            st.reset_for_relearn()                 # 재학습 모드 진입
-                            self.flow.reset()                      # flow_map 초기화
-                            self.traffic_analyzer_a.congestion_judge.reset()
-                            self.traffic_analyzer_b.congestion_judge.reset()
-                            self._ref_direction = None
-                            _relearn_smoothed_80 = False
-                            _relearn_smoothed_95 = False
+                                print(f"✅ 화면 안정 확인 ({stable_frames}프레임) → 스냅샷 재매칭 시도")
+                            _prev_label_sw = self._dir_label_a   # 전환 전 라벨 보존
+
+                            # ── 스냅샷 재매칭: 같은 도로 장면이면 재학습 스킵 ──────
+                            _sw_matched = False
+                            if _snap_dir is not None and _MATCHER_AVAILABLE:
+                                _sw_npy, _sw_score = find_best_snapshot(frame, _snap_dir)
+                                if _sw_npy is not None and self.flow.load(_sw_npy):
+                                    self.flow.speed_ref[:] = 0
+                                    self.flow.apply_boundary_erosion()
+                                    self.flow.apply_spatial_smoothing()
+                                    self._compute_ref_direction()
+                                    self._compute_direction_cell_counts()
+                                    if self._ref_direction is not None:
+                                        self.flow.build_directional_channels(
+                                            *self._ref_direction
+                                        )
+                                    # ── 방향 반전 감지: 메타데이터 우선, 없으면 라벨 비교 ──
+                                    _meta_sw   = load_snapshot_meta(_sw_npy)
+                                    _saved_lbl = _meta_sw.get("dir_label_a", "") or self._dir_label_a
+                                    if (_prev_label_sw and _prev_label_sw != _saved_lbl
+                                            and self._hist_pred_a is not None):
+                                        print(f"🔄 전환 스냅샷 방향 반전 감지 "
+                                              f"(이전={_prev_label_sw}, 스냅샷={_saved_lbl}) → 슬롯 스왑")
+                                        self._hist_pred_a.swap_slots_with(self._hist_pred_b)
+                                    self.traffic_analyzer_a.congestion_judge.reset()
+                                    self.traffic_analyzer_b.congestion_judge.reset()
+                                    self._track_direction.clear()
+                                    st.waiting_stable = False
+                                    self._prev_ref_direction = None
+                                    self._prev_dir_label_a   = None
+                                    st.cooldown_until = st.frame_num + cfg.cooldown_frames
+                                    self._wrongway_stable_until = (
+                                        st.frame_num
+                                        + getattr(cfg, "wrongway_relearn_grace_frames",
+                                                  cfg.cooldown_frames)
+                                    )
+                                    self.switch.set_reference(frame)
+                                    _sw_matched = True
+                                    print(f"✅ 카메라 전환 후 스냅샷 매칭 성공 "
+                                          f"(score={_sw_score:.3f}) → 재학습 스킵")
+
+                            if not _sw_matched:
+                                # 스냅샷 없거나 미매칭 → 전체 재학습
+                                print("[전환] 매칭 실패 또는 스냅샷 없음 → 재학습 시작")
+                                st.waiting_stable = False
+                                self._prev_ref_direction = self._ref_direction
+                                self._prev_dir_label_a   = _prev_label_sw
+                                st.reset_for_relearn()             # 재학습 모드 진입
+                                self.flow.reset()                  # flow_map 초기화
+                                self.traffic_analyzer_a.congestion_judge.reset()
+                                self.traffic_analyzer_b.congestion_judge.reset()
+                                self._ref_direction = None
+                                _relearn_smoothed_80 = False
+                                _relearn_smoothed_95 = False
 
                 # ── (C) 재학습 중: 또 흔들리면 중단 → 대기 복귀 ───────────
                 elif st.relearning:
@@ -762,7 +817,8 @@ class Detector:
                     _sdir = self._snapshot_dir()
                     if _sdir is not None:                           # 저장 경로 있으면
                         if _MATCHER_AVAILABLE:                      # 스냅샷으로 저장 (camera_id 서브폴더)
-                            save_flow_snapshot(frame, self.flow, _sdir)
+                            save_flow_snapshot(frame, self.flow, _sdir,
+                                               dir_label_a=self._dir_label_a)
                         else:                                       # matcher 없으면 단일 파일 fallback
                             self.flow.save(cfg.flow_map_path)
                     st.is_learning = False                          # 학습 모드 종료
@@ -808,7 +864,8 @@ class Detector:
                     _sdir = self._snapshot_dir()
                     if _sdir is not None:                           # 저장 경로 있으면
                         if _MATCHER_AVAILABLE:                      # 스냅샷으로 저장 (camera_id 서브폴더)
-                            save_flow_snapshot(frame, self.flow, _sdir)
+                            save_flow_snapshot(frame, self.flow, _sdir,
+                                               dir_label_a=self._dir_label_a)
                         else:                                       # matcher 없으면 단일 파일 fallback
                             self.flow.save(cfg.flow_map_path)
                     st.relearning = False                           # 재학습 모드 종료

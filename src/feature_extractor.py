@@ -254,10 +254,12 @@ class FeatureExtractor:
             occupied_cells / max(valid_cell_count, 1), 0.0, 1.0
         ))
 
-        # dwell_cell_ratio: 체류 셀 / 유효 셀 전체
-        # 차량이 안 움직이는 셀 비율 — 차선 수 무관하게 도로 면적 기준으로 자동 정규화
+        # dwell_cell_ratio: 체류 셀 / 현재 점유 셀 (플로우맵 크기 무관)
+        # "점유된 셀 중 얼마나 많은 셀이 체류 상태인가" → 차량이 멈춘 비율
+        # 분모를 valid_cell_count(전체 학습 셀)로 나누면 플로우맵이 넓어질수록 희석됨
+        # occupied_cells 기준으로 바꾸면 플로우맵 크기와 무관하게 정체 강도 반영
         dwell_cell_ratio = float(np.clip(
-            len(_dwell_cells_set) / max(valid_cell_count, 1), 0.0, 1.0
+            len(_dwell_cells_set) / max(occupied_cells, 1), 0.0, 1.0
         ))
 
         bbox_coverage = flow_occupancy                     # 하위 호환 별칭 (= flow_occupancy)

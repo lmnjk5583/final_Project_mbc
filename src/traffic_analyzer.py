@@ -179,17 +179,6 @@ class TrafficAnalyzer:
         self.congestion_judge.apply_level(rule_jam, frame_num)
 
     # ── 공개 메서드: 조회 ─────────────────────────────────────────
-    def get_last_feature(self) -> "dict | None":
-        """마지막 update()에서 계산된 feature 벡터를 반환한다.
-
-        detector.py에서 GRU online_step 레이블 판단에 사용.
-        baseline 미설정(학습 중)이면 None.
-
-        Returns:
-            feature dict or None.
-        """
-        return self._last_feature                     # 마지막 feature 벡터 반환
-
     def get_density_map(self) -> np.ndarray:
         """15×15 그리드 셀별 차량 밀도(대/셀)를 반환한다."""
         return self._density_map.copy()               # 복사본 반환 (외부 변경 방지)

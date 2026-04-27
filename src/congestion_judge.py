@@ -68,36 +68,35 @@ def compute_jam_score_fallback(x_t: dict) -> float:
     if known_cnt <= 2 or occupied_cnt <= 2 or flow_occ < 0.06:
         return _clip(0.08 * math.sqrt(flow_occ), 0.0, 0.10)  # 최대 0.10으로 제한
 
-    # ── 2) 규모 게이트: 차량 수·점유율이 충분할수록 체류 신호를 신뢰 ──
-    # count_gate: 2대 이하=0.0, 10대=1.0 — 소수 차량 오탐 억제
-    # occ_gate  : flow_occ 0.06 이하=0.0, 0.26 이상=1.0 — 빈 도로에서 cds 억제
-    # scale_gate: 두 조건 모두 충족해야 체류 신호를 최대 반영
-    count_gate = _clip((known_cnt - 2) / 10.0, 0.0, 1.0)     # 2대 이하는 0, 12대면 1.0 (13→10: 6fps 저감지 환경 보정)
-    _count_ref_val  = float(x_t.get("count_ref", 8.0))        # config.count_ref (기준 차량 수, 기본 8)
-    _valid_cnt      = max(int(x_t.get("valid_cell_count", 400)), 1)  # 방향별 유효 셀 수 (기본 400 → 80으로 실측 시 자동 반영)
-    _occ_gate_lo    = 0.04                                     # 최소 점유율 하한 (4셀 미만 완전 억제)
-    _occ_gate_range = max(0.05, _count_ref_val / _valid_cnt)   # count_ref/valid_cell_count: 기준 밀도 도달 시 포화 (고정 0.30 제거)
-    occ_gate   = _clip((flow_occ - _occ_gate_lo) / _occ_gate_range, 0.0, 1.0)  # 기준 밀도 이상이면 1.0 (valid=80, count_ref=8 → 포화점 occ≈0.14)
-    scale_gate = count_gate * occ_gate                         # 두 게이트의 곱 (AND 조건)
+    # ── 2) 규모 게이트: 차량 수가 충분할수록 체류 신호를 신뢰 ──────
+    # count_gate: 2대 이하=0.0, 12대=1.0 — 소수 차량 오탐 억제
+    # occ_gate  : 절대 차량 수 기준 (count_ref 대비) — 플로우맵 크기 무관
+    #   이전: flow_occ / threshold 기반 → valid_cell_count 증가 시 flow_occ 희석 → 낮아짐
+    #   수정: known_cnt / count_ref 기반 → 플로우맵이 넓어져도 차량 수가 같으면 동일 점수
+    # scale_gate: 두 게이트의 곱 (AND 조건)
+    count_gate     = _clip((known_cnt - 2) / 10.0, 0.0, 1.0)  # 2대=0, 12대=1.0
+    _count_ref_val = float(x_t.get("count_ref", 8.0))          # 기준 차량 수 (기본 8)
+    occ_gate       = _clip((known_cnt - 2) / max(_count_ref_val, 1), 0.0, 1.0)
+    scale_gate     = count_gate * occ_gate                     # 두 게이트의 곱
 
     # ── 3) 핵심 jam 계산 ─────────────────────────────────────────────
     # [설계 원칙]
-    # cds: "셀이 얼마나 자주 점유됐는가" — 4차선 고속도로에서 차량이 빠르게 지나가도
-    #      셀은 계속 점유되어 cds=0.4~0.6 누적. "교통 밀도" 지표이지 "정체" 지표가 아님.
-    # dwell: "15프레임(≈0.5초) 이상 같은 셀에 머문 차량이 있는 셀 비율"
-    #        → 시속 20km/h 이하에서 트리거. 진짜 정체 = 차량이 셀을 못 빠져나가는 것.
-    #        dwell=0이면 모든 차량이 정상 속도로 통과 중 → 정체 기여 0.
-    # persist: Jaccard 지속성 보조 — 점유 패턴이 30프레임 전과 유사할수록 상승
-    # cds  × 0.55: 1.10→0.55 — 교통량 배경 신호로만 사용 (단독으로 JAM 유발 불가)
-    # dwell× 1.00: 0.10×√dwell→1.00×dwell — 진짜 정체 신호로 승격 (주 신호)
-    # persist× 0.20: 0.25→0.20 — 보조 신호 소폭 감소
+    # cds   × 0.55: 교통 밀도 배경 신호 — 빠른 통과 차량도 셀을 점유하므로 단독 JAM 유발 불가
+    # dwell × 0.50: 점유 셀 중 체류 비율 (occupied_cells 기준)
+    #   이전 분모: valid_cell_count(~80) → dwell ≈ 0.03~0.10
+    #   현재 분모: occupied_cells(~10)  → dwell ≈ 0~1 (의미 전환: 점유 셀의 체류 비율)
+    #   분모가 줄어 값이 최대 10배 커졌으므로 가중치를 1.00→0.50으로 절반 하향
+    #   극심한 정체(dwell≈0.9): 기여 0.45 / 서행(dwell≈0.3): 기여 0.15 — 구분 충분
+    # persist × 0.20: Jaccard 지속성 보조
     core = (
-        0.55 * cds                   # 교통 밀도 배경 신호 (1.10→0.55: 단독 JAM 유발 방지)
-        + 0.20 * persist             # 점유 지속성 보조 (0.25→0.20)
-        + 1.00 * dwell               # 15f+ 체류 셀 비율 (0.10×√dwell→1.00×dwell: 진짜 정체 주 신호)
+        0.55 * cds                   # 교통 밀도 배경 신호
+        + 0.20 * persist             # 점유 지속성 보조
+        + 0.50 * dwell               # 체류 비율 (1.00→0.50: occupied_cells 분모 변경에 따른 보정)
     )
 
-    jam = core * scale_gate + 0.12 * math.sqrt(flow_occ)  # 규모 게이트 적용 + 기저 신호
+    # 기저 신호: 절대 차량 수 기준 (플로우맵 크기 무관)
+    _base = 0.05 * math.sqrt(float(known_cnt) / max(_count_ref_val, 1))
+    jam = core * scale_gate + _base                        # 규모 게이트 적용 + 기저 신호
 
     return _clip(jam, 0.0, 1.0)
 

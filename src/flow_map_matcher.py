@@ -4,6 +4,7 @@
 # 의존성: cv2, numpy (표준 환경)
 
 import cv2
+import json
 import numpy as np
 from pathlib import Path
 from datetime import datetime
@@ -12,13 +13,6 @@ from datetime import datetime
 # ── 매칭에 사용할 축소 해상도 (속도·정확도 균형) ─────────────────────────
 _MATCH_SIZE = (128, 128)   # 두 프레임 모두 이 크기로 리사이즈 후 비교
 
-
-def _load_gray(path: Path) -> np.ndarray | None:
-    """이미지를 그레이스케일로 로드한다."""
-    img = cv2.imdecode(np.fromfile(str(path), dtype=np.uint8), cv2.IMREAD_GRAYSCALE)
-    if img is None:
-        return None
-    return cv2.resize(img, _MATCH_SIZE, interpolation=cv2.INTER_AREA)
 
 
 def _score_orb(img_a: np.ndarray, img_b: np.ndarray) -> float:
@@ -145,92 +139,15 @@ def score_frames(frame_a: np.ndarray, frame_b: np.ndarray) -> float:
     return 0.35 * s_edge + 0.35 * s_spatial + 0.20 * s_hist + 0.10 * s_orb
 
 
-class FlowMapMatcher:
-    """저장된 flow_map 폴더들 중 현재 화면과 가장 유사한 것을 선택한다.
 
-    Parameters
-    ----------
-    flow_maps_root : Path
-        flow_maps/ 루트 폴더.
-    min_score : float
-        이 점수 미만이면 매칭 실패로 판단 (새로 학습).
-        기본 0.35 — 도로가 같으면 조명이 달라도 보통 0.4+ 나옴.
-    """
-
-    def __init__(self, flow_maps_root: Path, min_score: float = 0.35):
-        self.root      = flow_maps_root
-        self.min_score = min_score
-
-    def _candidates(self) -> list[tuple[Path, Path]]:
-        """(road_dir, ref_frame_path) 목록 반환 — ref_frame.jpg 있는 폴더만."""
-        result = []
-        if not self.root.exists():
-            return result
-        for d in sorted(self.root.iterdir()):
-            if not d.is_dir():
-                continue
-            flow_npy = d / "flow_map.npy"
-            ref_jpg  = d / "ref_frame.jpg"
-            if flow_npy.exists() and ref_jpg.exists():
-                result.append((d, ref_jpg))
-        return result
-
-    def find_best(self, current_frame: np.ndarray,
-                  exclude_dir: Path | None = None
-                  ) -> tuple[Path | None, float]:
-        """current_frame과 가장 유사한 flow_map 폴더를 찾는다.
-
-        Parameters
-        ----------
-        current_frame : np.ndarray
-            현재 카메라 BGR 프레임.
-        exclude_dir : Path | None
-            현재 CCTV 자신의 폴더 (자기 자신과 비교 제외).
-
-        Returns
-        -------
-        (best_dir, score)
-            best_dir: 매칭된 폴더 (None이면 min_score 미달 → 새 학습 필요)
-            score   : 유사도 0~1
-        """
-        candidates = self._candidates()
-        if not candidates:
-            return None, 0.0
-
-        best_dir   = None
-        best_score = 0.0
-
-        for road_dir, ref_path in candidates:
-            if exclude_dir is not None and road_dir == exclude_dir:
-                continue  # 자기 자신 제외
-
-            ref_img = cv2.imdecode(
-                np.fromfile(str(ref_path), dtype=np.uint8), cv2.IMREAD_COLOR
-            )
-            if ref_img is None:
-                continue
-
-            s = score_frames(current_frame, ref_img)
-            print(f"  [매칭] {road_dir.name}: {s:.3f}")
-
-            if s > best_score:
-                best_score = s
-                best_dir   = road_dir
-
-        if best_score < self.min_score:
-            print(f"  [매칭] 최고 점수 {best_score:.3f} < 기준 {self.min_score} → 새 학습 필요")
-            return None, best_score
-
-        print(f"  [매칭] ✅ 선택: {best_dir.name} (score={best_score:.3f})")
-        return best_dir, best_score
-
-
-def save_flow_snapshot(frame: np.ndarray, flow_map_obj, save_dir: Path) -> bool:
-    """학습 완료 시점의 프레임과 flow_map을 타임스탬프 이름으로 저장한다.
+def save_flow_snapshot(frame: np.ndarray, flow_map_obj, save_dir: Path,
+                       dir_label_a: str = "") -> bool:
+    """학습 완료 시점의 프레임·flow_map·방향 메타데이터를 타임스탬프 이름으로 저장한다.
 
     파일명 형식:
         flow_map_YYYYMMDD_HHMMSS.npy
         ref_frame_YYYYMMDD_HHMMSS.jpg
+        meta_YYYYMMDD_HHMMSS.json   ← dir_label_a 저장 (방향 반전 감지용)
 
     Parameters
     ----------
@@ -240,6 +157,8 @@ def save_flow_snapshot(frame: np.ndarray, flow_map_obj, save_dir: Path) -> bool:
         저장할 FlowMap 객체 (save(path) 메서드 사용).
     save_dir : Path
         저장 대상 폴더.
+    dir_label_a : str
+        A방향 레이블 ("UP" 또는 "DOWN"). 빈 문자열이면 메타데이터에 저장 안 함.
 
     Returns
     -------
@@ -247,15 +166,43 @@ def save_flow_snapshot(frame: np.ndarray, flow_map_obj, save_dir: Path) -> bool:
     """
     save_dir.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    npy_path = save_dir / f"flow_map_{ts}.npy"
-    jpg_path = save_dir / f"ref_frame_{ts}.jpg"
+    npy_path  = save_dir / f"flow_map_{ts}.npy"
+    jpg_path  = save_dir / f"ref_frame_{ts}.jpg"
+    meta_path = save_dir / f"meta_{ts}.json"
     flow_map_obj.save(npy_path)
     ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 90])
     if not ok:
         return False
     jpg_path.write_bytes(buf.tobytes())
-    print(f"[snapshot] 저장 완료: {npy_path.name} + {jpg_path.name}")
+    if dir_label_a:
+        meta_path.write_text(
+            json.dumps({"dir_label_a": dir_label_a}), encoding="utf-8"
+        )
+    print(f"[snapshot] 저장 완료: {npy_path.name} + {jpg_path.name}"
+          f" (dir_label_a={dir_label_a or '없음'})")
     return True
+
+
+def load_snapshot_meta(npy_path: Path) -> dict:
+    """npy_path에 대응하는 메타데이터를 반환한다.
+
+    예) flow_map_20240101_120000.npy → meta_20240101_120000.json
+
+    Returns
+    -------
+    dict : {"dir_label_a": "UP" | "DOWN"} 또는 {} (메타파일 없음).
+    """
+    stem = npy_path.stem  # "flow_map_YYYYMMDD_HHMMSS"
+    if not stem.startswith("flow_map_"):
+        return {}
+    ts_part   = stem[len("flow_map_"):]
+    meta_path = npy_path.parent / f"meta_{ts_part}.json"
+    if not meta_path.exists():
+        return {}
+    try:
+        return json.loads(meta_path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
 
 
 def find_best_snapshot(current_frame: np.ndarray, save_dir: Path,
@@ -324,27 +271,3 @@ def find_best_snapshot(current_frame: np.ndarray, save_dir: Path,
     return best_npy, best_score
 
 
-def save_ref_frame(frame: np.ndarray, road_dir: Path) -> bool:
-    """학습 완료 시점의 프레임을 ref_frame.jpg로 저장한다.
-
-    detector.py의 학습 완료 직후 호출한다.
-
-    Parameters
-    ----------
-    frame : np.ndarray
-        저장할 BGR 프레임.
-    road_dir : Path
-        저장 대상 폴더 (flow_map.npy와 같은 위치).
-
-    Returns
-    -------
-    bool : 저장 성공 여부.
-    """
-    road_dir.mkdir(parents=True, exist_ok=True)
-    out_path = road_dir / "ref_frame.jpg"
-    ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 90])
-    if not ok:
-        return False
-    out_path.write_bytes(buf.tobytes())
-    print(f"[ref_frame] 저장 완료: {out_path}")
-    return True
