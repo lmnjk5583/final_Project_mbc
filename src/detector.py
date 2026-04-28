@@ -136,11 +136,14 @@ class Detector:
         # vy 부호만으로 판별 — 카메라 설치 방향 무관하게 항상 동일하게 적용
         ref_vy = self._ref_direction[1]                           # A방향 y성분
         if ref_vy < 0:                                            # A가 이미지 위쪽으로 이동 → UP
-            self._dir_label_a = "UP"                              # A = UP (화면 위 방향)
-            self._dir_label_b = "DOWN"                            # B = DOWN (화면 아래 방향)
+            _auto_label_a = "UP"
         else:                                                     # A가 이미지 아래쪽으로 이동 → DOWN
-            self._dir_label_a = "DOWN"                            # A = DOWN (화면 아래 방향)
-            self._dir_label_b = "UP"                              # B = UP (화면 위 방향)
+            _auto_label_a = "DOWN"
+
+        _computed_label_a = _auto_label_a
+
+        self._dir_label_a = _computed_label_a
+        self._dir_label_b = "DOWN" if _computed_label_a == "UP" else "UP"
 
         print(f"🧭 기준 방향: ({self._ref_direction[0]:.3f}, {self._ref_direction[1]:.3f})"
               f" [셀({best_r},{best_c}), 샘플={best_count}]"
@@ -211,6 +214,29 @@ class Detector:
         cam_id = getattr(self.cfg, "camera_id", "").strip()
         return base / cam_id if cam_id else base
 
+    # ==================== 차량 격자 마스크 ====================
+    @staticmethod
+    def _make_vehicle_grid(tracks: list, frame_w: int, frame_h: int,
+                           grid_size: int) -> "np.ndarray":
+        """현재 탐지된 차량 bbox 중심점을 flow_map 격자에 투영한 bool 마스크.
+
+        같은 카메라라면 매번 비슷한 격자 셀에 차량이 나타난다.
+        카메라가 전환되면 차량이 다른 격자 셀에 위치 → coverage IoU가 낮아진다.
+        """
+        import numpy as _np
+        mask = _np.zeros((grid_size, grid_size), dtype=bool)
+        if not tracks or frame_w <= 0 or frame_h <= 0:
+            return mask
+        cw = frame_w / grid_size
+        ch = frame_h / grid_size
+        for t in tracks:
+            cx = (t["x1"] + t["x2"]) / 2.0
+            cy = (t["y1"] + t["y2"]) / 2.0
+            r = int(min(cy / ch, grid_size - 1))
+            c = int(min(cx / cw, grid_size - 1))
+            mask[max(0, r), max(0, c)] = True
+        return mask
+
     # ==================== 기본 유틸 ====================
     def _get_next_filename(self, base="results", ext=".mp4"):
         """결과 파일명이 겹치지 않도록 뒤에 번호를 붙여서 새 파일명 생성"""
@@ -261,22 +287,30 @@ class Detector:
         # ── 스냅샷 자동 매칭: 이전 학습 결과가 있으면 로드하고 학습 스킵 ──
         # detect_only=False 여도 타임스탬프 스냅샷이 존재하면 자동 로드해 학습을 건너뜀.
         # 첫 프레임을 peek해서 ref_frame 유사도를 비교 → 가장 유사한 npy 로드.
+        # ★ 즉시 학습 스킵 하지 않음 — 루프 진입 후 45프레임 차량 흐름 검증 후 확정.
         _snap_dir = self._snapshot_dir()
+        _startup_snap_npy = None                                     # 시작 스냅샷 후보 (검증 대기)
         if (_snap_dir is not None and not cfg.detect_only
                 and st.is_learning and _MATCHER_AVAILABLE):
             # 스트림 첫 프레임은 버퍼링/I-frame 미수신으로 품질이 낮을 수 있음
             # → 최대 10프레임 읽어 마지막으로 성공한 프레임을 매칭에 사용
+            # prev_frame도 함께 보관 → optical flow 기반 방향 추정 보조
             _peek_frame = None
+            _peek_prev_frame = None
             for _ in range(10):
                 _ret_peek, _f = cap.read()
                 if _ret_peek and _f is not None:
+                    _peek_prev_frame = _peek_frame
                     _peek_frame = _f
                 else:
                     break
             if _peek_frame is not None:
                 _cam_label = getattr(cfg, "camera_id", "").strip() or _snap_dir.name
                 print(f"[스냅샷] 이전 학습 스냅샷 검색 중... (범위: {_cam_label})")
-                _best_npy, _snap_score = find_best_snapshot(_peek_frame, _snap_dir)
+                _best_npy, _snap_score = find_best_snapshot(
+                    _peek_frame, _snap_dir, min_score=0.75,
+                    prev_frame=_peek_prev_frame
+                )
                 if _best_npy is not None and self.flow.load(_best_npy):
                     self.flow.speed_ref[:] = 0
                     self.flow.apply_boundary_erosion()
@@ -285,18 +319,11 @@ class Detector:
                     self._compute_direction_cell_counts()
                     if self._ref_direction is not None:
                         self.flow.build_directional_channels(*self._ref_direction)
-                    # ── 메타데이터로 방향 반전 감지 (시작 시점) ──────────────
-                    # 스냅샷 저장 당시의 dir_label_a 와 현재 계산된 값을 비교.
-                    # hist_pred 가 이미 초기화된 뒤이므로 CSV가 스왑 대상이 된다.
-                    _meta = load_snapshot_meta(_best_npy)
-                    _saved_label = _meta.get("dir_label_a", "")
-                    if (_saved_label and _saved_label != self._dir_label_a
-                            and self._hist_pred_a is not None):
-                        print(f"🔄 시작 스냅샷 방향 반전 감지 "
-                              f"(저장={_saved_label}, 현재={self._dir_label_a}) → 슬롯 스왑")
-                        self._hist_pred_a.swap_slots_with(self._hist_pred_b)
-                    st.is_learning = False
-                    print(f"✅ 스냅샷 로드: {_best_npy.name} (유사도={_snap_score:.3f}) → 학습 스킵")
+                    # is_learning=False 는 루프 진입 후 차량 흐름 검증 통과 시 확정
+                    # (메타 방향 반전 체크도 hist_pred 초기화 후인 루프에서 수행)
+                    _startup_snap_npy = _best_npy
+                    print(f"[스냅샷] 후보 로드: {_best_npy.name} "
+                          f"(score={_snap_score:.3f}) → 차량 흐름 검증 대기")
                 elif _best_npy is None:
                     print("[스냅샷] 저장된 스냅샷 없음 → 새로 학습 후 저장")
             if not is_stream:
@@ -415,6 +442,35 @@ class Detector:
         _prev_cap_ts_ms     = None                                   # 직전 프레임의 스트림 타임스탬프 (ms)
         _is_time_gap        = False                                  # 이번 프레임이 타임스탬프 갭 직후인지
 
+        # ── 카메라 전환 / 시작 스냅샷 차량 흐름 검증 ──────────────────────────
+        # 스냅샷 로드 후 45프레임 동안 차량 속도 벡터와 flow_map 방향의
+        # |cos| 평균으로 "같은 도로" 여부 확정.
+        _sw_verifying         = False    # 검증 진행 중
+        _sw_verify_npy        = None     # 검증 중 스냅샷 경로
+        _sw_verify_cos_sum    = 0.0      # 누적 |cos| 합
+        _sw_verify_vehicle_n  = 0        # 누적 유효 차량 수
+        _sw_verify_frame_n    = 0        # 검증 경과 프레임 수
+        _sw_verify_prev_label = None     # 전환 전 dir_label_a (검증 실패 시 복원용)
+        _sw_verify_is_startup = False    # True: 시작 스냅샷 검증 (실패 시 is_learning 복귀)
+        _SW_VERIFY_FRAMES     = 45       # 검증 기간 (약 1.5초 @ 30fps)
+        _SW_VERIFY_COS_THR    = 0.40     # 같은 도로 판정 임계값 (avg |cos|)
+        _SW_MATCH_MIN_SCORE   = 0.70     # 전환 후 시각 매칭 최소 점수
+        _prev_frame_for_hint  = None     # 1프레임 전 버퍼 (optical flow 방향 추정용)
+
+        # 시작 스냅샷이 로드됐으면 즉시 검증 모드로 진입
+        # (hist_pred·traffic_analyzer 초기화 완료 후 이 시점에서 is_learning=False 설정)
+        if _startup_snap_npy is not None:
+            _sw_verifying         = True
+            _sw_verify_npy        = _startup_snap_npy
+            _sw_verify_cos_sum    = 0.0
+            _sw_verify_vehicle_n  = 0
+            _sw_verify_frame_n    = 0
+            _sw_verify_prev_label = self._dir_label_a
+            _sw_verify_is_startup = True
+            st.is_learning        = False   # 탐지 모드로 전환 (검증 통과 시 확정)
+            print(f"🔍 시작 스냅샷 차량 흐름 검증 시작 "
+                  f"({_SW_VERIFY_FRAMES}프레임) → {_startup_snap_npy.name}")
+
         while cap.isOpened():                                       # 비디오 스트림이 열려 있는 동안
             # ── max_seconds 초과 시 루프 종료 (url_refresh_interval 미사용 시 fallback) ──
             if max_seconds is not None and url_refresh_interval is None:
@@ -480,6 +536,8 @@ class Detector:
                     continue
                 break                                               # 파일이면 종료
             _stream_fail_cnt = 0                                    # 성공 시 실패 카운터 초기화
+            _hint_prev = _prev_frame_for_hint                       # 이번 이터레이션용 이전 프레임 보관
+            _prev_frame_for_hint = frame                            # 다음 이터레이션을 위해 현재 프레임 저장
 
             # ── 실제 처리 fps 측정 및 jump 임계값 갱신 ──────────────────
             _now = time.time()
@@ -680,15 +738,26 @@ class Detector:
                         # 안정 지속 중 or 강제 재학습 — 충분히 유지됐으면 재학습 시작
                         stable_frames = st.frame_num - st.stable_since_frame
                         if stable_frames >= _stability_required_frames or _force_relearn:
-                            if not _force_relearn:
-                                print(f"✅ 화면 안정 확인 ({stable_frames}프레임) → 스냅샷 재매칭 시도")
                             _prev_label_sw = self._dir_label_a   # 전환 전 라벨 보존
 
-                            # ── 스냅샷 재매칭: 같은 도로 장면이면 재학습 스킵 ──────
+                            # ── 스냅샷 재매칭 시도 (강제 재학습 제외) ───────────────
+                            # 시각 점수 0.70 이상 후보 → 45프레임 차량 흐름 검증 후 확정.
+                            # 검증 통과(avg|cos|≥0.40) → 재학습 생략.
+                            # 검증 실패 or 후보 없음 → 전체 재학습.
                             _sw_matched = False
-                            if _snap_dir is not None and _MATCHER_AVAILABLE:
-                                _sw_npy, _sw_score = find_best_snapshot(frame, _snap_dir)
-                                if _sw_npy is not None and self.flow.load(_sw_npy):
+                            if (not _force_relearn
+                                    and _snap_dir is not None
+                                    and _MATCHER_AVAILABLE
+                                    and not _sw_verifying):
+                                _sw_vgrid = self._make_vehicle_grid(
+                                    tracks, fw, fh, self.cfg.grid_size
+                                ) if tracks else None
+                                _sw_cand, _sw_score = find_best_snapshot(
+                                    frame, _snap_dir, min_score=_SW_MATCH_MIN_SCORE,
+                                    prev_frame=_hint_prev,
+                                    vehicle_grid=_sw_vgrid
+                                )
+                                if _sw_cand is not None and self.flow.load(_sw_cand):
                                     self.flow.speed_ref[:] = 0
                                     self.flow.apply_boundary_erosion()
                                     self.flow.apply_spatial_smoothing()
@@ -698,39 +767,28 @@ class Detector:
                                         self.flow.build_directional_channels(
                                             *self._ref_direction
                                         )
-                                    # ── 방향 반전 감지: 메타데이터 우선, 없으면 라벨 비교 ──
-                                    _meta_sw   = load_snapshot_meta(_sw_npy)
-                                    _saved_lbl = _meta_sw.get("dir_label_a", "") or self._dir_label_a
-                                    if (_prev_label_sw and _prev_label_sw != _saved_lbl
-                                            and self._hist_pred_a is not None):
-                                        print(f"🔄 전환 스냅샷 방향 반전 감지 "
-                                              f"(이전={_prev_label_sw}, 스냅샷={_saved_lbl}) → 슬롯 스왑")
-                                        self._hist_pred_a.swap_slots_with(self._hist_pred_b)
-                                    self.traffic_analyzer_a.congestion_judge.reset()
-                                    self.traffic_analyzer_b.congestion_judge.reset()
-                                    self._track_direction.clear()
-                                    st.waiting_stable = False
-                                    self._prev_ref_direction = None
-                                    self._prev_dir_label_a   = None
-                                    st.cooldown_until = st.frame_num + cfg.cooldown_frames
-                                    self._wrongway_stable_until = (
-                                        st.frame_num
-                                        + getattr(cfg, "wrongway_relearn_grace_frames",
-                                                  cfg.cooldown_frames)
-                                    )
-                                    self.switch.set_reference(frame)
-                                    _sw_matched = True
-                                    print(f"✅ 카메라 전환 후 스냅샷 매칭 성공 "
-                                          f"(score={_sw_score:.3f}) → 재학습 스킵")
+                                    # 검증 상태 초기화
+                                    _sw_verifying         = True
+                                    _sw_verify_npy        = _sw_cand
+                                    _sw_verify_cos_sum    = 0.0
+                                    _sw_verify_vehicle_n  = 0
+                                    _sw_verify_frame_n    = 0
+                                    _sw_verify_prev_label = _prev_label_sw
+                                    st.waiting_stable     = False
+                                    _sw_matched           = True
+                                    print(f"✅ 화면 안정 확인 ({stable_frames}프레임) "
+                                          f"→ 스냅샷 후보 {_sw_cand.name} "
+                                          f"(score={_sw_score:.3f}) → 차량 흐름 검증 시작")
 
                             if not _sw_matched:
-                                # 스냅샷 없거나 미매칭 → 전체 재학습
-                                print("[전환] 매칭 실패 또는 스냅샷 없음 → 재학습 시작")
-                                st.waiting_stable = False
+                                # 후보 없음 or 강제 재학습 → 전체 재학습
+                                if not _force_relearn:
+                                    print(f"✅ 화면 안정 확인 ({stable_frames}프레임) → 재학습 시작")
+                                st.waiting_stable        = False
                                 self._prev_ref_direction = self._ref_direction
                                 self._prev_dir_label_a   = _prev_label_sw
-                                st.reset_for_relearn()             # 재학습 모드 진입
-                                self.flow.reset()                  # flow_map 초기화
+                                st.reset_for_relearn()         # 재학습 모드 진입
+                                self.flow.reset()              # flow_map 초기화
                                 self.traffic_analyzer_a.congestion_judge.reset()
                                 self.traffic_analyzer_b.congestion_judge.reset()
                                 self._ref_direction = None
@@ -942,6 +1000,68 @@ class Detector:
                         _prev_fleet_cos = None                      # 리셋: 다음 이벤트가 fresh start
                     else:
                         _prev_fleet_cos = _fleet_cos_avg            # 정상 프레임만 갱신
+
+            # ── 카메라 전환 스냅샷 검증: 차량 흐름 vs flow_map |cos| 누적 ────
+            # _sw_verifying 구간 동안 각 차량의 속도 벡터와 flow_map 방향의
+            # |cos| 를 누적. _SW_VERIFY_FRAMES 도달 시 평균으로 같은 도로 판정.
+            if _sw_verifying:
+                _fw_vw = cfg.velocity_window                        # 속도 계산 윈도우
+                for _vt in tracks:
+                    _vtraj = st.trajectories[_vt["id"]]
+                    if not _vtraj or len(_vtraj) < _fw_vw:
+                        continue                                    # 궤적 부족 → 건너뜀
+                    _vsi  = len(_vtraj) - _fw_vw
+                    _vpfx = [_vtraj[_vsi+i+1][0] - _vtraj[_vsi+i][0] for i in range(_fw_vw-1)]
+                    _vpfy = [_vtraj[_vsi+i+1][1] - _vtraj[_vsi+i][1] for i in range(_fw_vw-1)]
+                    _vvdx = float(np.median(_vpfx)) * (_fw_vw - 1)
+                    _vvdy = float(np.median(_vpfy)) * (_fw_vw - 1)
+                    _vmag = np.sqrt(_vvdx**2 + _vvdy**2)
+                    _vbh  = max(_vt["y2"] - _vt["y1"], 1)
+                    if _vmag / _vbh > cfg.norm_learn_threshold and _vmag > 1.0:
+                        _vndx, _vndy = _vvdx / _vmag, _vvdy / _vmag
+                        _vfv = self.flow.get_interpolated(_vt["cx"], _vt["cy"])
+                        if _vfv is not None:
+                            _sw_verify_cos_sum   += abs(_vndx * _vfv[0] + _vndy * _vfv[1])
+                            _sw_verify_vehicle_n += 1
+                _sw_verify_frame_n += 1
+
+                if _sw_verify_frame_n >= _SW_VERIFY_FRAMES:
+                    _sw_avg_cos = (_sw_verify_cos_sum / max(_sw_verify_vehicle_n, 1))
+                    if _sw_avg_cos >= _SW_VERIFY_COS_THR:
+                        # ── 검증 통과: 로드된 스냅샷 유지 → 재학습 생략 ──────
+                        print(f"✅ 차량 흐름 검증 통과 "
+                              f"(avg|cos|={_sw_avg_cos:.3f}, "
+                              f"n={_sw_verify_vehicle_n}) → 스냅샷 재사용")
+                        _meta_sw = load_snapshot_meta(_sw_verify_npy)
+                        _saved_sw = _meta_sw.get("dir_label_a", "")
+                        if (_saved_sw and _saved_sw != self._dir_label_a
+                                and self._hist_pred_a is not None):
+                            print(f"🔄 방향 반전 감지 "
+                                  f"(저장={_saved_sw}, 현재={self._dir_label_a}) → 슬롯 스왑")
+                            self._hist_pred_a.swap_slots_with(self._hist_pred_b)
+                        st.is_learning = False
+                    else:
+                        # ── 검증 실패: 다른 도로 ─────────────────────────────
+                        print(f"⚠️ 차량 흐름 검증 실패 "
+                              f"(avg|cos|={_sw_avg_cos:.3f} < {_SW_VERIFY_COS_THR}) → 재학습")
+                        self.flow.reset()
+                        self.traffic_analyzer_a.congestion_judge.reset()
+                        self.traffic_analyzer_b.congestion_judge.reset()
+                        self._ref_direction = None
+                        if _sw_verify_is_startup:
+                            # 시작 스냅샷 실패 → 신규 초기 학습으로 복귀
+                            st.is_learning   = True
+                            _learn_smoothed_80 = False
+                            _learn_smoothed_95 = False
+                        else:
+                            # 카메라 전환 스냅샷 실패 → 재학습 모드
+                            self._prev_ref_direction = self._ref_direction
+                            self._prev_dir_label_a   = _sw_verify_prev_label
+                            st.reset_for_relearn()
+                            _relearn_smoothed_80 = False
+                            _relearn_smoothed_95 = False
+                    _sw_verifying         = False                   # 검증 종료
+                    _sw_verify_is_startup = False
 
             # ── 차량별 속도 딕셔너리 초기화 ──
             speeds = {}                                             # {tid: mag} — traffic_analyzer용
@@ -1381,7 +1501,8 @@ class Detector:
 
                 # ── HistoricalPredictor: 현재 jam_score를 5분 창에 누적 ──
                 # 슬롯 경계(5분) 도달 시 중앙값 계산 후 CSV에 자동 flush
-                if self._hist_pred_a is not None:
+                # 검증 구간(_sw_verifying)에는 기록 금지 — 잘못된 도로 스냅샷 오염 방지
+                if self._hist_pred_a is not None and not _sw_verifying:
                     _now_dt = datetime.now()
                     self._hist_pred_a.record(
                         self.traffic_analyzer_a.get_jam_score(), dt=_now_dt
@@ -1393,22 +1514,24 @@ class Detector:
                 # ── flow_map speed_ref 온라인 학습 (SMOOTH 구간만) ────────
                 # SMOOTH 구간의 nm을 셀별로 EMA 축적 → 위치별 정상속도 기준 확보
                 # 이후 feature_extractor에서 velocity_deficit = 1 - nm/speed_ref 계산에 사용
-                for t in tracks:                                    # 활성 차량 순회
-                    _tid = t["id"]
-                    _mag = speeds.get(_tid)                         # 속도 (없으면 None=신규)
-                    if _mag is None or _mag <= 0:                   # 신규·정지 차량 제외
-                        continue
-                    _bh_ref = max(t["y2"] - t["y1"], cfg.min_bbox_h)  # bbox_h 클램프
-                    _nm_ref = _mag / _bh_ref                        # normalized_mag
-                    _dir_ref = self._track_direction.get(_tid, 'a') # 차량 방향
-                    # 방향별 SMOOTH 레벨일 때만 학습
-                    _lvl = (self.traffic_analyzer_a.get_congestion_level()
-                            if _dir_ref == 'a'
-                            else self.traffic_analyzer_b.get_congestion_level())
-                    if _lvl == "SMOOTH":                            # SMOOTH 구간만 학습
-                        _fx = t.get("fx", t["cx"])                  # footpoint x
-                        _fy = t.get("fy", t["y2"])                  # footpoint y
-                        self.flow.learn_baseline(_fx, _fy, _nm_ref) # 셀별 정상 속도 EMA 갱신
+                # 검증 구간(_sw_verifying)에는 학습 금지 — 잘못된 도로 속도 기준 오염 방지
+                if not _sw_verifying:
+                    for t in tracks:                                    # 활성 차량 순회
+                        _tid = t["id"]
+                        _mag = speeds.get(_tid)                         # 속도 (없으면 None=신규)
+                        if _mag is None or _mag <= 0:                   # 신규·정지 차량 제외
+                            continue
+                        _bh_ref = max(t["y2"] - t["y1"], cfg.min_bbox_h)  # bbox_h 클램프
+                        _nm_ref = _mag / _bh_ref                        # normalized_mag
+                        _dir_ref = self._track_direction.get(_tid, 'a') # 차량 방향
+                        # 방향별 SMOOTH 레벨일 때만 학습
+                        _lvl = (self.traffic_analyzer_a.get_congestion_level()
+                                if _dir_ref == 'a'
+                                else self.traffic_analyzer_b.get_congestion_level())
+                        if _lvl == "SMOOTH":                            # SMOOTH 구간만 학습
+                            _fx = t.get("fx", t["cx"])                  # footpoint x
+                            _fy = t.get("fy", t["y2"])                  # footpoint y
+                            self.flow.learn_baseline(_fx, _fy, _nm_ref) # 셀별 정상 속도 EMA 갱신
 
             # ── 트랙 정리 ──
             if st.frame_num % 30 == 0:                              # 30프레임마다
@@ -1449,6 +1572,16 @@ class Detector:
                 cv2.putText(frame, f"CAMERA SWITCHED - RE-LEARNING: {progress:.0f}%",
                             (fw // 2 - 220, 40),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2, cv2.LINE_AA)
+
+            # 스냅샷 차량 흐름 검증 중이면 화면 상단에 검증 텍스트 표시
+            elif _sw_verifying:
+                _sv_remain = max(0, _SW_VERIFY_FRAMES - _sw_verify_frame_n)
+                _sv_avg = (_sw_verify_cos_sum / max(_sw_verify_vehicle_n, 1))
+                cv2.putText(frame,
+                            f"VERIFYING SNAPSHOT: {_sv_remain}f remain "
+                            f"| avg|cos|={_sv_avg:.2f}",
+                            (fw // 2 - 280, 40),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 220, 255), 2, cv2.LINE_AA)
 
             # ── 방향별 정체 상태 패널 표시 (좌하단) ────────────────────
             if st.is_learning or st.relearning or st.waiting_stable:  # 학습·재학습·대기 중이면
