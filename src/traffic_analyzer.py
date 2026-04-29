@@ -1,7 +1,7 @@
 # 파일 경로: C:\final_pj\src\traffic_analyzer.py
 # 역할: ByteTrack 추적 결과(tracks·speeds)를 받아
 #        정체 레벨(SMOOTH/SLOW/JAM), 밀도맵, KPI를 산출하는 정체 탐지 모듈.
-#        Phase 1: 절대 km/h 대신 baseline 대비 비율(normalized_mag) 기반.
+#        절대 km/h 대신 baseline 대비 비율(normalized_mag) 기반.
 #        cv2·torch에 의존하지 않으며 numpy만 사용한다.
 
 import numpy as np                                    # 수치 계산 전용
@@ -11,7 +11,7 @@ from congestion_judge import CongestionJudge          # jam_score 계산 + 레�
 
 
 # ======================================================================
-# TrafficAnalyzer — 밀도·속도·정체 레벨 판정 (Phase 1 래퍼)
+# TrafficAnalyzer — 밀도·속도·정체 레벨 판정
 # ======================================================================
 
 class TrafficAnalyzer:
@@ -29,7 +29,7 @@ class TrafficAnalyzer:
     fps : float
         영상 FPS.
     flow_map : FlowMap or None
-        FlowMap 객체 — bbox_coverage 셀 수 fallback용.
+        FlowMap 객체 — flow_occupancy 셀 수 fallback용.
     congestion_judge : CongestionJudge or None
         외부에서 생성된 CongestionJudge. None이면 내부 생성.
     """
@@ -95,7 +95,7 @@ class TrafficAnalyzer:
     def set_valid_cell_count(self, n: int):
         """방향별 유효 셀 수를 FeatureExtractor에 전달한다.
 
-        bbox_coverage를 셀 점유율로 계산할 때 방향별 road area 편향 제거용.
+        flow_occupancy·cell_dwell_score 계산 시 방향별 road area 편향 제거용.
         detector.py가 _compute_direction_cell_counts() 후 호출한다.
 
         Args:
@@ -168,8 +168,8 @@ class TrafficAnalyzer:
                 affected += 1                         # 저속 차량 수 증가
         self._last_affected_count = affected          # 결과 저장
 
-        # ── 3) rule_jam 계산 ─────────────────────────────────────────
-        rule_jam = self.congestion_judge.compute_jam(x_t)  # rule 기반 jam_score
+        # ── 3) jam_score 계산 ────────────────────────────────────────
+        rule_jam = self.congestion_judge.compute_jam(x_t)  # jam_score 계산
         self._last_rule_jam = rule_jam                # 로그용 저장
 
         if frame_num % 30 == 0:                       # 30프레임마다 디버그

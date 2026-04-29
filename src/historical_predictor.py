@@ -1,6 +1,6 @@
 # 파일 경로: 최종 프로젝트/src/historical_predictor.py
 # 역할: 시각별(hour × 5분 슬롯) 과거 jam_score를 CSV에 누적하고,
-#        5분 후 정체 수준을 예측한다.
+#        시간별 정체 수준을 예측한다.
 #
 # 슬롯 구조:
 #   하루 = 24h × 12슬롯/h = 288 슬롯 (slot_id = hour*12 + minute//5)

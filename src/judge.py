@@ -1,10 +1,15 @@
 # 파일 경로: C:\final_pj\src\judge.py
-# 역할: 흐름장과 코사인 유사도 기반 역주행 판별
-#        원근 기반 속도 게이트 + 다중 포인트 투표 + 시간적 히스테리시스(카운팅)
-#        ③ 다중 스케일 윈도우: 단기(velocity_window) + 장기(×2) 모두 역방향이어야 의심
-#        ① 전체 궤적 방향 검증: 확정 시 traj[0]→traj[-1] 전체 방향도 역방향이어야 확정
-#        개선 3: smoothed_mask 셀에서 cos_threshold 완화 (보간 셀 오탐 방지)
-#        [수정] 역주행 미확정 문제 해결: 과도한 가드 완화 + 확정 경로 단순화
+# 역할: flow_map 기반 역주행 판별.
+#        매 프레임 차량의 이동 방향과 flow 벡터의 코사인 유사도를 비교해
+#        단기 투표 → 장기 윈도우 검증 → 전체 궤적 검증의 3단계로 역주행을 확정한다.
+#
+# 판정 흐름 요약:
+#   1. 속도 게이트 (nm < 임계값이면 무시 — 서행·정지 차량 제외)
+#   2. 방향 급변 가드 (이전 프레임 대비 방향이 갑자기 뒤집히면 일시 차단)
+#   3. 단기 투표 (궤적 포인트 최대 8개 × flow 비교 → disagree 비율)
+#   4. 장기 윈도우 검증 (velocity_window×2 구간 중앙값 방향이 flow와 역방향인지)
+#   5. 의심 카운트 누적 → wrong_count_threshold 도달 시 normal-path 확정 또는
+#      fast-track (disagree 비율·속도가 기준 초과 시 즉시 확정)
 
 import numpy as np
 
@@ -22,7 +27,17 @@ class WrongWayJudge:
         return self.cfg.base_speed_threshold * scale
 
     def _get_cos_threshold(self, px, py, level="short"):
-        """위치 기반 cos_threshold 반환."""
+        """위치(px, py)와 판정 단계(level)에 따라 역방향 판정 cos 임계값을 반환.
+
+        smoothed 셀(보간으로 채워진 셀)은 실측 샘플이 적어 벡터 방향이 부정확할 수 있으므로
+        임계값을 완화(-0.50/-0.60)해 오탐을 억제한다.
+        실측 데이터가 충분한 일반 셀은 config의 cos_threshold(기본 -0.3 등)를 그대로 사용.
+
+        level 종류:
+          "short"  : 단기 투표 (궤적 포인트별 판정) — smoothed 셀 완화 -0.50
+          "long"   : 장기 윈도우 검증 — smoothed 셀 완화 -0.60 (더 엄격히 완화)
+          "global" : 전체 궤적 검증 — smoothed 여부 무관, config 임계값 고정
+        """
         if level == "global":
             return self.cfg.cos_threshold
 
@@ -155,7 +170,20 @@ class WrongWayJudge:
 
     def check(self, track_id, traj, ndx, ndy, speed, cy, bbox_h: float = 30.0,
               track_dir=None):
-        """한 차량에 대해 flow_map과 방향 비교, 투표 방식으로 역주행 여부 판정."""
+        """한 차량에 대해 역주행 여부를 판정하고 결과를 반환한다.
+
+        Args:
+            track_id : 차량 트랙 ID.
+            traj     : 최근 N프레임 궤적 [(x, y), ...] (오래된 순서).
+            ndx, ndy : 현재 프레임 정규화 이동 방향 벡터 (단위 벡터).
+            speed    : 현재 프레임 픽셀 이동량 (mag).
+            cy       : 차량 bbox 중심 y 좌표 (원근 보정용, 로그 표시용).
+            bbox_h   : bbox 높이 (nm 속도 계산 분모).
+            track_dir: 'a' / 'b' / None — 방향별 채널 조회용.
+
+        Returns:
+            (is_wrong: bool, disagree_ratio: float, debug_info: dict)
+        """
         cfg = self.cfg
         st = self.st
 
@@ -164,6 +192,10 @@ class WrongWayJudge:
             return True, 1.0, {"status": "CONFIRMED", "cos_values": []}
 
         # ── 최소 추적 나이 체크 ──────────────────────────────────────────
+        # 등장 직후 궤적이 짧으면 방향 추정이 불안정하므로 min_wrongway_track_age 프레임간
+        # 역주행 판정을 보류한다.
+        # 보류 중에도 정방향으로 이동 중이면 last_correct_frame을 갱신해
+        # 이후 fast-track의 _ft_lcf_ok 조건에 반영한다.
         _min_age = getattr(cfg, "min_wrongway_track_age", 30)
         _track_age = st.frame_num - st.first_seen_frame.get(track_id, st.frame_num)
 
@@ -195,6 +227,11 @@ class WrongWayJudge:
             return False, 0, {"status": "slow", "cos_values": []}
 
         # ── 방향 급변 필터 ───────────────────────────────────────────────
+        # 직전 프레임 방향과 현재 방향의 코사인이 -0.5 미만(각도 120° 이상)이면
+        # 한 프레임 만에 거의 U턴에 가깝게 방향이 꺾인 것으로, 추적 오류나
+        # 차선 변경 끝단에서 발생하는 순간 노이즈로 판단해 즉시 차단한다.
+        # wrong_way_count를 0으로 리셋하고 direction_change_frame을 기록해
+        # 이후 direction_change_guard_frames 동안 추가로 차단한다.
         prev_vel = st.last_velocity.get(track_id)
         if prev_vel is not None:
             cos_dir = float(ndx * prev_vel[0] + ndy * prev_vel[1])
@@ -207,6 +244,16 @@ class WrongWayJudge:
         st.last_velocity[track_id] = (ndx, ndy)
 
         # ── 안정 방향 대비 급변 감지 (edge detection) ────────────────────
+        # stable_velocity : 단기 투표 통과(정상 판정) 시점마다 갱신되는 안정 방향 벡터.
+        #                   "이 차량이 정상적으로 주행하던 방향"을 기억한다.
+        # direction_was_stable : 직전 프레임에서 현재 방향이 stable_velocity와 일치했는지 여부.
+        #
+        # edge detection 원리:
+        #   _was_stable=True  AND _is_stable_now=False
+        #   → 이전까지 안정(정방향 일치)이었다가 이번 프레임에 벗어남 = 방향 전환 에지
+        #   이 에지를 감지한 순간 direction_change_frame을 기록하고,
+        #   아래 가드에서 direction_change_guard_frames 동안 역주행 판정을 차단한다.
+        #   (역주행이 아닌 차선 변경·U턴 직후 순간 벡터 오류 방지)
         _stable = st.stable_velocity.get(track_id)
         if _stable is not None:
             _cos_vs_stable = float(ndx * _stable[0] + ndy * _stable[1])
@@ -217,6 +264,8 @@ class WrongWayJudge:
             st.direction_was_stable[track_id] = _is_stable_now
 
         # ── 방향 급변 가드 early-exit ────────────────────────────────────
+        # direction_change_frame 기록 후 guard_frames 이내에 들어온 프레임은
+        # 아직 방향 전환 직후의 불안정 구간으로 보고 역주행 카운트를 0으로 초기화.
         _last_chg = st.direction_change_frame.get(track_id, 0)
         if (_last_chg > 0
                 and (st.frame_num - _last_chg) <= cfg.direction_change_guard_frames):
@@ -224,6 +273,12 @@ class WrongWayJudge:
             return False, 0, {"status": "direction_change_guard", "cos_values": []}
 
         # ── 단기 투표: 궤적 포인트 샘플링 ──────────────────────────────
+        # 최근 궤적에서 최대 8개 포인트를 균등 간격으로 샘플링해
+        # 각 위치의 flow 벡터와 현재 이동 방향(ndx, ndy)의 코사인 유사도를 비교한다.
+        # cos < cos_threshold → disagree(역방향), 이상 → agree(정방향)
+        # disagree 비율(disagree / (agree+disagree))이 vote_threshold 이상이면
+        # 이 차량이 역방향으로 이동 중이라고 단기 투표가 판단한 것.
+        # flow 데이터가 없는 위치는 skip 처리해 투표에서 제외한다.
         n_points = min(len(traj), 8)
         step = max(1, len(traj) // n_points)
 
@@ -294,6 +349,9 @@ class WrongWayJudge:
         disagree_ratio = disagree / total_checked
 
         # ── 단기 투표 통과 여부 ──────────────────────────────────────────
+        # disagree 비율이 vote_threshold 미만이면 정상 주행으로 판단.
+        # wrong_way_count를 즉시 0으로 리셋하지 않고 -2씩 감소시켜
+        # 일시적 정상 판정에도 누적 의심이 급격히 초기화되지 않도록 한다.
         if disagree_ratio < cfg.vote_threshold:
             st.wrong_way_count[track_id] = max(
                 0, st.wrong_way_count[track_id] - 2)
@@ -303,8 +361,13 @@ class WrongWayJudge:
             return False, disagree_ratio, debug_info
 
         # ── ③ 장기 윈도우 검사 ──────────────────────────────────────────
+        # 단기 투표(velocity_window)가 역방향이라도, 장기 윈도우(×2)에서
+        # 정방향이면 일시적 노이즈로 보고 의심을 취소한다.
+        # 방향 계산에 프레임 간 이동 벡터의 중앙값을 사용하는 이유:
+        #   순간 픽셀 오차·추적 점프가 평균을 왜곡하는 것을 방지하기 위해
+        #   중앙값으로 outlier를 제거하고 전체 이동량은 프레임 수를 곱해 복원한다.
         long_window = cfg.velocity_window * 2
-        long_suspect = True   # 궤적 부족 시 면제
+        long_suspect = True   # 궤적이 long_window보다 짧으면 검사 면제(True 유지)
 
         if len(traj) >= long_window:
             _lw = long_window
@@ -313,6 +376,7 @@ class WrongWayJudge:
                      for i in range(_lw - 1)]
             _lpfy = [traj[_lsi + i + 1][1] - traj[_lsi + i][1]
                      for i in range(_lw - 1)]
+            # 프레임 간 이동량 중앙값 × 프레임 수 = 노이즈 제거된 전체 이동 벡터
             lvdx = float(np.median(_lpfx)) * (_lw - 1)
             lvdy = float(np.median(_lpfy)) * (_lw - 1)
             lmag = np.sqrt(lvdx ** 2 + lvdy ** 2)
@@ -361,9 +425,13 @@ class WrongWayJudge:
                             <= cfg.direction_change_guard_frames)
 
         # ── fast-track 조건 ──────────────────────────────────────────────
-        # [수정] post_slow_guard 제거 — lcf 갱신 수정으로 이미 보호됨
-        #         fast-track 최소 나이를 velocity_window*2로 완화 (45f → 30f)
-        #         _lcf 조건: age_gate_end 이후 정방향 없었으면 충분
+        # _ft_age_ok : 등장 후 충분히 추적된 차량만 fast-track 허용
+        #              (너무 일찍 나타난 차량은 방향 추정 불안정 → 최소 나이 보장)
+        # _ft_lcf_ok : age_gate_end(=등장+min_age+velocity_window) 이후에
+        #              last_correct_frame(마지막 정방향 확인 프레임)이 없어야 함.
+        #              즉, "초기 안정화 기간이 지난 후 단 한 번도 정방향이 확인되지 않은 경우"만
+        #              fast-track으로 즉시 확정한다. 정방향이 한 번이라도 있었으면 lcf가
+        #              age_gate_end 이후로 갱신되어 _ft_lcf_ok=False → fast-track 차단.
         _ft_age_ok = _cur_age >= max(_ft_min_age,
                                      cfg.velocity_window * 2)
         _ft_lcf_ok = _lcf_ft <= _age_gate_end_ft
@@ -472,14 +540,25 @@ class WrongWayJudge:
                   f"(normal-path, frame={st.frame_num})")
             return True, disagree_ratio, debug_info
         else:
-            # flow 데이터가 전혀 없어서 검증 불가한 경우(global_cos 미설정) →
-            # 잘못된 감소로 bounce loop 방지: wrong_count 유지
+            # global_traj_ok = False (검증 실패 → 미확정 유지)
+            #
+            # 처리 방침:
+            #   ① wrong_count 감소: flow_cos 증거가 있었으나 정방향으로 판정된 경우에만
+            #      wrong_count를 -2 감소시킨다.
+            #      global_cos가 None(=flow 데이터 자체 없음)이면 감소 없이 유지 —
+            #      flow가 없다고 해서 "정상"이라는 증거가 된 것은 아니기 때문.
+            #   ② lcf(last_correct_frame) 갱신 금지:
+            #      disagree=1.0이어도 flow map 공백이나 궤적 방향 계산 이슈로
+            #      global_ok=False가 나올 수 있다. 이때 lcf를 현재 프레임으로 갱신하면
+            #        - fast-track _ft_lcf_ok=False → fast-track 영구 차단
+            #        - sudden_change_rejected: fsf < 갱신된 lcf → 루프 유발
+            #      실제 정방향 확인이 아닌 상황에서 lcf를 건드리면 안 된다.
+            #
+            # status "global_traj_ok"는 "global trajectory 검증 단계까지 도달했으나
+            # 역방향 확정에 실패"를 의미하는 내부 코드명 (이름이 혼동을 줄 수 있음).
             if debug_info.get("global_cos") is not None:
                 st.wrong_way_count[track_id] = max(
                     0, st.wrong_way_count[track_id] - 2)
-            # lcf는 갱신하지 않음: global_traj 검증 실패는 투표 disagree=1.0 상태에서도
-            # 발생할 수 있음 (flow map 공백·궤적 방향 이슈). 이 상황에서 lcf를 현재프레임으로
-            # 갱신하면 fast-track(_ft_lcf_ok) 영구 차단 + sudden_change_rejected 루프 유발.
             debug_info["status"] = "global_traj_ok"
             return False, disagree_ratio, debug_info
 

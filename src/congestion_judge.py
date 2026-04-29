@@ -178,13 +178,12 @@ class CongestionJudge:
 
     # ── 기준선 설정 ──────────────────────────────────────────────────
     def set_baseline(self):
-        """학습 완료 신호를 받아 EMA를 중립값(0.5)으로 초기화한다.
+        """학습 완료 신호를 받아 EMA를 0.0으로 초기화한다.
 
-        EMA 초기값을 0.0이 아닌 0.5로 설정하는 이유:
-          - 0.0 시작 시 원활 상황에서도 0.5까지 올라오는 데 수십 프레임 걸림
-          - 0.5 시작 시 원활이면 즉시 차감되어 0.1~0.2로 내려가고,
-            정체이면 즉시 증가하여 0.7~0.9로 올라감
-          - 학습 직후 "중립 → 실제 상태" 방향으로 빠르게 수렴
+        EMA를 0.0에서 시작하는 이유:
+          - 학습 직후 실제 도로 상태(원활·서행·정체)로 자연스럽게 수렴
+          - 초기 확정 구간(initial_confirm_sec) 동안 짧은 히스테리시스를 적용해
+            EMA가 안정화되기 전 오확정을 방지
         """
         self._baseline_set = True                      # 학습 완료 표시
         self._ema_jam = 0.0                            # EMA 0에서 시작 → 실제 도로 상태로 수렴
@@ -212,7 +211,7 @@ class CongestionJudge:
 
     # ── 임계값 접근자 ─────────────────────────────────────────────────
     def get_smooth_threshold(self) -> float:
-        """SMOOTH 판정 임계값을 반환한다 (기본 0.30).
+        """SMOOTH 판정 임계값을 반환한다 (기본 0.25).
 
         Returns:
             smooth_jam_threshold (LCS 보정 없음 — fallback 전용).
@@ -255,23 +254,21 @@ class CongestionJudge:
 
         return self._current_level                     # 현재(또는 유지 중) 레벨
 
-    # ── Phase 2 지원: jam 계산만 수행 ────────────────────────────────
+    # ── jam_score 계산 ───────────────────────────────────────────────
     def compute_jam(self, x_t: dict) -> float:
-        """x_t로부터 rule_jam_score를 계산하고 x_t에 역주입한다.
-
-        update()를 분리한 것. Phase 2에서 GRU 블렌딩 전 rule_jam을 얻을 때 사용.
+        """x_t feature 벡터로부터 jam_score를 계산한다.
 
         Args:
-            x_t: 7차원 feature 벡터 dict (rule_jam_score 키가 채워짐).
+            x_t: feature 벡터 dict.
 
         Returns:
-            rule_jam_score (0.0~1.0).
+            jam_score (0.0~1.0).
         """
-        jam = compute_jam_score_fallback(x_t)          # fallback 모드 (항상)
-        x_t["rule_jam_score"] = jam                    # feature 벡터에 역주입 (GRU 입력용)
-        return jam                                     # rule_jam_score 반환
+        jam = compute_jam_score_fallback(x_t)          # rule 기반 jam_score 계산
+        x_t["rule_jam_score"] = jam                    # 로그·조회용 역주입
+        return jam
 
-    # ── Phase 2 지원: 레벨 판정 + 히스테리시스만 수행 ──────────────────
+    # ── 레벨 판정 + 히스테리시스 ─────────────────────────────────────
     def apply_level(self, jam: float, frame_num: int) -> tuple:
         """jam_score에 비대칭 EMA를 적용한 뒤 레벨을 판정하고 히스테리시스를 적용한다.
 
@@ -280,7 +277,7 @@ class CongestionJudge:
           - 호전(raw_jam < ema_jam): alpha_down으로 느리게 반응 (순간 개선에 흔들리지 않음)
 
         Args:
-            jam: 순간 jam_score (0.0~1.0). rule_jam 또는 blended_jam.
+            jam: 순간 jam_score (0.0~1.0).
             frame_num: 현재 프레임 번호 (정체 지속 시간 추적용).
 
         Returns:
@@ -289,7 +286,7 @@ class CongestionJudge:
         # ── 비대칭 EMA 적용 ──────────────────────────────────────────
         # 1. 방향 판단: 악화(상승)이면 alpha_up, 호전(하강)이면 alpha_down
         if jam >= self._last_jam_score:  # 현재 순간값이 EMA보다 높으면 악화 방향
-            alpha = self._alpha_up       # 빠르게 반응 (기본 0.70 — 정체 진입 즉시 감지)
+            alpha = self._alpha_up       # 빠르게 반응 (기본 0.40 — 정체 진입 즉시 감지)
         else:
             alpha = self._alpha_down     # 천천히 반응 (기본 0.04 — 순간 개선에 흔들리지 않음)
 
@@ -312,7 +309,7 @@ class CongestionJudge:
         raw_level = self._classify(self._last_jam_score)
         level = self._apply_hysteresis(raw_level)      # 히스테리시스 적용 후 최종 레벨
 
-        # 4. 정체 지속 시간 추적
+        # 5. 정체 지속 시간 추적
         if level in ("SLOW", "JAM"):
             if self._congestion_start_frame is None:
                 self._congestion_start_frame = frame_num

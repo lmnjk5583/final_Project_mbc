@@ -9,7 +9,7 @@ from datetime import datetime                       # HistoricalPredictor 시각
 
 from .config import DetectorConfig                  # 모든 파라미터가 담긴 설정 클래스
 from .state import DetectorState                    # 프레임 번호·궤적·역주행 카운트 등 런타임 상태
-from .flow_map import FlowMap                       # 15×15 그리드 정상 흐름 벡터 학습/비교
+from .flow_map import FlowMap                       # 20x20 그리드 정상 흐름 벡터 학습/비교
 from .tracker import YoloTracker                    # YOLO 검출 + ByteTrack 추적
 from .judge import WrongWayJudge                    # 코사인 유사도 + 투표/히스테리시스 역주행 판정
 from .id_manager import IDManager                   # W라벨 관리 + occlusion 재매칭 + 오래된 트랙 정리
@@ -64,7 +64,7 @@ class Detector:
         self._wrongway_stable_until = 0                             # 재학습 후 역주행 판정 유예 종료 프레임
         self._dir_label_a = "상행"                                  # A방향 표시 레이블 (기본값)
         self._dir_label_b = "하행"                                  # B방향 표시 레이블 (기본값)
-        self._valid_cells_a: int = 1                                # A방향 유효 셀 수 (bbox_coverage 원근 보정용)
+        self._valid_cells_a: int = 1                                # A방향 유효 셀 수 (flow_occupancy 정규화 분모)
         self._valid_cells_b: int = 1                                # B방향 유효 셀 수
 
         # ── flow_map 로드 (탐지 전용이라면 필수) ────────────────────
@@ -112,51 +112,72 @@ class Detector:
 
     # ==================== 방향 분류 기준 벡터 계산 ====================
     def _compute_ref_direction(self):
-        """flow_map에서 가장 샘플이 많은 셀의 흐름 벡터를 기준 방향으로 설정한다."""
+        """flow_map 전체 셀의 샘플 수 가중 평균 벡터를 기준 방향으로 설정한다.
+
+        기존 방식(최다 샘플 단일 셀)은 재학습마다 어느 차선이 바빴느냐에 따라
+        결과가 달라져 UP/DOWN 레이블이 회차마다 뒤집히는 문제가 있었다.
+        가중 평균은 왕복 차선 전체를 반영하므로 더 안정적이다.
+        왕복 도로에서 양방향 벡터가 상쇄돼 합이 0에 가까울 경우
+        단일 최다 셀을 fallback으로 사용한다.
+        """
         grid = self.flow                                          # FlowMap 참조
-        best_r, best_c = 0, 0                                    # 최다 샘플 셀 좌표
-        best_count = 0                                            # 최다 샘플 수
-        for r in range(grid.grid_size):                           # 행 순회
-            for c in range(grid.grid_size):                       # 열 순회
-                cnt = grid.count[r, c]                            # 해당 셀 샘플 수
-                if cnt > best_count:                              # 더 많은 샘플 발견
-                    best_count = cnt                              # 갱신
-                    best_r, best_c = r, c                         # 좌표 갱신
-        vx = float(grid.flow[best_r, best_c, 0])                  # 최다 셀 흐름 x (flow[r,c,0])
-        vy = float(grid.flow[best_r, best_c, 1])                  # 최다 셀 흐름 y (flow[r,c,1])
-        mag = np.sqrt(vx**2 + vy**2)                              # 벡터 크기
-        if mag > 1e-6:                                            # 유효한 벡터이면
-            self._ref_direction = (vx / mag, vy / mag)            # 단위 벡터로 저장
-        else:                                                     # 무효 (빈 flow_map)
-            self._ref_direction = (1.0, 0.0)                      # fallback: 오른쪽
+
+        # ── 가중 평균 방향 계산 ──────────────────────────────────────
+        _mask = grid.count > 3                                    # 의미 있는 셀만 (노이즈 제거)
+        vx, vy = 0.0, 0.0
+        _best_r, _best_c, _best_count = 0, 0, 0                  # fallback용 최다 샘플 셀
+        if _mask.any():
+            _vx_arr = grid.flow[_mask, 0]
+            _vy_arr = grid.flow[_mask, 1]
+            _w_arr  = grid.count[_mask].astype(float)
+            vx = float(np.average(_vx_arr, weights=_w_arr))      # 샘플 수 가중 평균 x
+            vy = float(np.average(_vy_arr, weights=_w_arr))      # 샘플 수 가중 평균 y
+        # fallback: 최다 샘플 셀 (가중 평균이 0에 수렴할 경우)
+        for r in range(grid.grid_size):
+            for c in range(grid.grid_size):
+                if grid.count[r, c] > _best_count:
+                    _best_count = grid.count[r, c]
+                    _best_r, _best_c = r, c
+
+        mag = np.sqrt(vx**2 + vy**2)                              # 가중 평균 벡터 크기
+        if mag > 0.1:                                             # 유효한 가중 평균이면 사용
+            self._ref_direction = (vx / mag, vy / mag)
+            _src = "가중평균"
+        else:
+            # 왕복 차선에서 벡터 상쇄 → 단일 최다 셀 fallback
+            _fx = float(grid.flow[_best_r, _best_c, 0])
+            _fy = float(grid.flow[_best_r, _best_c, 1])
+            _fm = np.sqrt(_fx**2 + _fy**2)
+            if _fm > 1e-6:
+                self._ref_direction = (_fx / _fm, _fy / _fm)
+            else:
+                self._ref_direction = (1.0, 0.0)                  # 최후 fallback
+            _src = f"단일셀[{_best_r},{_best_c}]"
 
         # ── UP/DOWN 레이블 자동 판별 ────────────────────────────────
         # 카메라 좌표계: 이미지 위 = y 감소(vy < 0) = 화면 상 위로 이동 = UP
         #               이미지 아래 = y 증가(vy > 0) = 화면 상 아래로 이동 = DOWN
-        # vy 부호만으로 판별 — 카메라 설치 방향 무관하게 항상 동일하게 적용
         ref_vy = self._ref_direction[1]                           # A방향 y성분
-        if ref_vy < 0:                                            # A가 이미지 위쪽으로 이동 → UP
-            _auto_label_a = "UP"
-        else:                                                     # A가 이미지 아래쪽으로 이동 → DOWN
-            _auto_label_a = "DOWN"
+        _auto_label_a = "UP" if ref_vy < 0 else "DOWN"
 
-        _computed_label_a = _auto_label_a
-
-        self._dir_label_a = _computed_label_a
-        self._dir_label_b = "DOWN" if _computed_label_a == "UP" else "UP"
+        self._dir_label_a = _auto_label_a
+        self._dir_label_b = "DOWN" if _auto_label_a == "UP" else "UP"
 
         print(f"🧭 기준 방향: ({self._ref_direction[0]:.3f}, {self._ref_direction[1]:.3f})"
-              f" [셀({best_r},{best_c}), 샘플={best_count}]"
+              f" [{_src}, 최다셀=({_best_r},{_best_c}) n={_best_count}]"
               f" → A={self._dir_label_a}, B={self._dir_label_b}")
 
     # ==================== 방향별 유효 셀 수 계산 ====================
     def _compute_direction_cell_counts(self):
-        """flow_map 유효 셀을 A/B방향으로 분류해 각 셀 수를 계산한다.
+        """flow_map 학습 셀을 A/B방향으로 분류해 방향별 유효 셀 수를 계산하고 TrafficAnalyzer에 주입한다.
 
-        bbox_coverage 계산 시 전체 road_area 대신 방향별 road_area를 사용하기 위해
-        학습 완료 직후 _compute_ref_direction() 다음에 호출한다.
+        FeatureExtractor는 dwell_cell_ratio·flow_occupancy·cell_dwell_score 계산 시
+        전체 그리드가 아닌 방향별 실제 도로 면적(셀 수)을 분모로 사용한다.
+        예: 왕복 2차선에서 A방향 40셀·B방향 35셀이면 A방향 피처는 40을 분모로 정규화.
+        이를 위해 _compute_ref_direction() 이후에 호출해 방향별 셀 수를 확정한다.
 
-        결과를 _valid_cells_a/b에 저장 후 각 TrafficAnalyzer에 주입.
+        분류 기준: 기준 방향(ref_direction)과의 코사인 유사도가
+          lane_cos_threshold 이상이면 A방향, 미만이면 B방향으로 분류.
         """
         if self._ref_direction is None:                           # 기준 방향 미설정이면
             return                                                # 계산 불가 → 기본값 유지
@@ -218,10 +239,23 @@ class Detector:
     @staticmethod
     def _make_vehicle_grid(tracks: list, frame_w: int, frame_h: int,
                            grid_size: int) -> "np.ndarray":
-        """현재 탐지된 차량 bbox 중심점을 flow_map 격자에 투영한 bool 마스크.
+        """현재 프레임의 탐지 차량 bbox 중심점을 flow_map 격자(grid_size×grid_size)에
+        투영한 bool 마스크를 반환한다.
 
-        같은 카메라라면 매번 비슷한 격자 셀에 차량이 나타난다.
-        카메라가 전환되면 차량이 다른 격자 셀에 위치 → coverage IoU가 낮아진다.
+        스냅샷 매칭(find_best_snapshot)에서 카메라 전환 여부를 판별하는 용도로 사용된다.
+        같은 카메라라면 도로 구조가 동일하므로 차량이 매 프레임 비슷한 셀에 집중되고,
+        저장된 스냅샷의 vehicle_grid와 IoU가 높게 유지된다.
+        카메라가 전환되면 차량 위치 패턴이 달라져 IoU가 낮아지므로 매칭 후보에서 탈락한다.
+
+        Args:
+            tracks: 현재 프레임 탐지 결과 (각 항목에 x1·y1·x2·y2 키 포함).
+            frame_w: 프레임 너비 (픽셀).
+            frame_h: 프레임 높이 (픽셀).
+            grid_size: flow_map 격자 한 변의 셀 수.
+
+        Returns:
+            (grid_size, grid_size) bool ndarray.
+            차량 중심점이 투영된 셀은 True, 나머지는 False.
         """
         import numpy as _np
         mask = _np.zeros((grid_size, grid_size), dtype=bool)
@@ -332,13 +366,13 @@ class Detector:
         # ── 방향별 TrafficAnalyzer 초기화 ─────────────────────────────
         self.traffic_analyzer_a = TrafficAnalyzer(                  # A방향 정체 탐지
             cfg, frame_w=fw, frame_h=fh, fps=fps,
-            flow_map=self.flow,                                     # flow_map 주입 (bbox_coverage 계산용)
+            flow_map=self.flow,                                     # flow_map 주입 (flow_occupancy 셀 수 계산용)
         )
         self.traffic_analyzer_a.set_state(self.state)               # state 주입
 
         self.traffic_analyzer_b = TrafficAnalyzer(                  # B방향 정체 탐지
             cfg, frame_w=fw, frame_h=fh, fps=fps,
-            flow_map=self.flow,                                     # flow_map 주입 (bbox_coverage 계산용)
+            flow_map=self.flow,                                     # flow_map 주입 (flow_occupancy 셀 수 계산용)
         )
         self.traffic_analyzer_b.set_state(self.state)               # state 주입
 
@@ -366,8 +400,8 @@ class Detector:
             print("ℹ️  HistoricalPredictor 비활성 (flow_map_path 없음)")
 
         # ── 정체 탐지 활성화 ──────────────────────────────────────────────
-        self.traffic_analyzer_a.set_baseline()                     # A방향 FE+CJ 활성화
-        self.traffic_analyzer_b.set_baseline()                     # B방향 FE+CJ 활성화
+        self.traffic_analyzer_a.set_baseline()                     # A방향 FeatureExtractor(피처 계산) + CongestionJudge(정체 판정) 활성화
+        self.traffic_analyzer_b.set_baseline()                     # B방향 FeatureExtractor(피처 계산) + CongestionJudge(정체 판정) 활성화
         if not st.is_learning:                                     # 탐지 전용이면 flow_map 로드됨 → 기준 방향 계산
             self._compute_ref_direction()
             self._compute_direction_cell_counts()                  # 방향별 셀 수 계산 → TA 주입
@@ -676,7 +710,7 @@ class Detector:
                 _lo = {"SMOOTH": 0, "SLOW": 1, "JAM": 2}     # 레벨 순위
                 _worst_lvl = (_lvl_a if _lo.get(_lvl_a, 0) >= _lo.get(_lvl_b, 0)  # 더 나쁜 레벨
                               else _lvl_b)
-                # worst-of-both 방향의 rule_jam / gru_score 선택 (jam 기준)
+                # worst-of-both 방향의 jam_score 선택
                 _src = (self.traffic_analyzer_a                     # jam 높은 쪽 analyzer
                         if _jam_a >= _jam_b else self.traffic_analyzer_b)
                 _rule_jam = _src.get_rule_jam_score() if _src else 0.0  # rule_jam (로그용)
@@ -904,19 +938,12 @@ class Detector:
                     # ── 양방향 채널 재구축 (117차) ────────────────────────────
                     if self._ref_direction is not None:
                         self.flow.build_directional_channels(*self._ref_direction)
-                    # ── 방향 라벨 반전 감지 → HistoricalPredictor 슬롯 스왑 ────
-                    # 라벨(Up/Down)은 _ref_direction의 vy 부호만으로 결정되므로
-                    # dot product 비교보다 라벨 변화 감지가 더 정확하다.
-                    # 예) 재학습 전 a=Up → 재학습 후 a=Down: dot이 양수여도 라벨이 바뀜
-                    #     → 예측기 데이터를 교환하지 않으면 Up/Down 예측이 뒤집힘
-                    if (self._prev_dir_label_a is not None
-                            and self._dir_label_a != self._prev_dir_label_a
-                            and hasattr(self, "_hist_pred_a")
-                            and self._hist_pred_a is not None):
-                        print(f"🔄 방향 라벨 반전 감지 "
-                              f"(a: {self._prev_dir_label_a} → {self._dir_label_a}) "
-                              f"→ HistoricalPredictor 슬롯 스왑")
-                        self._hist_pred_a.swap_slots_with(self._hist_pred_b)
+                    # ── HistoricalPredictor 슬롯 스왑 비활성 ──────────────────
+                    # 자동 스왑은 카메라 전환·새벽 저교통량·물리적 회전 등을
+                    # 서로 구별할 수 없어 오히려 오작동을 유발한다.
+                    # ref_direction을 가중평균으로 안정화했으므로 재학습 후에도
+                    # 방향이 뒤집히는 일이 드물고, 설령 일시적으로 방향이 바뀌어도
+                    # hist CSV는 누적 평균 구조라 새 데이터가 쌓이면 자가 교정된다.
                     self._prev_ref_direction = None                 # 사용 후 초기화
                     self._prev_dir_label_a   = None                 # 사용 후 초기화
                     _sdir = self._snapshot_dir()
@@ -1032,13 +1059,6 @@ class Detector:
                         print(f"✅ 차량 흐름 검증 통과 "
                               f"(avg|cos|={_sw_avg_cos:.3f}, "
                               f"n={_sw_verify_vehicle_n}) → 스냅샷 재사용")
-                        _meta_sw = load_snapshot_meta(_sw_verify_npy)
-                        _saved_sw = _meta_sw.get("dir_label_a", "")
-                        if (_saved_sw and _saved_sw != self._dir_label_a
-                                and self._hist_pred_a is not None):
-                            print(f"🔄 방향 반전 감지 "
-                                  f"(저장={_saved_sw}, 현재={self._dir_label_a}) → 슬롯 스왑")
-                            self._hist_pred_a.swap_slots_with(self._hist_pred_b)
                         st.is_learning = False
                     else:
                         # ── 검증 실패: 다른 도로 ─────────────────────────────
@@ -1085,8 +1105,8 @@ class Detector:
                 # 기존: flow_map 기반 → 미학습 셀(상단) 에서 nearest-neighbor가
                 #       반대 방향 셀을 반환해 상행 차량을 A로 오분류
                 # 개선: 궤적 3점 이상이면 velocity 벡터로 즉시 분류
-                #       원거리 차량은 YOLO가 자주 끊겨 traj<20인 경우 많음 →
-                #       velocity_window(20) 대기 없이 조기 정확 분류
+                #       원거리 차량은 YOLO가 자주 끊겨 traj<10인 경우 많음 →
+                #       velocity_window(10) 대기 없이 조기 정확 분류
                 if not st.is_learning and not st.relearning and not st.waiting_stable and self._ref_direction is not None:
                     _traj_dir = st.trajectories[tid]                # 이번 프레임 추가 전 궤적
                     _DIR_WIN = min(cfg.velocity_window, len(_traj_dir))  # 가용 최대 window
@@ -1274,61 +1294,6 @@ class Detector:
                                     tid, traj, ndx, ndy, mag, cy, _bbox_h,
                                     track_dir=self._track_direction.get(tid)
                                 )
-
-                            # ── 이웃 차량 방향 일치 확인 (118차 — neighbor_agreement_guard) ──
-                            # 진짜 역주행: 이 차량만 반대 방향, 같은 분류 이웃은 정방향
-                            # 오탐(flow map 오류·오염): 같은 분류 이웃 차량들도 같은 방향으로 이동 중
-                            # → 이웃 N대 이상이 같은 방향이면 flow map이 틀린 것으로 판단 → 취소
-                            #
-                            # 적용 조건:
-                            # ① 이번 프레임에 새로 확정된 경우에만 (_was_confirmed_before=False)
-                            #    이미 확정된 차량은 가드 대상 아님 — 이전 프레임 debug_info에
-                            #    global_cos가 없어(_has_strong_flow=False) 매 프레임 취소되는 루프 방지
-                            # ② global_cos < -0.8이면 강한 flow 증거 → 가드 bypass
-                            #    이웃이 같은 방향이어도 이 차량만 다른 차선일 수 있음
-                            _nbr_min   = getattr(cfg, "neighbor_guard_min_total", 3)
-                            _nbr_agree = getattr(cfg, "neighbor_guard_agree",     2)
-                            _sus_dir   = self._track_direction.get(tid)
-                            _gc = debug_info.get("global_cos")
-                            _has_strong_flow = (_gc is not None and _gc < -0.8)
-                            _newly_confirmed = is_wrong and not _was_confirmed_before
-                            if (_newly_confirmed and (ndx != 0.0 or ndy != 0.0)
-                                    and _sus_dir is not None
-                                    and not _has_strong_flow):
-                                _same_dir  = 0
-                                _total_nbr = 0
-                                for _ov, _ovv in st.last_velocity.items():
-                                    if _ov == tid or _ov in st.wrong_way_ids:
-                                        continue
-                                    if self._track_direction.get(_ov) != _sus_dir:
-                                        continue            # 같은 방향 분류 차량만 비교
-                                    _total_nbr += 1
-                                    if float(ndx * _ovv[0] + ndy * _ovv[1]) > 0.5:
-                                        _same_dir += 1
-                                if _total_nbr >= _nbr_min and _same_dir >= _nbr_agree:
-                                    st.wrong_way_ids.discard(tid)
-                                    st.wrong_way_count[tid] = 0
-                                    st.first_suspect_frame.pop(tid, None)
-                                    # lcf 업데이트: fast-track이 즉시 재확정하는 루프 방지
-                                    # (lcf > age_gate_end → _ft_lcf_ok=False → guard_frames 동안 차단)
-                                    st.last_correct_frame[tid] = st.frame_num
-                                    is_wrong = False
-                                    print(f"   ✅ ID:{tid} 이웃 {_same_dir}/{_total_nbr}대 "
-                                          f"동방향 → 역주행 취소 (flow map 오탐 추정)")
-                                    # ── 119차 cascade reset ────────────────────────────────
-                                    # 이웃 중 의심 누적 중인 같은 방향 차량도 함께 초기화
-                                    # 이유: W1 취소 직후 W2·W3이 연속 확정되는 패턴 방지
-                                    for _ov2, _ovv2 in list(st.last_velocity.items()):
-                                        if _ov2 == tid or _ov2 in st.wrong_way_ids:
-                                            continue
-                                        if self._track_direction.get(_ov2) != _sus_dir:
-                                            continue
-                                        if float(ndx * _ovv2[0] + ndy * _ovv2[1]) > 0.5:
-                                            if st.wrong_way_count.get(_ov2, 0) > 0:
-                                                st.wrong_way_count[_ov2] = 0
-                                                st.first_suspect_frame.pop(_ov2, None)
-                                                print(f"   ↩️  ID:{_ov2} 연쇄 의심 초기화 "
-                                                      f"(cascade from ID:{tid})")
 
                             # 역주행 확정 시 라벨 부여
                             if is_wrong and tid in st.wrong_way_ids:

@@ -16,9 +16,18 @@ _MATCH_SIZE = (128, 128)   # 두 프레임 모두 이 크기로 리사이즈 후
 
 
 def _score_orb(img_a: np.ndarray, img_b: np.ndarray) -> float:
-    """ORB 키포인트 매칭 점수 (0~1, 높을수록 유사).
+    """ORB 키포인트 매칭 점수 (0~1, 높을수록 유사). score_frames에서 가중치 0.10 보조 신호.
 
-    조명·각도 변화에 강함 — 주요 매칭 방법.
+    ORB(Oriented FAST + Rotated BRIEF) 동작 원리:
+      1. FAST로 키포인트 검출 — 모서리·경계처럼 주변과 뚜렷이 구분되는 점
+         (가드레일 끝, 차선 경계, 신호등 기둥, 건물 모서리 등)
+      2. BRIEF로 각 키포인트 주변 패턴을 이진 문자열(디스크립터)로 압축
+      3. 두 이미지의 디스크립터를 Hamming 거리(비트 XOR 차이)로 비교해 매칭 쌍 수 집계
+         → 매칭이 많을수록 두 이미지가 같은 장소·각도를 찍은 것
+
+    카메라 전환 판별에 유효한 이유:
+      같은 카메라라면 도로 구조물이 항상 같은 위치에 보여서 매칭 수가 많고,
+      다른 카메라로 전환되면 배경 구조 자체가 달라서 매칭이 거의 안 됨.
     """
     orb = cv2.ORB_create(nfeatures=500)
     kp_a, des_a = orb.detectAndCompute(img_a, None)
@@ -34,11 +43,11 @@ def _score_orb(img_a: np.ndarray, img_b: np.ndarray) -> float:
     if not matches:
         return 0.0
 
-    # 거리 기준 정렬 후 상위 50%만 사용 (노이즈 제거)
+    # 거리 기준 정렬 후 상위 50%만 사용 — 노이즈성 약매칭 제거
     matches = sorted(matches, key=lambda m: m.distance)
     good    = matches[:len(matches) // 2]
 
-    # 좋은 매칭 수 / 키포인트 수로 정규화
+    # 좋은 매칭 수 / 키포인트 수로 정규화 → 0~1
     score = len(good) / max(len(kp_a), len(kp_b))
     return float(np.clip(score, 0.0, 1.0))
 
@@ -301,20 +310,39 @@ def _load_coverage_mask(npy_path: Path) -> "np.ndarray | None":
 
 
 def _coverage_iou(mask_a: np.ndarray, mask_b: np.ndarray) -> float:
-    """두 bool 격자 마스크의 Intersection over Union (0~1)."""
+    """두 bool 격자 마스크의 Intersection over Union (0~1).
+
+    IoU = 교집합 셀 수 / 합집합 셀 수
+
+    mask_a: 저장된 스냅샷의 flow_map count>0 셀 (이 카메라가 학습한 도로 영역)
+    mask_b: 현재 프레임의 차량 위치 격자 (vehicle_grid)
+
+    같은 카메라라면 차량이 학습된 도로 영역 위에 나타나므로 겹치는 셀이 많아 IoU 높음.
+    다른 카메라로 전환되면 학습 영역과 실제 차량 위치가 어긋나 교집합이 줄고 IoU 낮아짐.
+
+    예)  mask_a = [도로 셀 40개],  mask_b = [차량 위치 10개]
+         교집합 8개 / 합집합 42개 → IoU = 0.19  (낮음 → 다른 카메라 의심)
+         교집합 9개 / 합집합 41개 → IoU = 0.22  (높음 → 같은 카메라)
+    """
     inter = float(np.logical_and(mask_a, mask_b).sum())
     union = float(np.logical_or(mask_a,  mask_b).sum())
     return inter / union if union > 0 else 0.0
 
 
 def load_snapshot_meta(npy_path: Path) -> dict:
-    """npy_path에 대응하는 메타데이터를 반환한다.
+    """npy_path에 대응하는 메타데이터 JSON을 로드해 반환한다.
 
+    flow_map_*.npy 저장 시 함께 기록되는 메타파일로,
+    npy와 동일한 타임스탬프를 가진 meta_*.json을 읽는다.
     예) flow_map_20240101_120000.npy → meta_20240101_120000.json
+
+    메타데이터에 포함된 정보:
+      dir_label_a : A방향 표시 레이블 (예: "상행", "하행")
+                    스냅샷 재매칭 후 방향 레이블을 올바르게 복원하는 데 사용.
 
     Returns
     -------
-    dict : {"dir_label_a": "UP" | "DOWN"} 또는 {} (메타파일 없음).
+    dict : {"dir_label_a": "상행"} 형태, 또는 {} (메타파일 없거나 파싱 실패).
     """
     stem = npy_path.stem  # "flow_map_YYYYMMDD_HHMMSS"
     if not stem.startswith("flow_map_"):

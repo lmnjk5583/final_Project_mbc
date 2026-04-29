@@ -49,8 +49,8 @@ class CSVLogger:
             "프레임번호", "영상시간(초)", "추적중_차량수",
             "역주행확정_차량수", "Flow샘플총합",
             "장면전환감지", "모드",
-            "jam_score", "정체레벨",                                # Phase 1/2 정체 탐지 컬럼
-            "rule_jam_score", "gru_score"                          # 진단용: 블렌딩 전 개별 값
+            "jam_score", "정체레벨",                                # 정체 탐지 컬럼
+            "rule_jam_score"                                       # 진단용: 계산 직후 jam_score
         ])
 
         # ---------------- 트랙 로그 헤더 (한글) ----------------
@@ -73,7 +73,7 @@ class CSVLogger:
     def log_frame(self, frame_num, time_sec, active_tracks, wrong_confirmed_count,
                   flow_samples_total, camera_switch_triggered, mode,
                   jam_score: float = 0.0, congestion_level: str = "SMOOTH",
-                  rule_jam_score: float = 0.0, gru_score: "float | None" = None):
+                  rule_jam_score: float = 0.0):
         """프레임당 1행 기록.
 
         Args:
@@ -84,18 +84,16 @@ class CSVLogger:
             flow_samples_total: flow_map 전체 샘플 수.
             camera_switch_triggered: 장면 전환 감지 여부.
             mode: "LEARNING" / "DETECTING" 등.
-            jam_score: GRU 블렌딩 후 최종 jam_score (0.0~1.0). 기본 0.0.
+            jam_score: 최종 jam_score (0.0~1.0). 기본 0.0.
             congestion_level: 현재 정체 레벨. 기본 "SMOOTH".
-            rule_jam_score: rule 기반 jam_score (블렌딩 전). 기본 0.0.
-            gru_score: GRU 예측값 (warmup 중이면 None). 기본 None.
+            rule_jam_score: 계산 직후 jam_score (진단용). 기본 0.0.
         """
         self.frame_writer.writerow([
             frame_num, round(time_sec, 3), active_tracks,
             wrong_confirmed_count, int(flow_samples_total),
             int(bool(camera_switch_triggered)), mode,
             round(jam_score, 4), congestion_level,              # 정체 탐지 컬럼
-            round(rule_jam_score, 4),                           # rule_jam (블렌딩 전)
-            "" if gru_score is None else round(gru_score, 4)   # gru_score (warmup 중 빈칸)
+            round(rule_jam_score, 4),                           # 진단용 jam_score
         ])
 
     def log_track(self, row: list):
